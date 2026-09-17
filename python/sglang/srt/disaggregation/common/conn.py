@@ -102,6 +102,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    prefill_layerwise_offload: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -137,10 +138,15 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    layer_start: Optional[int] = None
+    layer_end: Optional[int] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        if self.layer_start is not None or self.layer_end is not None:
+            if self.layer_start is None or self.layer_end is None or not 0 <= self.layer_start < self.layer_end:
+                raise ValueError("Prefill rank has an invalid logical layer interval")
 
 
 class CommonKVManager(BaseKVManager):
@@ -730,6 +736,8 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
+            if info.prefill_layerwise_offload and self.enable_all_cp_ranks_for_transfer:
+                raise ValueError("bounded replicated Prefill KV requires CP-rank-0 transfer on Decode")
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
@@ -818,10 +826,15 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "layer_start": (getattr(self.kv_args, "prefill_start_layer", None)
+                            if getattr(self.kv_args, "prefill_layerwise_offload", False) else None),
+            "layer_end": (getattr(self.kv_args, "prefill_end_layer", None)
+                          if getattr(self.kv_args, "prefill_layerwise_offload", False) else None),
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "prefill_layerwise_offload": bool(getattr(self.kv_args, "prefill_layerwise_offload", False)),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1680,6 +1693,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.prefill_layerwise_offload: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1780,6 +1794,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
             )
+        layerwise = bool(data.get("prefill_layerwise_offload", False))
+        if self.prefill_layerwise_offload is None:
+            self.prefill_layerwise_offload = layerwise
+        elif self.prefill_layerwise_offload != layerwise:
+            return web.Response(text="Prefill ranks disagree on layerwise offload", status=400)
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -1795,6 +1814,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                layer_start=data.get("layer_start"),
+                layer_end=data.get("layer_end"),
             )
 
             self._registered_count += 1
@@ -1845,6 +1866,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                prefill_layerwise_offload=bool(self.prefill_layerwise_offload),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

@@ -26,7 +26,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -3596,6 +3596,7 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        prefill_reqs: Sequence[Req] = (),
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
@@ -3604,10 +3605,11 @@ class Scheduler(
         available = max(
             available - self.beam_coordinator.pending_member_rows(active_batch), 0
         )
-        res = min(pp_budget, available)
+        reused_rows = sum(req.kv.holds_kv for req in prefill_reqs)
+        res = min(pp_budget, available + reused_rows)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, available // beam_width + reused_rows)
 
         return res
 
@@ -3774,6 +3776,7 @@ class Scheduler(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                prefill_reqs=adder.can_run_list,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:

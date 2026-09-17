@@ -236,6 +236,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        from sglang.srt.hardware_backend.npu.fsa_backend import initialize_fsa_backend
+
+        initialize_fsa_backend(self, model_runner)
 
         if self.dsa_index_kpool > 1:
             assert self.page_size % self.dsa_index_kpool == 0, (
@@ -246,6 +249,33 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
     def _create_forward_metadata(self) -> AscendDSAForwardMetadata:
         return AscendDSAForwardMetadata(page_size=self.page_size)
+
+    def forward_sparse(self, q, k, v, layer, forward_batch, save_kv_cache=True,
+                       q_rope=None, k_rope=None, topk_indices=None):
+        if self.fused_sparse_state is not None and not forward_batch.forward_mode.is_extend_without_speculative():
+            from sglang.srt.hardware_backend.npu.fsa_backend import forward_fsa
+
+            return forward_fsa(
+                self, q, k, v, layer, forward_batch, save_kv_cache,
+                q_rope, k_rope, topk_indices,
+            )
+        output = super().forward_sparse(
+            q, k, v, layer, forward_batch, save_kv_cache,
+            q_rope=q_rope, k_rope=k_rope, topk_indices=topk_indices,
+        )
+        from sglang.srt.hardware_backend.npu.fsa_backend import sparse_pool_and_layer
+
+        pool, local_layer = sparse_pool_and_layer(self.token_to_kv_pool, layer.layer_id)
+        runtime = getattr(pool, "prefill_offload_runtime", None)
+        if runtime is not None and forward_batch.forward_mode.is_extend_without_speculative():
+            runtime.finish_layer(pool.start_layer + local_layer)
+        return output
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        from sglang.srt.hardware_backend.npu.fsa_backend import reserve_fsa_graph
+
+        reserve_fsa_graph(self, max_num_tokens)
+        return super().init_cuda_graph_state(max_bs, max_num_tokens)
 
     def _query_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Return per-request query lengths without a device-host round trip."""
@@ -657,12 +687,16 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        if self.fused_sparse_state is not None:
+            self.fused_sparse_state.refresh_generations()
         super().init_forward_metadata(forward_batch)
         self._populate_dsa_metadata(forward_batch)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> None:
+        if self.fused_sparse_state is not None:
+            self.fused_sparse_state.refresh_generations()
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         # Capture allocates stable addresses; replay updates only the contents
         # in place so graph references remain valid.

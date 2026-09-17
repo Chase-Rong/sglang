@@ -273,6 +273,7 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    _joint_capacity: Optional[Any] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -1491,6 +1492,9 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
         dsa_pool_kwargs = {}
+        from sglang.srt.hardware_backend.npu.offload_config import fsa_pool_options
+
+        fsa_options = fsa_pool_options(self, self.layer_info.num_effective_layers)
         if is_dsa_model:
             # The indexer and KV pool must use the same KPool/compression
             # configuration. Otherwise, the indexer may call
@@ -1528,6 +1532,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             **dsa_pool_kwargs,
+            **fsa_options,
         )
         return token_to_kv_pool
 
@@ -1841,6 +1846,10 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
+        if self.device == "npu" and self.use_mla_backend:
+            from sglang.srt.hardware_backend.npu.offload_config import fsa_pool_options
+
+            extra_args["fsa_pool_kwargs"] = fsa_pool_options(self, len(full_attention_layer_ids))
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
@@ -2212,6 +2221,22 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        joint = getattr(self, "_joint_capacity", None)
+        if joint is not None:
+            resolved = min(
+                joint.requests,
+                token_capacity // max(get_schedule().page_size, 2),
+                get_schedule().max_mamba_cache_size // self._calculate_mamba_ratio(),
+            )
+            if resolved <= 0:
+                raise MemoryError("Joint DSA/KDA capacity cannot support one request")
+            if resolved < joint.requests:
+                logger.warning(
+                    "max_running_requests was reduced from the joint budget's %d to %d "
+                    "(per dp worker) by the final token/KDA capacity.",
+                    joint.requests, resolved,
+                )
+            return resolved
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -2294,6 +2319,19 @@ class KVCacheConfigurator:
         )
 
         configurator = create_memory_pool_configurator(self)
+        joint = getattr(self, "_joint_capacity", None)
+        if joint is not None:
+            target_tokens = joint.target_tokens
+            if cap_tokens is not None:
+                target_tokens = min(target_tokens, cap_tokens)
+            target_tokens = self._apply_token_constraints(target_tokens)
+            configurator._decode_budget.validate(
+                target_tokens, self.resolve_max_num_reqs(target_tokens),
+                get_schedule().page_size, budget_bytes,
+            )
+            return configurator.calculate_pool_sizes_from_max_tokens(
+                target_tokens, get_schedule().page_size,
+            )
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
@@ -2371,6 +2409,14 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
+
+        joint_rest = self._resolve_joint_dsa_kda_budget(
+            total_rest_memory, stage_per_req, replayssm_ring_per_req,
+            stage_per_req * get_spec().speculative_num_draft_tokens
+            if has_spec_dec and not replayssm_active else 0,
+        )
+        if joint_rest is not None:
+            return joint_rest
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -2481,6 +2527,69 @@ class KVCacheConfigurator:
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def _resolve_joint_dsa_kda_budget(
+        self, total_rest_memory, state_bytes, ring_bytes, intermediate_bytes
+    ):
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+        configurator = create_memory_pool_configurator(self)
+        budget = getattr(configurator, "_decode_budget", None)
+        if budget is None:
+            return None
+        from sglang.srt.hardware_backend.npu.decode_memory_budget import (
+            solve_joint_dsa_kda_tokens,
+        )
+
+        page_size = get_schedule().page_size
+        requested = get_schedule().max_running_requests
+        if requested is None:
+            raise ValueError("Offload memory budgeting requires explicit --max-running-requests")
+        if requested <= 0 or requested % self.ps.attn_dp_size:
+            raise ValueError("max-running-requests must be positive and divisible by attention DP size")
+        request_limit = requested // self.ps.attn_dp_size
+        explicit_slots = get_schedule().max_mamba_cache_size
+        if explicit_slots is not None:
+            explicit_slots //= self.ps.attn_dp_size
+        options = dict(
+            slots_per_request=self._calculate_mamba_ratio(),
+            ring_bytes_per_slot=ring_bytes,
+            intermediate_bytes_per_request=intermediate_bytes,
+            explicit_state_slots=explicit_slots,
+            request_bytes_per_row=(self.model_config.context_len + get_req_to_token_extra_context_len()) * 4 + 28,
+        )
+        token_limit = self.model_config.context_len * request_limit
+        if get_schedule().max_total_tokens is not None:
+            token_limit = min(token_limit, get_schedule().max_total_tokens)
+        joint = solve_joint_dsa_kda_tokens(
+            budget, int(total_rest_memory * (1 << 30)), token_limit,
+            page_size, request_limit, state_bytes, **options,
+        )
+        get_context().override(
+            "mamba_pool.joint_dsa_budget", max_mamba_cache_size=joint.state_slots,
+        )
+        self._joint_capacity = joint
+        logger.info(
+            "Joint DSA/KDA budget: target_tokens=%d dsa_hbm=%.3f GiB "
+            "kda_hbm=%.3f GiB state_slots=%d requests=%d unused_hbm=%.3f GiB request_hbm=%.3f GiB",
+            joint.target_tokens, joint.dsa_bytes / (1 << 30), joint.kda_bytes / (1 << 30),
+            joint.state_slots, joint.requests, joint.unused_bytes / (1 << 30),
+            joint.request_bytes / (1 << 30),
+        )
+        if joint.requests < request_limit:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) to fit the joint DSA/KDA, Host and token budgets.",
+                request_limit, joint.requests,
+            )
+        logger.info(
+            "Joint request priority: max_running_requests=%d shared_token_capacity=%d "
+            "single_request_token_ceiling=%d",
+            joint.requests, joint.target_tokens,
+            min(self.model_config.context_len, joint.target_tokens),
+        )
+        return total_rest_memory - (joint.kda_bytes + joint.request_bytes) / (1 << 30)
 
 
 def calculate_mla_kv_cache_dim(

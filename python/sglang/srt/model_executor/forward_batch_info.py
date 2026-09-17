@@ -494,6 +494,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    prefill_offload_senders: Optional[List[object]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -819,6 +820,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            prefill_offload_senders=(
+                [req.disagg_kv_sender for req in batch.reqs]
+                if envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+                and not envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

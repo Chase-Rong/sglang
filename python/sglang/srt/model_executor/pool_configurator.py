@@ -178,6 +178,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._prefill_budget = None
+        self._decode_budget = None
+        self._decode_device_budget = None
+        self._kvc = kvc
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -208,7 +212,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # reuse the target architecture's attention config.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+        ) and not kvc.is_draft_worker and self._prefill_budget is None and self._decode_budget is None:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if (
                 eagle_draft_num_layers is not None
@@ -269,6 +273,50 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
+        if envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get():
+            from sglang.srt.hardware_backend.npu.decode_memory_budget import budget_from_config
+
+            self._decode_budget = budget_from_config(kvc, num_layers)
+            return self._decode_budget.device_bytes_per_token
+        if envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get():
+            from sglang.srt.hardware_backend.npu.prefill_offload import (
+                PrefillKvMemoryBudget,
+            )
+
+            if (
+                kvc.device != "npu"
+                or not kvc.use_mla_backend
+                or not is_deepseek_dsa(kvc.model_config.hf_config)
+                or get_disagg().disaggregation_mode != "prefill"
+            ):
+                raise ValueError(
+                    "bounded Prefill sizing requires an NPU DSA Prefill service"
+                )
+            if kvc.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError("bounded Prefill sizing requires BF16 or FP16 KV")
+            row_bytes = (
+                kvc.model_config.kv_lora_rank
+                + kvc.model_config.qk_rope_head_dim
+                + kvc.model_config.index_head_dim
+            ) * torch._utils._element_size(kvc.kv_cache_dtype)
+            from sglang.srt.hardware_backend.npu.speculative_sparse import sparse_mtp_draft_layers
+
+            draft_layers = sparse_mtp_draft_layers(kvc)
+            pooled_index = getattr(kvc.model_config.hf_text_config, "index_kpool", 1) > 1
+            index_bytes = kvc.model_config.index_head_dim * torch._utils._element_size(kvc.kv_cache_dtype)
+            if pooled_index:
+                row_bytes -= index_bytes
+            physical_slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), num_layers)
+            if draft_layers:
+                physical_slots += min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), draft_layers)
+            self._prefill_budget = PrefillKvMemoryBudget(
+                num_layers + draft_layers,
+                physical_slots,
+                row_bytes,
+                envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
+                resident_index_bytes_per_token=(num_layers + draft_layers) * index_bytes if pooled_index else 0,
+            )
+            return self._prefill_budget.device_bytes_per_token
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
@@ -459,6 +507,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._decode_budget is not None:
+            self._decode_device_budget = available_bytes
+            tokens = self._decode_budget.max_tokens(
+                available_bytes, page_size, self._kvc.resolve_max_num_reqs
+            )
+            if tokens <= 0:
+                raise MemoryError("Decode budgets cannot hold selection, planner and an Indexer page")
+            return MemoryPoolConfig(max_total_num_tokens=tokens)
+        if getattr(self, "_prefill_budget", None) is not None:
+            return MemoryPoolConfig(
+                max_total_num_tokens=self._prefill_budget.max_tokens(available_bytes, page_size)
+            )
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -471,6 +531,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._decode_budget is not None:
+            self._decode_budget.validate(
+                max_total_num_tokens, self._kvc.resolve_max_num_reqs(max_total_num_tokens),
+                page_size, self._decode_device_budget,
+            )
+        if getattr(self, "_prefill_budget", None) is not None:
+            self._prefill_budget.validate_host_capacity(max_total_num_tokens, page_size)
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 

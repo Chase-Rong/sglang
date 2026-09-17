@@ -367,6 +367,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
+        if getattr(self.draft_runner, "prefill_offload_runtime", None) is not None:
+            return
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 

@@ -1172,6 +1172,14 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
+            if is_prefill:
+                runtime = getattr(self.token_to_kv_pool, "prefill_offload_runtime", None)
+                start_hook = getattr(runtime, "on_compute_start", None)
+                if start_hook is not None:
+                    from sglang.srt.hardware_backend.npu.fsa_backend import sparse_pool_and_layer
+
+                    pool, local_layer = sparse_pool_and_layer(self.token_to_kv_pool, layer.layer_id)
+                    start_hook(pool.start_layer + local_layer)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,

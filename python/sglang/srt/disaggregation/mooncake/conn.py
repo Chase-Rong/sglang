@@ -98,6 +98,7 @@ class TransferInfo:
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
+    layer_manifest: bytes = b""
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -129,6 +130,7 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            layer_manifest=msg[10] if len(msg) > 10 else b"",
         )
 
 
@@ -217,6 +219,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._layer_staging = None
+        self._layer_staged_host_regions = set()
+        self._layer_rpc_waiters = {}
+        self._layer_pending_aborts = {}
+        self._layer_leases = {}
+        self._layer_operations = {}
+        self._layer_send_lock = threading.RLock()
+        staging_bytes = envs.SGLANG_NPU_LAYER_STAGING_BYTES.get()
+        if staging_bytes and disaggregation_mode == DisaggregationMode.DECODE:
+            from sglang.srt.hardware_backend.npu.layer_staging import create_npu_layer_staging
+
+            layer_pool = getattr(args, "npu_layer_receive_pool", None)
+            backings = getattr(layer_pool, "host_backings", None)
+            if backings is None:
+                backings = (getattr(layer_pool, "decode_host_backing", None),)
+            if any(backing is None for backing in backings):
+                raise ValueError("NPU layer staging requires registered Decode Host offload")
+            self._layer_staging = create_npu_layer_staging(staging_bytes, backings[0].pool.device_id)
+            self._layer_staged_host_regions = {
+                (region.host_ptr, region.nbytes)
+                for backing in backings for layer in backing.regions for region in layer
+                if region is not None
+            }
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -296,6 +321,134 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    def _handle_layer_message(self, message):
+        if message[0].startswith(b"FSA_STAGE_"):
+            from sglang.srt.hardware_backend.npu.layer_staging import handle_layer_staging_message
+
+            handle_layer_staging_message(self, message)
+            return True
+        if message[0] not in (b"FSA_LAYER_READY", b"FSA_LAYER_ACK", b"FSA_LAYER_FAILED",
+                              b"FSA_LAYER_ABORT", b"FSA_LAYER_ABORT_ACK", b"FSA_LAYER_REJECTED"):
+            return False
+        from sglang.srt.hardware_backend.npu.layer_protocol import decode, encode
+
+        payload = None
+        try:
+            if len(message) != 2:
+                raise ValueError("invalid layer control frame count")
+            payload = decode(message[1])
+            room = payload["room"]
+            if message[0] == b"FSA_LAYER_ABORT":
+                info = self.transfer_infos[room][payload["session"]]
+                manifest = decode(info.layer_manifest)
+                if manifest["lease"] != payload["lease"]:
+                    raise ValueError("abort names a stale receiver lease")
+                self._abort_layer_transfers(payload)
+            elif message[0] == b"FSA_LAYER_ABORT_ACK":
+                lease = self._layer_leases[room]
+                if (lease.session_id, lease.lease_id) != (payload["session"], payload["lease"]):
+                    raise ValueError("abort ACK names a stale receiver lease")
+                lease.failed = True
+                if not lease.note_writer_drain(payload):
+                    return True
+                if self._layer_staging is not None:
+                    self._layer_staging.abort(lease, transport_drained=True)
+                lease.drained = True
+            elif message[0] == b"FSA_LAYER_REJECTED":
+                lease = self._layer_leases[room]
+                lease.validate_writer(payload)
+                if (lease.session_id, lease.lease_id) != (payload["session"], payload["lease"]):
+                    raise ValueError("layer rejection names a stale receiver lease")
+                lease.failed = True
+                self.record_failure(room, payload.get("error", "Prefill staged transfer failed"))
+                self.update_status(room, KVPoll.Failed)
+            elif message[0] == b"FSA_LAYER_READY":
+                lease = self._layer_leases[room]
+                if self.check_status(room) == KVPoll.Failed:
+                    raise RuntimeError("layer arrived after request failure")
+                lease.receive(payload)
+                reply = b"FSA_LAYER_ACK"
+                address = NetworkAddress(payload["reply_ip"], payload["reply_port"])
+                self._send_multipart_locked(address.to_tcp(), [reply, encode(payload)],
+                                            is_ipv6=address.is_ipv6)
+            else:
+                identity = (room, payload["session"], tuple(payload["token"]))
+                with self._layer_send_lock:
+                    operation = self._layer_operations.get(identity)
+                    if operation is None:
+                        return True
+                    if getattr(operation, "receiver_lease", None) != payload["lease"]:
+                        raise ValueError("layer ACK names a stale lease")
+                    if message[0] == b"FSA_LAYER_ACK":
+                        if operation.state == "transferred":
+                            operation.acknowledge()
+                    else:
+                        operation.state = "failed"
+                        self.record_failure(room, payload.get("error", "receiver layer failure"))
+                        self.update_status(room, KVPoll.Failed)
+        except Exception as exc:
+            logger.exception("NPU layer control message failed")
+            if payload is not None and "room" in payload:
+                room = payload["room"]
+                self.record_failure(room, f"NPU layer control failed: {exc}")
+                self.update_status(room, KVPoll.Failed)
+                if message[0] == b"FSA_LAYER_READY":
+                    lease = self._layer_leases.get(room)
+                    if lease is not None:
+                        lease.failed = True
+                    try:
+                        address = NetworkAddress(payload["reply_ip"], payload["reply_port"])
+                        self._send_multipart_locked(
+                            address.to_tcp(), [b"FSA_LAYER_FAILED", encode({**payload, "error": str(exc)})],
+                            is_ipv6=address.is_ipv6,
+                        )
+                    except Exception:
+                        logger.exception("Could not notify Prefill of layer failure")
+        return True
+
+    def _abort_layer_transfers(self, payload):
+        room = payload["room"]
+        with self._layer_send_lock:
+            self.update_status(room, KVPoll.Failed)
+            self._layer_pending_aborts[(room, payload["session"], payload["lease"])] = payload
+            self._flush_layer_aborts(room)
+
+    def _flush_layer_aborts(self, room):
+        from sglang.srt.hardware_backend.npu.layer_protocol import encode
+
+        with self._layer_send_lock:
+            if getattr(self, "_staging_outstanding", {}).get(room, 0) > 0:
+                return
+            operations = [operation for identity, operation in self._layer_operations.items()
+                          if identity[0] == room]
+            if any(not getattr(operation, "transport_drained",
+                               operation.state in ("transferred", "acknowledged", "drained"))
+                   for operation in operations):
+                return
+            pending = getattr(self, "_layer_pending_aborts", {})
+            for identity, payload in tuple(pending.items()):
+                if identity[0] != room:
+                    continue
+                for operation in operations:
+                    operation.state = "drained"
+                address = NetworkAddress(payload["reply_ip"], payload["reply_port"])
+                self._send_multipart_locked(
+                    address.to_tcp(), [b"FSA_LAYER_ABORT_ACK", encode({
+                        **payload, "reply_ip": self.local_ip, "reply_port": self.rank_port,
+                    })],
+                    is_ipv6=address.is_ipv6,
+                )
+                del pending[identity]
+
+    def requires_strict_abort_drain(self, room):
+        return room in self._layer_leases
+
+    def is_abort_release_safe(self, bootstrap_room, required_acks):
+        lease = self._layer_leases.get(bootstrap_room)
+        if lease is not None:
+            return lease.drained
+        return super().is_abort_release_safe(bootstrap_room, required_acks)
+
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
 
@@ -308,6 +461,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
+                if (ptr, length) in getattr(self, "_layer_staged_host_regions", ()):
+                    continue
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
@@ -318,19 +473,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             add(ptrs, lens)
+        staging = getattr(self, "_layer_staging", None)
+        if staging is not None:
+            add([staging.address], [staging.window_bytes])
         return regions
 
     def register_buffer_to_engine(self):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            status = self.engine.batch_register(list(ptrs), list(lens))
+            if status not in (None, 0):
+                raise RuntimeError(f"transfer-engine memory registration failed: {status}")
 
     def deregister_buffer_to_engine(self):
+        staging = getattr(self, "_layer_staging", None)
+        if staging is not None:
+            if self._layer_leases:
+                raise RuntimeError("drain and clear layer leases before deregistering staging")
+            staging.drain()
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
-            self.engine.batch_deregister(list(ptrs))
+            status = self.engine.batch_deregister(list(ptrs))
+            if status not in (None, 0):
+                raise RuntimeError(f"transfer-engine memory deregistration failed: {status}")
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -749,6 +916,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        completed = getattr(self.kv_args, "prefill_layerwise_completed_ptrs", ())
+        layers_params = [entry for entry in layers_params if entry[0] not in completed]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -2073,6 +2242,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if self._handle_layer_message(waiting_req_bytes):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2087,6 +2258,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    if getattr(self.kv_args, "prefill_layerwise_offload", False):
+                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        continue
                     room_active = (
                         room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
@@ -2185,6 +2359,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
+                    info = self.transfer_infos[room][mooncake_session_id]
+                    if info.layer_manifest and not getattr(self.kv_args, "prefill_layerwise_offload", False):
+                        self.record_failure(room, "Decode layer protocol requires a layerwise Prefill sender")
+                        self.update_status(room, KVPoll.Failed)
+                        continue
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2204,6 +2383,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if self._handle_layer_message(msg):
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -2422,7 +2603,258 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self._layer_ready_operations = {}
+        self._prefill_layer_targets = {}
         self._init_trace_ctx()
+
+    def configure_prefill_layer_targets(self, layer_id, targets):
+        if any(operation.state != "acknowledged"
+               for operation in self._layer_ready_operations.values()):
+            raise RuntimeError("cannot replace layer destinations during a transfer")
+        if not targets or len({target.session_id for target in targets}) != len(targets):
+            raise ValueError("layer targets must contain distinct receiver sessions")
+        self._prefill_layer_targets[layer_id] = tuple(targets)
+
+    def require_prefill_layer_targets(self, layer_ids):
+        layer_ids = tuple(layer_ids)
+        if getattr(self.kv_mgr, "is_dummy_cp_rank", False):
+            self._prefill_layer_dummy_only = True
+            for layer_id in layer_ids:
+                self._prefill_layer_targets.setdefault(layer_id, ())
+            return
+        if not self._prefill_layer_targets:
+            self._load_negotiated_layer_targets()
+        if any(layer_id not in self._prefill_layer_targets for layer_id in layer_ids):
+            raise RuntimeError("receiver layer-ready registrations have not been negotiated")
+
+    def _load_negotiated_layer_targets(self):
+        from sglang.srt.hardware_backend.npu.layer_protocol import parse_targets
+
+        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        if not infos or len(infos) != next(iter(infos.values())).required_dst_info_num:
+            raise RuntimeError("layer bootstrap is incomplete")
+        targets = {}
+        for session_id, info in infos.items():
+            if not info.layer_manifest:
+                raise RuntimeError("Decode endpoint did not negotiate the NPU layer protocol")
+            layers = parse_targets(
+                info.layer_manifest, room=self.bootstrap_room, session_id=session_id,
+                page_size=self.kv_mgr.kv_args.page_size,
+                writer_endpoint=(None if info.is_dummy else
+                                 (getattr(self.kv_mgr, "local_ip", None),
+                                  getattr(self.kv_mgr, "rank_port", None))),
+                notify=lambda lease, record, operation, peer=info:
+                    self._notify_layer_receiver(peer, lease, record, operation),
+            )
+            for layer, target in layers.items():
+                layer_targets = targets.setdefault(layer, [])
+                if not info.is_dummy:
+                    layer_targets.append(target)
+        self._prefill_layer_dummy_only = bool(infos) and all(info.is_dummy for info in infos.values())
+        for layer, layer_targets in targets.items():
+            if layer_targets:
+                self.configure_prefill_layer_targets(layer, layer_targets)
+            else:
+                self._prefill_layer_targets[layer] = ()
+
+    def _notify_layer_receiver(self, peer, lease, record, operation):
+        from sglang.srt.hardware_backend.npu.layer_protocol import encode, ready_payload
+
+        payload = ready_payload(self.bootstrap_room, peer.mooncake_session_id, lease, record, operation)
+        payload.update(reply_ip=self.kv_mgr.local_ip, reply_port=self.kv_mgr.rank_port)
+        with self.kv_mgr._layer_send_lock:
+            if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
+                raise RuntimeError("request failed before receiver notification")
+            operation.receiver_lease = lease
+            address = NetworkAddress(peer.endpoint, peer.dst_port)
+            self.kv_mgr._send_multipart_locked(
+                address.to_tcp(), [b"FSA_LAYER_READY", encode(payload)], is_ipv6=address.is_ipv6
+            )
+
+    def prefill_layer_operations(self):
+        return tuple(self._layer_ready_operations.values())
+
+    def publish_prefill_layer(self, work, binding, source_ready_event, *, layer_offset=0, layer_ids=None):
+        from dataclasses import replace
+
+        from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
+        from sglang.srt.hardware_backend.npu.prefill_offload import (
+            KvComponent, LayerReadyRecord, PdComponentDescriptor, PdSourceKind,
+        )
+
+        wire_layer = work.token.logical_layer if layer_ids is None else layer_ids[work.token.logical_layer]
+        transfer_token = replace(work.token, logical_layer=wire_layer + layer_offset)
+        self.require_prefill_layer_targets((transfer_token.logical_layer,))
+        page_size = work.host_allocation.page_size
+        tensors = {
+            KvComponent.LATENT_K: binding.latent_k,
+            KvComponent.ROPE_K: binding.rope_k,
+        }
+        if binding.indexer_k is not None and not getattr(self.kv_mgr.kv_args, "prefill_layerwise_aux_kv", False):
+            tensors[KvComponent.INDEXER_K] = binding.indexer_k
+        tensors = {component: tensor for component, tensor in tensors.items() if tensor.shape[-1] != 0}
+        registered = set(self.kv_mgr._registerable_regions())
+        sources = {}
+        for component, tensor in tensors.items():
+            if (tensor.data_ptr(), tensor.nbytes) not in registered:
+                raise RuntimeError("layer source is not in the registered transfer inventory")
+            page_bytes = tensor.shape[-1] * tensor.element_size() * page_size
+            sources[component] = RegisteredLayerRegion(
+                tensor.data_ptr(), tensor.nbytes, page_bytes,
+                f"prefill:{tensor.data_ptr()}:{tensor.nbytes}",
+                PdSourceKind.NPU_REGISTERED, str(tensor.dtype), tensor,
+            )
+        operations = []
+        for target in self._prefill_layer_targets[transfer_token.logical_layer]:
+            if set(target.regions) != set(sources):
+                raise ValueError("receiver registration lacks a Prefill KV component")
+            record = LayerReadyRecord(transfer_token, tuple(
+                PdComponentDescriptor(
+                    request_id=work.token.request_id,
+                    logical_layer=transfer_token.logical_layer,
+                    generation=work.token.generation,
+                    component=component,
+                    source_kind=PdSourceKind.NPU_REGISTERED,
+                    source_slot=work.token.slot_id,
+                    source_page_ids=binding.source_page_ids,
+                    destination_page_ids=tuple(target.page_ids[component][:len(binding.source_page_ids)]),
+                    valid_range=work.valid_range,
+                    bytes_per_page=region.bytes_per_page,
+                ) for component, region in sources.items()
+            ))
+            operation = self.send_layer_ready(
+                record, source_regions=sources, destination_regions=target.regions,
+                destination_session_id=target.session_id, page_size=page_size,
+                source_ready_event=source_ready_event,
+                transfer_components=target.transfer_components,
+                staging=target.staging,
+            )
+            operations.append(operation)
+            target.notify(record, operation)
+        return operations
+
+    def send_layer_ready(
+        self,
+        record,
+        *,
+        source_regions,
+        destination_regions,
+        destination_session_id,
+        page_size,
+        source_ready_event,
+        transfer_components=None,
+        staging=None,
+    ):
+        """Write one protected layer using the configured transfer engine.
+
+        This synchronous entry point is separate from whole-request send().
+        It must run outside graph replay. The caller supplies registrations
+        agreed by the layer bootstrap and a completed source-write event.
+        """
+        from sglang.srt.hardware_backend.npu.layer_transfer import (
+            LayerTransferOperation,
+            build_layer_transfer_spans,
+        )
+        from sglang.srt.hardware_backend.npu.prefill_offload import SlotBusyError
+
+        if not destination_session_id:
+            raise ValueError("layer transfer requires a destination session")
+        if self.conclude_state is not None:
+            raise RuntimeError("cannot submit a layer after request completion")
+        key = (record.token, destination_session_id)
+        if key in self._layer_ready_operations:
+            raise RuntimeError("layer generation was already submitted to this peer")
+        if source_ready_event is None or not source_ready_event.query():
+            raise SlotBusyError("layer source writes have not completed")
+        spans = build_layer_transfer_spans(
+            record, source_regions, destination_regions, page_size=page_size,
+            transfer_components=transfer_components,
+        )
+        blocks = [] if staging is not None else [
+            (span.source_address, destination_regions[span.component].address + span.destination_offset, span.nbytes)
+            for span in spans
+        ]
+        operation = LayerTransferOperation(
+            record, source_regions, destination_regions, blocks
+        )
+        self._layer_ready_operations[key] = operation
+        try:
+            with self.kv_mgr._layer_send_lock:
+                from sglang.srt.hardware_backend.npu.layer_protocol import token_identity
+
+                identity = (self.bootstrap_room, destination_session_id,
+                            tuple(token_identity(record.token)))
+                self.kv_mgr._layer_operations[identity] = operation
+                if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
+                    raise RuntimeError("cannot transfer a layer after request failure")
+                if staging is None:
+                    operation.execute(self.kv_mgr._transfer_data, destination_session_id)
+            if staging is not None:
+                self._execute_staged_layer(operation, spans, staging, destination_session_id)
+        except Exception:
+            if operation.state not in ("failed", "drained"):
+                operation.state = "failed"
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            raise
+        finally:
+            flush = getattr(self.kv_mgr, "_flush_layer_aborts", None)
+            if flush is not None:
+                flush(self.bootstrap_room)
+        return operation
+
+    def _execute_staged_layer(self, operation, spans, staging, session_id):
+        from sglang.srt.hardware_backend.npu.layer_protocol import decode, encode, ready_payload
+        from sglang.srt.hardware_backend.npu.layer_staging import execute_staged_layer, request_layer_staging
+
+        peer = self.kv_mgr.transfer_infos[self.bootstrap_room][session_id]
+        manifest = decode(peer.layer_manifest)
+        operation.receiver_lease = manifest["lease"]
+        payload = ready_payload(self.bootstrap_room, session_id, manifest["lease"], operation.record, operation)
+
+        def transfer(block):
+            with self.kv_mgr._layer_send_lock:
+                if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
+                    raise RuntimeError("request aborted before staging write")
+                operation.transport_drained = False
+                status = self.kv_mgr._transfer_data(session_id, [block])
+                operation.transport_drained = status == 0
+                return status
+
+        try:
+            execute_staged_layer(
+                operation, spans, staging, payload,
+                rpc=lambda header, message, timeout: request_layer_staging(self.kv_mgr, peer, header, message, timeout),
+                transfer=transfer, timeout_s=envs.SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S.get(),
+            )
+        except Exception as exc:
+            try:
+                address = NetworkAddress(peer.endpoint, peer.dst_port)
+                rejected = {**payload, "error": str(exc),
+                            "reply_ip": self.kv_mgr.local_ip, "reply_port": self.kv_mgr.rank_port}
+                self.kv_mgr._send_multipart_locked(
+                    address.to_tcp(), [b"FSA_LAYER_REJECTED", encode(rejected)], is_ipv6=address.is_ipv6
+                )
+            except Exception:
+                logger.exception("Could not notify Decode of staged layer failure")
+            raise
+
+    def acknowledge_layer_ready(self, token, destination_session_id):
+        """Apply receiver visibility ACK before releasing registration owners."""
+        operation = self._layer_ready_operations[(token, destination_session_id)]
+        operation.acknowledge()
+
+    def forget_layer_ready(self, token, destination_session_id):
+        key = (token, destination_session_id)
+        operation = self._layer_ready_operations[key]
+        if operation.state not in ("acknowledged", "drained"):
+            raise RuntimeError("layer transfer still needs receiver ACK or failed drain")
+        del self._layer_ready_operations[key]
+        from sglang.srt.hardware_backend.npu.layer_protocol import token_identity
+
+        self.kv_mgr._layer_operations.pop(
+            (self.bootstrap_room, destination_session_id, tuple(token_identity(token))), None
+        )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2436,6 +2868,23 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         if should_skip:
             return
+
+        if getattr(self.kv_mgr.kv_args, "prefill_layerwise_offload", False):
+            if (not self._layer_ready_operations and not getattr(self, "_prefill_layer_dummy_only", False)) or any(
+                operation.state != "acknowledged"
+                for operation in self._layer_ready_operations.values()
+            ):
+                raise RuntimeError("whole-request completion requires all Prefill layer ACKs")
+            if not getattr(self.kv_mgr.kv_args, "prefill_layerwise_aux_kv", False):
+                self._record_transfer_indices(kv_indices, state_indices)
+                if not is_last_chunk:
+                    return
+                self.kv_mgr.add_transfer_request(
+                    self.bootstrap_room, np.empty(0, dtype=np.int32), slice(0, 0), True,
+                    aux_index=self.aux_index, state_indices=state_indices, num_kv_tokens=0,
+                    trace_ctx=self.trace_ctx.copy_for_thread(),
+                )
+                return
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
@@ -2460,8 +2909,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
+        if any(identity[0] == self.bootstrap_room
+               for identity in getattr(self.kv_mgr, "_layer_pending_aborts", ())):
+            self.kv_mgr._flush_layer_aborts(self.bootstrap_room)
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
+            if any(
+                operation.state in ("failed", "drained")
+                for operation in self._layer_ready_operations.values()
+            ):
+                status = KVPoll.Failed
+            if status == KVPoll.Success and any(
+                operation.state != "acknowledged"
+                for operation in self._layer_ready_operations.values()
+            ):
+                return KVPoll.Transferring
             # Hold Success until all staging chunks transferred: a deferred
             # chunk can still be pending, and concluding now would drop it.
             if (
@@ -2480,6 +2942,12 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             return status
         else:
             return self.conclude_state
+
+    def clear(self):
+        for token, session_id in tuple(self._layer_ready_operations):
+            self.forget_layer_ready(token, session_id)
+        self._prefill_layer_targets.clear()
+        super().clear()
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
@@ -2503,6 +2971,37 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
+    def _send_abort_notification(self):
+        lease = self.kv_mgr._layer_leases.get(self.bootstrap_room)
+        if lease is None:
+            return super()._send_abort_notification()
+        from sglang.srt.hardware_backend.npu.layer_protocol import encode
+
+        lease.failed = True
+        payload = encode({"room": self.bootstrap_room, "session": self.session_id,
+                          "lease": lease.lease_id, "reply_ip": self.kv_mgr.local_ip,
+                          "reply_port": self.kv_mgr.rank_port})
+        for peer in self.bootstrap_infos:
+            if peer["is_dummy"]:
+                continue
+            if (peer["rank_ip"], int(peer["rank_port"])) not in lease.writer_endpoints():
+                continue
+            sock, lock = self._connect_to_bootstrap_server(peer)
+            with lock:
+                sock.send_multipart([b"FSA_LAYER_ABORT", payload])
+
+    def clear(self):
+        lease = self.kv_mgr._layer_leases.get(self.bootstrap_room)
+        if lease is not None:
+            success = self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Success
+            if not success and not lease.drained:
+                raise RuntimeError("cannot release a Decode layer lease before transport drain")
+            staging = getattr(self.kv_mgr, "_layer_staging", None)
+            if staging is not None:
+                staging.forget(lease)
+            del self.kv_mgr._layer_leases[self.bootstrap_room]
+        super().clear()
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2516,7 +3015,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                struct.pack("Q", 0 if (ptr, length) in getattr(
+                    self.kv_mgr, "_layer_staged_host_regions", ()
+                ) else ptr)
+                for ptr, length in zip(self.kv_mgr.kv_args.kv_data_ptrs, self.kv_mgr.kv_args.kv_data_lens)
             )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
@@ -2620,6 +3122,34 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        layer_manifest = b""
+        layer_pool = getattr(self.kv_mgr.kv_args, "npu_layer_receive_pool", None)
+        if layer_pool is not None:
+            from sglang.srt.hardware_backend.npu.layer_protocol import select_layer_writers
+
+            if self.kv_mgr.enable_staging:
+                raise ValueError("NPU layer leases require direct receive until staging is negotiated")
+            if self.bootstrap_room in self.kv_mgr._layer_leases:
+                raise RuntimeError("request already owns a layer receive lease")
+            lease = layer_pool.layer_receive_lease(
+                self.bootstrap_room, self.session_id, kv_indices,
+                kv_indices if device_kv_indices is None else device_kv_indices,
+                prefix=decode_prefix_len or 0,
+            )
+            lease.layer_writers = select_layer_writers(self.bootstrap_infos, lease.layers)
+            endpoints = lease.writer_endpoints()
+            lease.writer_endpoint = next(iter(endpoints)) if len(endpoints) == 1 else None
+            staging = getattr(self.kv_mgr, "_layer_staging", None)
+            if staging is not None:
+                lease.staging = staging.manifest()
+            inventory = set(self.kv_mgr._registerable_regions())
+            if any((region.address, region.nbytes) not in inventory and (
+                region.address, region.nbytes
+            ) not in getattr(self.kv_mgr, "_layer_staged_host_regions", ())
+                   for regions in lease.layers.values() for region in regions.values()):
+                raise RuntimeError("Decode layer manifest contains an unregistered region")
+            self.kv_mgr._layer_leases[self.bootstrap_room] = lease
+            layer_manifest = lease.manifest()
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -2653,6 +3183,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
+                            layer_manifest,
                         ]
                     )
             except zmq.ZMQError:
