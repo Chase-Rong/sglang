@@ -70,9 +70,14 @@ class AscendKVManager(MooncakeKVManager):
                         f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
                     )
                 region = (ptr, length)
+                if region in getattr(self, "_layer_staged_host_regions", ()):
+                    continue
                 if region not in seen:
                     seen.add(region)
                     regions.append(region)
+        staging = getattr(self, "_layer_staging", None)
+        if staging is not None:
+            regions.append((staging.address, staging.window_bytes))
         return regions
 
     def get_mla_kv_ptrs_with_pp(
@@ -219,6 +224,8 @@ class AscendKVManager(MooncakeKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            if src_ptr in getattr(self.kv_args, "prefill_layerwise_completed_ptrs", ()):
+                return 0
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
@@ -226,6 +233,10 @@ class AscendKVManager(MooncakeKVManager):
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
+                if src_ptr in getattr(
+                    self.kv_args, "prefill_layerwise_completed_ptrs", ()
+                ):
+                    continue
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 

@@ -300,6 +300,8 @@ def capture_prefill_graph(
             capture_time=capture_time,
         )
 
+    if getattr(model_runner, "prefill_offload_runtime", None) is not None:
+        return result(eager_runner)
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
             "Disable prefill CUDA graph because cuda_graph_config "
@@ -502,6 +504,11 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         memory_usage_gb=0,
         capture_time=0,
     )
+    if (
+        getattr(model_runner, "prefill_offload_runtime", None) is not None
+        and not envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+    ):
+        return no_capture
 
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.

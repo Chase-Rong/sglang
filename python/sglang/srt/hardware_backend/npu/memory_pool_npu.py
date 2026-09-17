@@ -546,6 +546,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        prefill_layer_slots: Optional[int] = None,
+        decode_host_budget: Optional[int] = None,
+        shared_host_group=None,
+        integrated_offload: bool = False,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -571,13 +575,49 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             else [False] * layer_num
         )
         assert len(self.skip_topk_layers) == layer_num
+        if prefill_layer_slots is not None and not 0 < prefill_layer_slots <= layer_num:
+            raise ValueError("Prefill layer slots must fit the logical layer count")
+        self.prefill_layer_slots = prefill_layer_slots
+        self.integrated_offload = integrated_offload
+        if integrated_offload and (
+            prefill_layer_slots is None
+            or decode_host_budget is None
+            or not self._kpool_use_compress
+        ):
+            raise ValueError(
+                "integrated offload requires Prefill slots, Host KV and resident KPool"
+            )
+        self.prefill_offload_runtime = None
+        self.decode_host_backing = None
+        if decode_host_budget is not None:
+            if (
+                prefill_layer_slots is not None and not integrated_offload
+            ) or index_head_dim is None:
+                raise ValueError("Decode Host KV requires a dedicated DSA Decode pool")
+            from sglang.srt.hardware_backend.npu.decode_host_kv import (
+                DecodeHostKvBacking,
+            )
+
+            self.decode_host_backing = DecodeHostKvBacking(
+                layers=layer_num,
+                pages=size // page_size + 1,
+                page_size=page_size,
+                latent_dim=kv_lora_rank,
+                rope_dim=qk_rope_head_dim,
+                dtype=self.store_dtype,
+                device_id=torch.npu.current_device(),
+                host_budget=decode_host_budget,
+                shared_group=shared_host_group,
+            )
+        physical_layers = prefill_layer_slots or layer_num
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
+            self.k_buffer = self._allocate_full_component(
+                0,
                 (
-                    layer_num,
+                    physical_layers,
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
@@ -586,9 +626,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self.v_buffer = torch.zeros(
+            self.v_buffer = self._allocate_full_component(
+                1,
                 (
-                    layer_num,
+                    physical_layers,
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
@@ -601,7 +642,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
-                        layer_num,
+                        layer_num if self._kpool_use_compress else physical_layers,
                         self.size // self.page_size + 1,
                         self.page_size,
                         1,
@@ -622,6 +663,126 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self._finalize_allocation_log(size)
 
+    def _allocate_full_component(self, component, shape, *, dtype, device):
+        if self.decode_host_backing is None or self.integrated_offload:
+            return torch.zeros(shape, dtype=dtype, device=device)
+        return [
+            self.decode_host_backing.layer_views(layer)[component]
+            for layer in range(self.layer_num)
+        ]
+
+    def layer_receive_lease(self, room, session_id, host_pages, device_pages, prefix=0):
+        from uuid import uuid4
+
+        from sglang.srt.hardware_backend.npu.layer_protocol import LayerReceiveLease
+        from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
+        from sglang.srt.hardware_backend.npu.prefill_offload import (
+            KvComponent,
+            PdSourceKind,
+        )
+
+        if self.decode_host_backing is None:
+            raise RuntimeError("layer receive requires registered Decode Host backing")
+        if not hasattr(self, "_layer_receive_registration_id"):
+            self._layer_receive_registration_id = uuid4().hex
+        layers = {}
+        for local_layer in range(self.layer_num):
+            latent, rope = self.decode_host_backing.regions[local_layer]
+            indexer = self.index_k_buffer[local_layer]
+            regions = {}
+            for component, tensor, owner, kind in (
+                (
+                    KvComponent.LATENT_K,
+                    latent.tensor,
+                    latent,
+                    PdSourceKind.HOST_REGISTERED,
+                ),
+                (
+                    KvComponent.ROPE_K,
+                    None if rope is None else rope.tensor,
+                    rope,
+                    PdSourceKind.HOST_REGISTERED,
+                ),
+                (KvComponent.INDEXER_K, indexer, indexer, PdSourceKind.NPU_REGISTERED),
+            ):
+                if self._kpool_use_compress and component == KvComponent.INDEXER_K:
+                    continue
+                if tensor is None or tensor.numel() == 0:
+                    continue
+                regions[component] = RegisteredLayerRegion(
+                    tensor.data_ptr(),
+                    tensor.nbytes,
+                    tensor.shape[-1] * tensor.element_size() * self.page_size,
+                    f"{self._layer_receive_registration_id}:{local_layer}:{component.value}",
+                    kind,
+                    str(tensor.dtype),
+                    owner,
+                )
+            layers[self.start_layer + local_layer] = regions
+        device_id = self.decode_host_backing.pool.device_id
+        shared_group = getattr(self.decode_host_backing.pool, "shared_group", None)
+        if shared_group is not None:
+            shared_group.validate_identity(
+                (
+                    room,
+                    tuple(map(int, host_pages)),
+                    tuple(map(int, device_pages)),
+                    prefix,
+                )
+            )
+
+        def complete_visibility(layer, start, end):
+            torch.npu.set_device(device_id)
+            torch.npu.synchronize(device_id)
+
+        page_ids = {
+            KvComponent.LATENT_K: tuple(map(int, host_pages)),
+            KvComponent.INDEXER_K: tuple(map(int, device_pages)),
+        }
+        if self._kpool_use_compress:
+            del page_ids[KvComponent.INDEXER_K]
+        if self.qk_rope_head_dim:
+            page_ids[KvComponent.ROPE_K] = tuple(map(int, host_pages))
+        return LayerReceiveLease(
+            room,
+            session_id,
+            self.page_size,
+            layers,
+            page_ids,
+            complete_visibility,
+            prefix=prefix,
+            shared_group_id=shared_group.group_id if shared_group is not None else "",
+            shared_host_writer=shared_group is None or shared_group.is_writer,
+        )
+
+    def physical_layer_index(self, layer_id: int) -> int:
+        local_layer = layer_id - self.start_layer
+        if not 0 <= local_layer < self.layer_num:
+            raise IndexError(f"logical KV layer {layer_id} is outside this pool")
+        return local_layer % (self.prefill_layer_slots or self.layer_num)
+
+    def prepare_layer_access(self, layer_id: int) -> int:
+        physical_layer = self.physical_layer_index(layer_id)
+        if self.prefill_layer_slots is not None:
+            if self.prefill_offload_runtime is None:
+                raise RuntimeError("bounded Prefill pool has no layer runtime")
+            self.prefill_offload_runtime.prepare_layer(layer_id)
+        return physical_layer
+
+    def raw_layer_components(self, layer_id: int):
+        physical_layer = self.physical_layer_index(layer_id)
+        return (
+            self.k_buffer[physical_layer],
+            self.v_buffer[physical_layer],
+            None
+            if self.index_k_buffer is None
+            else self.index_k_buffer[
+                layer_id - self.start_layer
+                if self._kpool_use_compress
+                else physical_layer
+            ],
+        )
+
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
@@ -640,9 +801,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_score = None
             return
 
-        assert (
-            max_running_requests is not None
-        ), "NPUMLATokenToKVPool with kpool compress requires max_running_requests"
+        assert max_running_requests is not None, (
+            "NPUMLATokenToKVPool with kpool compress requires max_running_requests"
+        )
         req_pool_size = max_running_requests + 1
         tail_dtype = torch.bfloat16
         tail_width = index_kpool + tail_extra_slots
@@ -675,9 +836,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            self._kpool_use_compress
-        ), "get_compress_tail_buffers called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "get_compress_tail_buffers called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         return (
             self._compress_tail_k[idx],
@@ -704,9 +865,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kpool_decode_update_and_maybe_write_cache_bf16,
         )
 
-        assert (
-            self._kpool_use_compress
-        ), "kpool_decode_update_index_cache called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
         kpool_decode_update_and_maybe_write_cache_bf16(
@@ -735,9 +896,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         n_remain: int,
         dst_logical_start: int,
     ) -> None:
-        assert (
-            self._kpool_use_compress
-        ), "set_compress_tail_for_request called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "set_compress_tail_for_request called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         if n_remain > 0:
             slots = (
@@ -752,9 +913,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         assert hasattr(self, "v_buffer")
         kv_size_bytes = 0
         for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
+            if self.decode_host_backing is None or self.integrated_offload:
+                kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
+            if self.decode_host_backing is None or self.integrated_offload:
+                kv_size_bytes += get_tensor_size_bytes(v_cache)
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
@@ -762,19 +925,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
+        if self.integrated_offload and not getattr(
+            self.prefill_offload_runtime, "active", False
+        ):
+            return self.decode_host_backing.layer_views(layer_id - self.start_layer)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[self.prepare_layer_access(layer_id)],
+            self.v_buffer[self.prepare_layer_access(layer_id)],
         )
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
-        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        layers = [
+            self.raw_layer_components(self.start_layer + i)[2]
+            for i in range(self.layer_num)
+        ]
+        data_ptrs = [layers[i].data_ptr() for i in range(self.layer_num)]
+        data_lens = [layers[i].nbytes for i in range(self.layer_num)]
+        item_lens = [layers[i][0].nbytes for i in range(self.layer_num)]
         return data_ptrs, data_lens, item_lens
 
     @property
@@ -798,28 +969,40 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
+        if self.integrated_offload:
+            return self.get_kv_buffer(layer_id)[0]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[self.prepare_layer_access(layer_id)].view(self.dtype)
+        return self.k_buffer[self.prepare_layer_access(layer_id)]
 
     def get_value_buffer(self, layer_id: int):
+        if self.integrated_offload:
+            return self.get_kv_buffer(layer_id)[1]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[self.prepare_layer_access(layer_id)].view(self.dtype)
+        return self.v_buffer[self.prepare_layer_access(layer_id)]
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+            return self.index_k_buffer[
+                layer_id - self.start_layer
+                if self._kpool_use_compress
+                else self.prepare_layer_access(layer_id)
+            ].view(self.dtype)
+        return self.index_k_buffer[
+            layer_id - self.start_layer
+            if self._kpool_use_compress
+            else self.prepare_layer_access(layer_id)
+        ]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -831,7 +1014,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         skipped_empty = []
         for name, bufs in sections:
             for i in range(self.layer_num):
-                buf = bufs[i]
+                physical = i % (self.prefill_layer_slots or self.layer_num)
+                if name == "index_k" and self._kpool_use_compress:
+                    physical = i
+                buf = bufs[physical]
                 if buf.numel() == 0:
                     # Zero-size placeholder (e.g. v/rope cache when
                     # qk_rope_head_dim == 0); skipping keeps the registration
@@ -849,7 +1035,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             (name, i)
             for name, bufs in sections
             for i in range(self.layer_num)
-            if bufs[i].numel() != 0 and bufs[i].data_ptr() == 0
+            if bufs[i % len(bufs)].numel() != 0 and bufs[i % len(bufs)].data_ptr() == 0
         ]
         if zero_bufs:
             logger.error(
@@ -879,14 +1065,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
+        if self.decode_host_backing is not None:
+            self.decode_host_backing.write_current(
+                layer_id - self.start_layer, loc, cache_k, cache_v
+            )
+            if not self.integrated_offload or not getattr(
+                self.prefill_offload_runtime, "active", False
+            ):
+                return
+
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            self.k_buffer[self.prepare_layer_access(layer_id)].view(
+                -1, 1, self.kv_lora_rank
+            ),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         if self.qk_rope_head_dim > 0:
             torch_npu.npu_scatter_nd_update_(
-                self.v_buffer[layer_id - self.start_layer].view(
+                self.v_buffer[self.prepare_layer_access(layer_id)].view(
                     -1, 1, self.qk_rope_head_dim
                 ),
                 loc.view(-1, 1),
@@ -906,9 +1103,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.index_head_dim
-            ),
+            self.index_k_buffer[
+                layer_id - self.start_layer
+                if self._kpool_use_compress
+                else self.prepare_layer_access(layer_id)
+            ].view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )

@@ -903,6 +903,17 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION = EnvBool(False)
+    SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE = EnvStr("fused")
+    SGLANG_NPU_FSA_RESIDENT_CAPACITY = EnvInt(4096)
+    SGLANG_NPU_SHARED_HOST_KV = EnvBool(True)
+    SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD = EnvBool(False)
+    SGLANG_NPU_LAYER_STAGING_BYTES = EnvInt(0)
+    SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S = EnvFloat(30.0)
+    SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD = EnvBool(False)
+    SGLANG_NPU_PREFILL_LAYER_SLOTS = EnvInt(2)
+    SGLANG_NPU_PREFILL_HOST_KV_BYTES = EnvInt(0)
+    SGLANG_NPU_DECODE_HOST_KV_BYTES = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)

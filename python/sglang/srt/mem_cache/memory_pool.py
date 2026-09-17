@@ -282,6 +282,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self.req_generation_epoch = 0
         self._aux_cache: Any = None
 
     def write(self, indices, values):
@@ -339,6 +340,7 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        self.req_generation_epoch += 1
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
@@ -3691,6 +3693,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        fsa_pool_kwargs: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3794,6 +3797,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 **pool_kwargs,
+                **(fsa_pool_kwargs or {}),
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3820,6 +3824,8 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
+        if fsa_pool_kwargs:
+            self.full_kv_pool.fsa_wire_layer_ids = tuple(full_attention_layer_ids)
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
@@ -3833,6 +3839,56 @@ class HybridLinearKVPool(KVCache):
     @property
     def post_capture_backed_bytes(self) -> int:
         return self.full_kv_pool.post_capture_backed_bytes
+
+    @property
+    def prefill_layer_slots(self):
+        return getattr(self.full_kv_pool, "prefill_layer_slots", None)
+
+    @property
+    def prefill_offload_runtime(self):
+        return getattr(self.full_kv_pool, "prefill_offload_runtime", None)
+
+    @prefill_offload_runtime.setter
+    def prefill_offload_runtime(self, runtime):
+        self.full_kv_pool.prefill_offload_runtime = runtime
+
+    @property
+    def decode_host_backing(self):
+        return getattr(self.full_kv_pool, "decode_host_backing", None)
+
+    @property
+    def kv_lora_rank(self):
+        return self.full_kv_pool.kv_lora_rank
+
+    @property
+    def qk_rope_head_dim(self):
+        return self.full_kv_pool.qk_rope_head_dim
+
+    @property
+    def layer_num(self):
+        return self.full_layer_nums
+
+    @property
+    def store_dtype(self):
+        return self.full_kv_pool.store_dtype
+
+    def layer_receive_lease(self, *args, **kwargs):
+        lease = self.full_kv_pool.layer_receive_lease(*args, **kwargs)
+        inverse = {
+            local: global_id
+            for global_id, local in self.full_attention_layer_id_mapping.items()
+        }
+        complete = lease.visibility
+        lease.layers = {
+            inverse[layer]: region for layer, region in lease.layers.items()
+        }
+        lease.prefixes = {
+            inverse[layer]: prefix for layer, prefix in lease.prefixes.items()
+        }
+        lease.visibility = lambda layer, start, end: complete(
+            self._transfer_full_attention_id(layer), start, end
+        )
+        return lease
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.

@@ -507,6 +507,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        if getattr(self.token_to_kv_pool, "decode_host_backing", None) is not None:
+            kv_args.npu_layer_receive_pool = self.token_to_kv_pool
+            if self.draft_token_to_kv_pool is not None:
+                from sglang.srt.hardware_backend.npu.layer_receive_group import (
+                    LayerReceivePoolGroup,
+                )
+
+                kv_args.npu_layer_receive_pool = LayerReceivePoolGroup(
+                    self.token_to_kv_pool,
+                    self.draft_token_to_kv_pool,
+                    self.scheduler.model_config.num_hidden_layers,
+                )
 
         attn_tp_size = get_parallel().attn_tp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
@@ -2370,11 +2382,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                strict_layer_drain = getattr(
+                    decode_req.kv_receiver.kv_mgr,
+                    "requires_strict_abort_drain",
+                    lambda room: False,
+                )(decode_req.req.bootstrap_room)
+                if strict_layer_drain and not decode_req.kv_receiver.abort_notified:
+                    decode_req.kv_receiver._send_abort_notification()
+                    decode_req.kv_receiver.abort_notified = True
                 if (
-                    self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
-                ):
+                    strict_layer_drain
+                    or (
+                        self.enable_deferred_kv_release
+                        and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
+                    )
+                ) and decode_req.kv_receiver.abort_notified:
                     # Decode-initiated abort: a prefill write may still target
                     # these pages, so hold them until the drain ack or timeout.
                     # (A prefill-initiated failure has already stopped writing ->
@@ -2474,6 +2496,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def resolve_deferred_releases(self) -> None:
         """Release held requests once every prefill rank acks the drain, or the
         hold times out."""
+        shared_drained = None
+        pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        backing = getattr(pool, "decode_host_backing", None)
+        shared_group = (
+            getattr(backing.pool, "shared_group", None) if backing is not None else None
+        )
+        if shared_group is not None:
+            from sglang.srt.hardware_backend.npu.shared_host_kv import (
+                shared_abort_drain_readiness,
+            )
+
+            shared_drained = shared_abort_drain_readiness(
+                shared_group.group,
+                {
+                    entry.req.bootstrap_room: entry.kv_receiver.kv_mgr.is_abort_release_safe(
+                        entry.req.bootstrap_room, required_acks
+                    )
+                    for entry, _, _, required_acks in self._deferred_releases
+                },
+            )
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -2483,7 +2525,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            if shared_drained is not None:
+                drained = drained and shared_drained.get(room, False)
+            strict = getattr(kv_mgr, "requires_strict_abort_drain", lambda room: False)(
+                room
+            )
+            if not drained and (now < deadline or strict):
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
