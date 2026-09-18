@@ -122,6 +122,16 @@ private:
     __aicore__ inline void CopyOutSelectionMisses(LocalTensor<KV_T> kvInUb,
         LocalTensor<int16_t> compactPlanLocal, int64_t dealRow,
         int64_t selectionRow, ConstInfo &constInfo);
+    __aicore__ inline void SignalKvReady(
+        Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
+        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm);
+    __aicore__ inline int64_t CopySparseKvBatch(
+        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
+        LocalTensor<int16_t> selectionPlanLocal, LocalTensor<int16_t> compactPlanLocal,
+        int64_t &s2, uint32_t pingPong, const RunInfo &runInfo, ConstInfo &constInfo);
+    __aicore__ inline bool CopyPlannedKvWindow(LocalTensor<KV_T> destination,
+        LocalTensor<int16_t> selectionPlanLocal, LocalTensor<int16_t> compactPlanLocal,
+        int64_t start, int64_t count, const RunInfo &runInfo, ConstInfo &constInfo);
     /* VEC2_RES_T is the current type of bmm2ResUb. No cast is needed when VEC2_RES_T == Q_T.
        Invalid-row cases currently require a cast by default. */
     using VEC2_RES_T = T;
@@ -191,6 +201,7 @@ private:
     int64_t selectionDirectRowStride = 0;
     int64_t selectionPlanOffset = 0;
     bool externalSelectionPlanActive = false;
+    bool selectionWindowHasMiss = true;
 
     static constexpr int16_t SELECTION_EXTERNAL_PLAN_READY_MARKER = 0x5A45;
     static constexpr int16_t SELECTION_DIRECT_LAYOUT_MARKER = 0x5A44;
@@ -475,7 +486,7 @@ FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::CopyOutSelectionMisses(
     LocalTensor<KV_T> kvInUb, LocalTensor<int16_t> compactPlanLocal,
     int64_t dealRow, int64_t selectionRow, ConstInfo &constInfo)
 {
-    if (!externalSelectionPlanActive || selectionRow < 0) {
+    if (!externalSelectionPlanActive || selectionRow < 0 || !selectionWindowHasMiss) {
         return;
     }
     DataCopyExtParams kvParams;
@@ -629,6 +640,13 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void FusedSparseAttentionOverlapVecto
 
     CalSparseCalSize(runInfo, constInfo);
     ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo, startPos);
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void
+FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::SignalKvReady(
+    Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
+    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm)
+{
     if constexpr (IS_SPLIT_G) {
         CrossCoreSetFlag<0, PIPE_MTE3>(15);
         CrossCoreWaitFlag<0, PIPE_MTE3>(15);
@@ -649,46 +667,154 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void FusedSparseAttentionOverlapVecto
     int64_t logicalSelectionRow = -1;
     PrepareExternalSelectionPlan(runInfo, constInfo, selectionPlanLocal, logicalSelectionRow);
     if (sparseCalSize == 0) {
+        SignalKvReady(outputL1, v0ResGm);
         return;
     }
-    int64_t s2Start = sparseS2Start;
     int64_t s2 = sparseS2Start;
-    int64_t token0Idx;
-    int64_t token1Idx; // Indices of the two copied tokens
-    // Process one S2 base block.
     uint32_t pingPong = 0;
-    while (s2 < sparseS2End) {
-        int64_t dealRow = 0;
-        // 1. Copy KV in, GM to UB.
+    while (sparseS2End - s2 > 16) {
+        int64_t dealRow = CopySparseKvBatch(v0ResGm, selectionPlanLocal, compactPlanLocal,
+            s2, pingPong, runInfo, constInfo);
         LocalTensor<Q_T> stage0OutUb = this->stage0OutBuf[pingPong].template Get<Q_T>();
-        WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
-        while (dealRow < Min(16, sparseCalSize) && s2 < sparseS2End) { // Copy 16 rows or stop on -1
-            GetRealCmpS2Idx(token0Idx, token1Idx, s2, runInfo, constInfo);
-            int16_t planValue0 = externalSelectionPlanActive ? selectionPlanLocal.GetValue(s2) : 0;
-            int16_t planValue1 = externalSelectionPlanActive && s2 + 1 < runInfo.s2RealSize ?
-                selectionPlanLocal.GetValue(s2 + 1) : 0;
-            s2 += 2; // Copy two rows per iteration
-            dealRow += CopyInKvWithExternalPlan(stage0OutUb, compactPlanLocal, dealRow,
-                token0Idx, token1Idx, planValue0, planValue1, runInfo, constInfo);
-            if (s2 > sparseS2End) {
-                --dealRow;
-            }
-        }
-        if (dealRow  == 0) {
-            SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
-            pingPong ^= 1;
-            return;
-        }
-        SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
-        WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
-        // 2. Copy KV out, UB to L1.
-        CopyOutKvUb2Gm(v0ResGm, stage0OutUb, dealRow, s2Start, runInfo, constInfo);
         CopyOutSelectionMisses(stage0OutUb, compactPlanLocal, dealRow,
             selectionDataRow, constInfo);
         SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
-        s2Start += dealRow;
         pingPong ^= 1;
     }
+    int64_t dealRow = CopySparseKvBatch(v0ResGm, selectionPlanLocal, compactPlanLocal,
+        s2, pingPong, runInfo, constInfo);
+    if constexpr (!IS_SPLIT_G) {
+        SignalKvReady(outputL1, v0ResGm);
+    }
+    LocalTensor<Q_T> stage0OutUb = this->stage0OutBuf[pingPong].template Get<Q_T>();
+    CopyOutSelectionMisses(stage0OutUb, compactPlanLocal, dealRow,
+        selectionDataRow, constInfo);
+    SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
+    if constexpr (IS_SPLIT_G) {
+        SignalKvReady(outputL1, v0ResGm);
+    }
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline int64_t
+FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::CopySparseKvBatch(
+    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
+    LocalTensor<int16_t> selectionPlanLocal, LocalTensor<int16_t> compactPlanLocal,
+    int64_t &s2, uint32_t pingPong, const RunInfo &runInfo, ConstInfo &constInfo)
+{
+    int64_t s2Start = s2;
+    int64_t dealRow = 0;
+    selectionWindowHasMiss = true;
+    LocalTensor<Q_T> stage0OutUb = this->stage0OutBuf[pingPong].template Get<Q_T>();
+    WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
+    int64_t windowSize = Min(static_cast<int64_t>(16), sparseS2End - s2);
+    if (externalSelectionPlanActive && selectionDirectRowStride > 0 &&
+        CopyPlannedKvWindow(stage0OutUb, selectionPlanLocal, compactPlanLocal,
+            s2, windowSize, runInfo, constInfo)) {
+        dealRow = windowSize;
+        s2 += windowSize;
+    }
+    while (dealRow < 16 && s2 < sparseS2End) {
+        int64_t token0Idx;
+        int64_t token1Idx;
+        GetRealCmpS2Idx(token0Idx, token1Idx, s2, runInfo, constInfo);
+        int16_t planValue0 = externalSelectionPlanActive ? selectionPlanLocal.GetValue(s2) : 0;
+        int16_t planValue1 = externalSelectionPlanActive && s2 + 1 < runInfo.s2RealSize ?
+            selectionPlanLocal.GetValue(s2 + 1) : 0;
+        s2 += 2;
+        dealRow += CopyInKvWithExternalPlan(stage0OutUb, compactPlanLocal, dealRow,
+            token0Idx, token1Idx, planValue0, planValue1, runInfo, constInfo);
+        if (s2 > sparseS2End) {
+            --dealRow;
+        }
+    }
+    SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
+    WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
+    CopyOutKvUb2Gm(v0ResGm, stage0OutUb, dealRow, s2Start, runInfo, constInfo);
+    return dealRow;
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::CopyPlannedKvWindow(
+    LocalTensor<KV_T> destination, LocalTensor<int16_t> selectionPlanLocal,
+    LocalTensor<int16_t> compactPlanLocal, int64_t start, int64_t count,
+    const RunInfo &runInfo, ConstInfo &constInfo)
+{
+    int16_t plans[16];
+    for (int64_t row = 0; row < count; ++row) {
+        plans[row] = selectionPlanLocal.GetValue(start + row);
+        if (plans[row] == 0 || plans[row] > selectionDirectRowStride ||
+            plans[row] < -selectionDirectRowStride) {
+            return false;
+        }
+    }
+    DataCopyExtParams copyParams;
+    copyParams.blockLen = constInfo.dSizeNope * sizeof(KV_T);
+    copyParams.dstStride = (576 - constInfo.dSizeNope) * sizeof(KV_T) / BUFFER_SIZE_BYTE_32B;
+    DataCopyPadExtParams<KV_T> padParams{false, 0, 0, 0};
+    bool hasMiss = false;
+    for (int64_t row = 0; row < count;) {
+        bool fromSelection = plans[row] > 0;
+        int64_t runLength = 1;
+        int64_t offset0;
+        int64_t offset1 = -1;
+        if (fromSelection) {
+            offset0 = GetSelectionTokenOffset(selectionDataRow, plans[row] - 1);
+            while (row + runLength < count && plans[row + runLength] == plans[row] + runLength) {
+                ++runLength;
+            }
+            if (offset0 < 0 || plans[row] + runLength - 1 > selectionDirectRowStride) {
+                return false;
+            }
+            if (runLength == 1 && row + 1 < count && plans[row + 1] > 0) {
+                offset1 = GetSelectionTokenOffset(selectionDataRow, plans[row + 1] - 1);
+            }
+        } else {
+            hasMiss = true;
+            int64_t token0;
+            int64_t token1;
+            GetRealCmpS2Idx(token0, token1, start + row, runInfo, constInfo);
+            if (token0 < 0) {
+                return false;
+            }
+            offset0 = GetkeyOffset(token0, runInfo, constInfo);
+            if (row + 1 < count && plans[row + 1] <= 0 && token1 >= 0) {
+                offset1 = GetkeyOffset(token1, runInfo, constInfo);
+            }
+            if (offset0 < 0) {
+                return false;
+            }
+        }
+        copyParams.srcStride = 0;
+        if (offset1 >= 0) {
+            int64_t distance = offset1 - offset0;
+            int64_t stride = ((distance < 0 ? -distance : distance) - 1) *
+                constInfo.dSizeNope * sizeof(KV_T);
+            if (stride >= 0 && stride < INT32_MAX) {
+                if (distance < 0) {
+                    offset0 = offset1;
+                    int16_t savedPlan = plans[row];
+                    plans[row] = plans[row + 1];
+                    plans[row + 1] = savedPlan;
+                }
+                copyParams.srcStride = stride;
+                runLength = 2;
+            }
+        }
+        copyParams.blockCount = runLength;
+        if (fromSelection) {
+            DataCopyPad(destination[row * 576], selectionKvCacheGm[offset0 * constInfo.dSizeNope],
+                copyParams, padParams);
+        } else {
+            DataCopyPad(destination[row * 576], keyGm[offset0 * constInfo.dSizeNope],
+                copyParams, padParams);
+        }
+        for (int64_t offset = 0; offset < runLength; ++offset) {
+            compactPlanLocal.SetValue(row + offset, plans[row + offset]);
+        }
+        row += runLength;
+    }
+    selectionWindowHasMiss = hasMiss;
+    return true;
 }
 
 TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::ProcessVec1(
