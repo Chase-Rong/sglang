@@ -101,6 +101,27 @@ def test_transfer_copies_only_partial_page_range_and_independent_components(modu
     ]
 
 
+def test_nope_layer_transfer_accepts_registered_latent_without_rope(modules):
+    protocol, transfer = modules
+    record, sources, destinations = inputs(*modules)
+    keep = {protocol.KvComponent.LATENT_K, protocol.KvComponent.INDEXER_K}
+    record = protocol.LayerReadyRecord(
+        record.token, tuple(entry for entry in record.components if entry.component in keep)
+    )
+    sources = {key: value for key, value in sources.items() if key in keep}
+    destinations = {key: value for key, value in destinations.items() if key in keep}
+    blocks = transfer.build_layer_transfer_blocks(record, sources, destinations, page_size=2)
+    assert blocks == [(1040, 2024, 8), (1000, 2048, 8), (1240, 2224, 8), (1200, 2248, 8)]
+
+
+def test_layer_transfer_rejects_publication_missing_registered_component(modules):
+    protocol, transfer = modules
+    record, sources, destinations = inputs(*modules)
+    record = protocol.LayerReadyRecord(record.token, record.components[:-1])
+    with pytest.raises(ValueError, match="components do not match"):
+        transfer.build_layer_transfer_blocks(record, sources, destinations, page_size=2)
+
+
 def test_transfer_rejects_unregistered_bounds_or_wrong_destination_kind(modules):
     protocol, transfer = modules
     record, sources, destinations = inputs(*modules)
