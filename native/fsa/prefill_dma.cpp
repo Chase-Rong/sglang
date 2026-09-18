@@ -1,5 +1,6 @@
 #include "prefill_dma.h"
 #include "external_host_mapping.h"
+#include "dma_segments.h"
 
 #include <acl/acl.h>
 #include <utility>
@@ -19,8 +20,8 @@ void PrefillDmaCopy(const at::Tensor &device_tensor, const at::Tensor &host_meta
                 host_metadata.is_contiguous() && device_tensor.dim() == 2 && host_metadata.dim() == 2 &&
                 device_tensor.scalar_type() == host_metadata.scalar_type() &&
                 device_tensor.size(1) == host_metadata.size(1), "DMA row layout mismatch");
-    TORCH_CHECK(ValidateMemFabricRegion(host_metadata.data_ptr(), device_address, host_metadata.nbytes(),
-                                      stream.device_index()), "DMA requires a live MemFabric allocation");
+    const auto segment_ends = MemFabricDmaSegmentEnds(host_metadata.data_ptr(), device_address,
+                                                     host_metadata.nbytes(), stream.device_index());
     TORCH_CHECK(runs.device().is_cpu() && runs.is_contiguous() && runs.scalar_type() == at::kLong &&
                 runs.dim() == 2 && runs.size(1) == 2, "DMA runs must be contiguous CPU int64 [N,2]");
     const auto *entries = runs.const_data_ptr<int64_t>();
@@ -33,8 +34,9 @@ void PrefillDmaCopy(const at::Tensor &device_tensor, const at::Tensor &host_meta
         TORCH_CHECK(start > 0 && count > 0 && count <= device_tensor.size(0) &&
                     count <= host_metadata.size(0) && start <= device_tensor.size(0) - count &&
                     start <= host_metadata.size(0) - count, "DMA run is outside the KV allocation");
-        copies.emplace_back(static_cast<uint64_t>(start) * row_bytes,
-                            static_cast<uint64_t>(count) * row_bytes);
+        const auto segments = SplitDmaRun(static_cast<uint64_t>(start) * row_bytes,
+                                         static_cast<uint64_t>(count) * row_bytes, segment_ends);
+        copies.insert(copies.end(), segments.begin(), segments.end());
     }
     c10_npu::NPUCachingAllocator::recordStream(device_tensor.storage().data_ptr(), stream);
     const auto raw_stream = stream.stream(false);

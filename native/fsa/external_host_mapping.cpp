@@ -1,5 +1,7 @@
 #include "external_host_mapping.h"
 
+#include <acl/acl.h>
+#include <algorithm>
 #include <dlfcn.h>
 #include <limits>
 #include <map>
@@ -12,9 +14,28 @@ namespace {
 struct Mapping {
     uint64_t device_address;
     uint64_t bytes;
+    std::vector<uint64_t> dma_segment_ends;
 };
 std::mutex mapping_mutex;
 std::map<std::pair<uint64_t, int64_t>, Mapping> mappings;
+
+std::vector<uint64_t> QueryDmaSegmentEnds(uint64_t device, uint64_t bytes)
+{
+    std::vector<uint64_t> ends;
+    uint64_t offset = 0;
+    while (offset < bytes) {
+        void *base = nullptr;
+        size_t size = 0;
+        const auto address = device + offset;
+        const auto result = aclrtMemGetAddressRange(reinterpret_cast<void *>(address), &base, &size);
+        const auto start = reinterpret_cast<uint64_t>(base);
+        TORCH_CHECK(result == ACL_SUCCESS && start <= address && address - start < size,
+                    "Cannot query MemFabric DMA mapping range: ", result);
+        offset += std::min<uint64_t>(bytes - offset, size - (address - start));
+        ends.push_back(offset);
+    }
+    return ends;
+}
 
 uint64_t QueryDeviceAddress(uint64_t address, bool shared_gva)
 {
@@ -55,7 +76,7 @@ std::tuple<at::Tensor, int64_t> CreateMemFabricRegion(int64_t address, at::IntAr
                 "MemFabric allocation is not a contiguous device mapping");
     auto metadata = at::from_blob(reinterpret_cast<void *>(address), shape, dtype_template.options());
     std::lock_guard<std::mutex> guard(mapping_mutex);
-    TORCH_CHECK(mappings.emplace(std::make_pair(address, device_id), Mapping{device, bytes}).second,
+    TORCH_CHECK(mappings.emplace(std::make_pair(address, device_id), Mapping{device, bytes, {}}).second,
                 "MemFabric allocation already registered");
     return {metadata, static_cast<int64_t>(device)};
 }
@@ -81,7 +102,7 @@ void RegisterMemFabricRegion(const at::Tensor &source, int64_t device_address, i
     TORCH_CHECK(query(host, &first) == 0 && query(host + bytes - 1, &last) == 0 &&
                 first == device && last == device + bytes - 1, "MemFabric range is not mapped to the supplied DVA");
     std::lock_guard<std::mutex> guard(mapping_mutex);
-    TORCH_CHECK(mappings.emplace(std::make_pair(host, device_id), Mapping{device, bytes}).second,
+    TORCH_CHECK(mappings.emplace(std::make_pair(host, device_id), Mapping{device, bytes, {}}).second,
                 "MemFabric allocation already registered");
 }
 
@@ -101,5 +122,22 @@ bool ValidateMemFabricRegion(const void *host, uint64_t device_address, uint64_t
     auto entry = mappings.find(std::make_pair(reinterpret_cast<uint64_t>(host), device_id));
     return entry != mappings.end() && bytes > 0 && bytes <= entry->second.bytes &&
         device_address == entry->second.device_address;
+}
+
+std::vector<uint64_t> MemFabricDmaSegmentEnds(const void *host, uint64_t device_address,
+                                           uint64_t bytes, int64_t device_id)
+{
+    std::lock_guard<std::mutex> guard(mapping_mutex);
+    auto entry = mappings.find(std::make_pair(reinterpret_cast<uint64_t>(host), device_id));
+    TORCH_CHECK(entry != mappings.end() && bytes > 0 && bytes <= entry->second.bytes &&
+                device_address == entry->second.device_address,
+                "DMA requires a live MemFabric allocation");
+    // Lazy, per-registration cache: no runtime queries on later chunks or graph
+    // replay, and unregister removes boundaries along with the mapping.
+    auto &mapping = entry->second;
+    if (mapping.dma_segment_ends.empty()) {
+        mapping.dma_segment_ends = QueryDmaSegmentEnds(mapping.device_address, mapping.bytes);
+    }
+    return mapping.dma_segment_ends;
 }
 }
