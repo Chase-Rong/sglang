@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -82,6 +83,10 @@ def test_mtp_selection_requires_external_validity_tracking():
 
 
 def test_missing_fused_binary_fails_explicitly(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.hardware_backend.npu.fsa_native",
+        SimpleNamespace(load_native_extension=lambda: False),
+    )
     monkeypatch.setattr(torch, "ops", SimpleNamespace())
     with pytest.raises(FusedSparseAttentionUnavailable, match="not loaded"):
         resolve_op()
@@ -201,6 +206,18 @@ def test_layer_state_is_not_shared_even_with_shared_topk():
     assert second.selection_kv_cache.data_ptr() != first.selection_kv_cache.data_ptr()
     assert torch.all(second.selection_kv_block_status == -1)
     assert torch.all(state.build_inputs(**arguments).selection_kv_block_status == 42)
+
+
+def test_target_and_draft_with_shared_requests_keep_separate_selection():
+    target, arguments = make_state_and_inputs()
+    draft, _ = make_state_and_inputs()
+    draft.pool = target.pool
+    target_inputs = target.build_inputs(**arguments)
+    target_inputs.selection_kv_block_status.fill_(42)
+    draft_inputs = draft.build_inputs(**arguments)
+    assert draft_inputs.selection_kv_cache.data_ptr() != target_inputs.selection_kv_cache.data_ptr()
+    assert torch.all(draft_inputs.selection_kv_block_status == -1)
+    assert torch.all(target.build_inputs(**arguments).selection_kv_block_status == 42)
 
 
 def test_reallocated_request_slot_invalidates_selection():

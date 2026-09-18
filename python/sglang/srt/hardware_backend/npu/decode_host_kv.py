@@ -36,7 +36,10 @@ class DecodeHostKvBacking:
             )
 
             self.pool = MemFabricHostKvPool(
-                device_id, required_bytes=required, shared_group=shared_group
+                device_id,
+                required_bytes=required,
+                reserve_bytes=host_budget,
+                shared_group=shared_group,
             )
         elif shared_group is None:
             self.pool = NpuRegisteredHostKvPool(device_id)

@@ -367,7 +367,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if getattr(self.draft_runner, "prefill_offload_runtime", None) is not None:
+        runtime = getattr(self.draft_runner, "prefill_offload_runtime", None)
+        if runtime is not None and not getattr(
+            getattr(runtime, "pool", None), "integrated_offload", False
+        ):
             return
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
@@ -520,6 +523,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    def _execute_draft_graph(self, graph_runner, forward_batch, *args):
+        # Specialized draft graphs bypass ModelRunner._forward_raw. Preserve
+        # its Host KV visibility dependency without a CPU/device-wide barrier.
+        with self.draft_runner.prefill_offload_forward(forward_batch):
+            return graph_runner.execute(forward_batch, *args)
+
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
@@ -553,7 +562,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self._execute_draft_graph(self.cuda_graph_runner, forward_batch)
                 )
             else:
                 if (
@@ -1001,8 +1010,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             if can_run_decode_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch, select_index
+                draft_logits_output = self._execute_draft_graph(
+                    self.cuda_graph_runner_for_draft_extend, forward_batch, select_index
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(

@@ -50,11 +50,21 @@ def resolve_transfer_device(logical_device, physical_override, visible_devices):
     return physical_device
 
 
-def validate_prefill_overlap(*, integrated, prefill, speculative, mixed_chunk, cp_size, dcp_size):
+def validate_integrated_layout(*, integrated, prefill, mixed_chunk, cp_size, dcp_size):
     if not integrated or not prefill:
-        raise ValueError("Prefill copy overlap requires integrated layerwise offload")
-    if speculative or mixed_chunk or cp_size != 1 or dcp_size != 1:
-        raise ValueError("Prefill copy overlap requires MTP0, separate Prefill batches and CP1/DCP1")
+        raise ValueError("Integrated offload requires layerwise Prefill")
+    if mixed_chunk or cp_size != 1 or dcp_size != 1:
+        raise ValueError("Integrated offload requires separate Prefill batches and CP1/DCP1")
+
+
+def validate_prefill_overlap(*, integrated, prefill, speculative, mixed_chunk, cp_size, dcp_size):
+    try:
+        validate_integrated_layout(integrated=integrated, prefill=prefill,
+                                   mixed_chunk=mixed_chunk, cp_size=cp_size, dcp_size=dcp_size)
+    except ValueError as error:
+        raise ValueError(f"Prefill copy overlap: {error}") from error
+    # MTP graph replay enters the Prefill runtime context before consuming KV;
+    # its Host-visibility event orders asynchronous copies on the replay stream.
 
 
 def fsa_pool_options(kvc, layer_count):
@@ -69,11 +79,10 @@ def fsa_pool_options(kvc, layer_count):
     host_budget = envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get()
     integrated = envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
     if integrated:
-        from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+        from sglang.srt.runtime_context import get_parallel, get_schedule
 
-        validate_prefill_overlap(
+        validate_integrated_layout(
             integrated=integrated, prefill=prefill,
-            speculative=get_spec().speculative_algorithm is not None,
             mixed_chunk=get_schedule().enable_mixed_chunk,
             cp_size=get_parallel().attn_cp_size, dcp_size=get_parallel().attn_dcp_size,
         )

@@ -1023,6 +1023,8 @@ class ModelRunner:
             from sglang.srt.hardware_backend.npu.prefill_overlap import PipelinedIntegratedOffloadRuntime
 
             pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+            # Eager forwards and direct MTP graph replay both enter the runtime
+            # context, which waits for the preceding Prefill Host publication.
             runtime = PipelinedIntegratedOffloadRuntime(pool, self.req_to_token_pool)
             self.prefill_offload_runtime = runtime
             self.token_to_kv_pool.prefill_offload_runtime = runtime

@@ -14,7 +14,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 @pytest.mark.parametrize("changes", [
-    {"integrated": False}, {"prefill": False}, {"speculative": True},
+    {"integrated": False}, {"prefill": False},
     {"mixed_chunk": True}, {"cp_size": 2}, {"dcp_size": 2},
 ])
 def test_prefill_overlap_rejects_unsupported_modes(changes):
@@ -24,6 +24,11 @@ def test_prefill_overlap_rejects_unsupported_modes(changes):
     options.update(changes)
     with pytest.raises(ValueError, match="Prefill copy overlap"):
         MODULE.validate_prefill_overlap(**options)
+
+
+def test_prefill_overlap_and_mtp_can_coexist():
+    MODULE.validate_prefill_overlap(integrated=True, prefill=True, speculative=True,
+                                    mixed_chunk=False, cp_size=1, dcp_size=1)
 
 
 def service(**changes):
