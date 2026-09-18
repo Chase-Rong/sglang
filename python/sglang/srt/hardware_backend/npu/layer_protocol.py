@@ -262,7 +262,7 @@ def parse_targets(message, *, room, session_id, page_size, notify, writer_endpoi
         layer: PrefillLayerTarget(
             session_id, regions, pages,
             lambda record, operation, lease=payload["lease"]: notify(lease, record, operation),
-            transfer_components,
+            transfer_components.intersection(regions) if transfer_components is not None else None,
             staging,
         ) for layer, regions in layers.items()
         if writers is None or writer_endpoint is None or writers[layer] == writer_endpoint

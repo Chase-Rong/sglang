@@ -72,6 +72,29 @@ def test_shared_host_manifest_sends_host_once_and_indexer_to_each_rank(modules, 
         assert blocks == [(1240, 2224, 8), (1200, 2248, 8)]
 
 
+def test_shared_host_nonwriter_without_indexer_has_no_transfer_components(modules):
+    protocol, transfer = modules
+    record, sources, destinations = inputs(*modules)
+    latent = protocol.KvComponent.LATENT_K
+    regions = {latent: destinations[latent]}
+    lease = wire_module().LayerReceiveLease(
+        5, "decode-session", 2, {4: regions}, {latent: (1, 3)}, lambda *args: None,
+        shared_group_id="tp-local-group", shared_host_writer=False,
+    )
+    target = wire_module().parse_targets(
+        lease.manifest(), room=5, session_id="decode-session", page_size=2,
+        notify=lambda *args: None,
+    )[4]
+    assert target.transfer_components == frozenset()
+    record = protocol.LayerReadyRecord(
+        record.token, tuple(entry for entry in record.components if entry.component == latent)
+    )
+    assert transfer.build_layer_transfer_blocks(
+        record, {latent: sources[latent]}, regions, page_size=2,
+        transfer_components=target.transfer_components,
+    ) == []
+
+
 def test_shared_host_receiver_rejects_old_wire_version(modules):
     lease, _, _, _, _ = lease_inputs(modules)
     lease.shared_group_id = "tp-local-group"

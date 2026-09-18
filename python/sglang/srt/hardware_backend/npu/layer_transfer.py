@@ -77,8 +77,13 @@ def build_layer_transfer_spans(
     """Translate logical token ranges without copying prefix or padded tail bytes."""
     if page_size <= 0:
         raise ValueError("page_size must be positive")
+    components = {descriptor.component for descriptor in record.components}
+    if KvComponent.LATENT_K not in components:
+        raise ValueError("layer publication requires a latent component")
+    if components != set(sources) or components != set(destinations):
+        raise ValueError("layer publication components do not match registered regions")
     if transfer_components is not None and transfer_components not in (
-        frozenset(destinations), frozenset({KvComponent.INDEXER_K}),
+        frozenset(destinations), frozenset({KvComponent.INDEXER_K}.intersection(destinations)),
     ):
         raise ValueError("partial layer transfer must be a shared-Host Indexer consumer")
     seen = set()
@@ -140,8 +145,6 @@ def build_layer_transfer_spans(
                 component, source.address + source_page * page_bytes + offset,
                 destination_page * page_bytes + offset, (end - begin) * token_bytes,
             ))
-    if not {KvComponent.LATENT_K, KvComponent.ROPE_K}.issubset(seen):
-        raise ValueError("layer publication requires latent and RoPE components")
     return blocks
 
 
