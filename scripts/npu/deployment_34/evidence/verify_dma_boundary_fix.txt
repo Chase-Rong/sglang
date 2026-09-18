@@ -1,0 +1,83 @@
+........                                                                 [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8 passed, 1 warning in 0.98s
+2026-09-18 10:45:40.337460 WARN [183404-183404][HYBM hybm_gva_version.cpp:47 LoadValueFromFile] driver version path is not a valid real path:/etc/ascend_install.info
+2026-09-18 10:45:40.337840 WARN [183404-183404][HYBM dl_hccp_api.cpp:128 LoadLibrary] Host URMA unavailable: neither ra_socket_setwhite_list_status nor RsUpdate is exported by libra.so
+2026-09-18 10:45:40.339515 WARN [183404-183404][HYBM dl_hcom_api.cpp:84 LoadLibrary] Unable to open library [libhcom.so], libhcom.so: cannot open shared object file: No such file or directory
+2026-09-18 10:45:40.340409 TRACE [183404-183404][HYBM hybm_entry.cpp:116 hybm_init] hybm init successfully, library version: 1.2.1, build time: Sep 17 2026 18:09:27, commit: , deviceId: 0
+2026-09-18 10:45:40.352178 TRACE [183404-183661][AccLink acc_tcp_link_delay_cleanup.h:116 RunInThread] AccDelay cleanup thread thread started
+2026-09-18 10:45:40.352286 TRACE [183404-183662][AccLink acc_tcp_worker.cpp:154 RunInThread] Worker [name AccWrk, index 0, cpu -1, thread-priority 0, poll-timeout-ms 500] progress thread started
+2026-09-18 10:45:40.352414 TRACE [183404-183663][AccLink acc_tcp_worker.cpp:154 RunInThread] Worker [name AccWrk, index 1, cpu -1, thread-priority 0, poll-timeout-ms 500] progress thread started
+2026-09-18 10:45:40.352570 TRACE [183404-183664][AccLink acc_tcp_listener.cpp:136 RunInThread] Acc listener accept thread for 127.0.0.1:8500 start ...
+2026-09-18 10:45:40.352796 TRACE [183404-183668][AccLink acc_tcp_link_delay_cleanup.h:116 RunInThread] AccDelay cleanup thread thread started
+2026-09-18 10:45:40.352924 TRACE [183404-183669][AccLink acc_tcp_worker.cpp:154 RunInThread] Worker [name AccWrk, index 0, cpu -1, thread-priority 0, poll-timeout-ms 500] progress thread started
+2026-09-18 10:45:40.353017 TRACE [183404-183670][AccLink acc_tcp_worker.cpp:154 RunInThread] Worker [name AccWrk, index 1, cpu -1, thread-priority 0, poll-timeout-ms 500] progress thread started
+2026-09-18 10:45:40.353195 TRACE [183404-183664][AccLink acc_tcp_listener.cpp:210 ProcessNewConnection] Connected from 127.0.0.1:35030 successfully, ssl disable
+2026-09-18 10:45:40.353226 TRACE [183404-183664][SMEM smem_tcp_config_store_server.cpp:241 LinkConnectedHandler] New link connected, linkId: 1, worldSize: 1, rankId: 0 reconnect:0
+2026-09-18 10:45:40.353232 TRACE [183404-183664][SMEM smem_tcp_config_store_server.cpp:207 CanReceiveNewLink] change server state from INITED to NORMAL
+2026-09-18 10:45:40.353281 TRACE [183404-183404][AccLink acc_tcp_server_default.cpp:705 Handshake] Connect to 127.0.0.1:8500 successfully, with ssl disable
+2026-09-18 10:45:40.353591 WARN [183404-183404][HYBM hybm_entity_tag_info.cpp:143 GetTag2TagOpType] Not find opType from tag1:HYBM_DEFAULT_TAG_FOR_EMPTY to tag2:HYBM_DEFAULT_TAG_FOR_EMPTY
+2026-09-18 10:45:40.353600 TRACE [183404-183404][HYBM hybm_entity_default.cpp:102 InitTagManager] Success to init tag manager data op type:1
+2026-09-18 10:45:41.416674 TRACE [183404-183404][HYBM hybm_vmm_based_segment.cpp:476 ExportInner] Success to export vmm segment info rank:0 superPodId:16383 serverId:69 devId:0 segType:1 size:34359738368
+2026-09-18 10:45:41.453773 TRACE [183404-183404][HYBM hybm_vmm_based_segment.cpp:476 ExportInner] Success to export vmm segment info rank:0 superPodId:16383 serverId:69 devId:0 segType:1 size:1073741824
+2026-09-18 10:45:41.454747 TRACE [183404-183404][OFFLOAD acc_offload.cpp:45 offload_init] offload_init ret: 0, deviceId: 0, reserveSize: 35433480192
+{"padding": "0x340000000000", "host": "0x3407ffc00000", "dva": "0x3407ffc00000", "boundary": "0x340800000000"}
+{"query": "0x3407ffc00000", "return": 0, "base": "0x340000000000", "bytes": 34359738368}
+{"query": "0x340800000000", "return": 0, "base": "0x340800000000", "bytes": 1073741824}
+{"query": "0x340800400000", "return": 0, "base": "0x340800000000", "bytes": 1073741824}
+BEGIN within
+PASS within
+BEGIN crossing
+PASS crossing
+BEGIN ends_at_boundary
+PASS ends_at_boundary
+BEGIN starts_at_boundary
+PASS starts_at_boundary
+BEGIN multiple_runs
+PASS multiple_runs
+PASS crossing stream events across generations
+PASS crossing graph replay with new data
+2026-09-18 10:45:44.856104 TRACE [183404-183663][SMEM smem_tcp_config_store_server.cpp:295 LinkBrokenHandler] link broken, linkId: 1 remove rankId: 0
+2026-09-18 10:45:44.856146 TRACE [183404-183663][SMEM smem_tcp_config_store_server.cpp:299 LinkBrokenHandler] all client link broken, will clear data
+2026-09-18 10:45:44.955426 TRACE [183404-183404][SMEM smem_tcp_config_store_server.cpp:126 Shutdown] start to shutdown Acc Store Server
+2026-09-18 10:45:45.357927 WARN [183404-183664][AccLink acc_tcp_listener.cpp:151 RunInThread] Acc listener accept thread get stop signal, will exit...
+2026-09-18 10:45:45.357969 TRACE [183404-183664][AccLink acc_tcp_listener.cpp:182 RunInThread] Working thread for AccTcpStore listener at 127.0.0.1:8500 exiting
+2026-09-18 10:45:46.455755 TRACE [183404-183667][SMEM smem_tcp_config_store_server.cpp:1138 CheckerThreadTask] checker thread exit
+2026-09-18 10:45:46.455924 TRACE [183404-183404][SMEM smem_tcp_config_store_server.cpp:164 Shutdown] finished shutdown Acc Store Server
+2026-09-18 10:45:46.456341 TRACE [183404-183404][OFFLOAD acc_offload.cpp:53 offload_uninit] offload_uninit finished
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 16.09s
+<frozen runpy>:128: RuntimeWarning: 'torch.distributed.run' found in sys.modules after import of package 'torch.distributed', but prior to execution of 'torch.distributed.run'; this may result in unpredictable behaviour
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+[W918 10:46:20.966870700 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:20.354339240 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:21.031075450 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:22.360383330 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:25.614409490 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:27.597009040 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:31.665042090 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:34.804476660 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:46:44.621625980 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:47:01.624105740 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+[W918 10:47:18.661281580 socket.cpp:764] [c10d] The IPv6 network addresses of (C02-B09-CPU6, 33325) cannot be retrieved (gai error: -2 - Name or service not known).
+Terminated

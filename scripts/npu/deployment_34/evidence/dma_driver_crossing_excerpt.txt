@@ -1,0 +1,26 @@
+27492-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.149.545 [capture_model_utils.cc:385]170528 IsUbDma:Failed to convert copy type, kind=MEMCPY_DEVICE_TO_DEVICE(3).
+27493-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.506 [npu_driver.cc:169]170528 GetTransWayByAddr:Call driver api drvDeviceGetTransWay failed, drvRetCode=65534.
+27494-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.514 [memory_task.cc:367]170528 ConvertD2DCpyType:D2D memcpy async, get channel type failed, retCode=0x702001d.
+27495-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.516 [memory_task.cc:407]170528 ConvertCpyType:Failed to convert the D2D asynchronous copy type, retCode=0x702001d.
+27496-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.524 [capture_model_utils.cc:385]170528 IsUbDma:Failed to convert copy type, kind=MEMCPY_DEVICE_TO_DEVICE(3).
+27497:[ERROR] DRV(166082,):2026-09-18-10:24:25.258.538 [svm_get_urma_seg.c:66][ascend][curpid:166082,170528][drv][devmm][halMemGetSeg]<errno:22, 8> The va prop is not match. (va=0x3407ffd20000; tmp_va=0x340800000000; size=0x800000)
+27498-[ERROR] DRV(166082,):2026-09-18-10:24:25.258.542 [trs_master_async.c:103][ascend][curpid:166082,170528][drv][tsdrv][trs_get_segment]Get segment failed. (devid=0; va=0x3407ffd20000; size=8388608; ret=3)
+27499-[ERROR] DRV(166082,):2026-09-18-10:24:25.258.546 [trs_master_async.c:527][ascend][curpid:166082,170528][drv][tsdrv][trs_fill_async_dma_direct_wqe]Failed to get segment. (vaddr=0x3407ffd20000; dir=1; ret=3)
+27500-[ERROR] DRV(166082,):2026-09-18-10:24:25.258.549 [trs_master_async.c:1118][ascend][curpid:166082,170528][drv][tsdrv][trs_async_dma_wqe_create]Failed to fill async dma wqe. (ret=3; dev_id=0; sq_id=31)
+27501-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.559 [npu_driver_standard_soc.cc:54]170528 CreateAsyncDmaWqe:Call driver api halAsyncDmaCreate failed, drvRetCode=3, drvDevId=0, tsId=0, sqId=31, isUbMode=1, isSqeUpdate=0.
+27502-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.562 [memory_task.cc:707]170528 ConvertAsyncDma:Failed to call drv interface to create asyncDmaWqe, retCode=0x7020010.
+27503-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.564 [memory_task.cc:838]170528 MemcpyAsyncTaskInitV3:ConvertAsyncDma failed, retCode=0x7020010.
+27504-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.566 [memcpy_starsv2.cc:224]170528 MemcopyAsync:Init MemcpyAsyncTask failed, stream_id=32, retCode=0x7020010
+27505-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.575 [api_impl_david.cc:846]170528 MemcpyAsync:cnt=8388608, doingSize=8388608, realSize=8388608.
+27506-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.578 [api_error.cc:1792]170528 MemcpyAsync:Memcpy async failed, count=8388608, kind=MEMCPY_DEVICE_TO_HOST(2), isInvolvePageableMemory=0
+27507-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.590 [api_c.cc:1097]170528 rtMemcpyAsync:ErrCode=507899, desc=[driver error:internal error], InnerCode=0x7020010
+27508-[ERROR] RUNTIME(166082,):2026-09-18-10:24:25.258.593 [error_message_manage.cc:69]170528 FuncErrorReason:rtMemcpyAsync execution failed, reason=driver error:internal error
+27509-[ERROR] APP(166082,):2026-09-18-10:24:25.259.672 170528 OpParamMaker.cpp:ExecFuncOpApi:457: "[PTA]:Custom hand error:Prefill DMA submission failed: 507899
+27510-Exception raised from operator() at /home/j00628475/unified_host_validation_20260917_v1/source/native/fsa/prefill_dma.cpp:48 (most recent call first):
+27511-frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xfffe2c155978 in /usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib/libc10.so)
+27512-frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::"
+27513-[ERROR] APP(166082,):2026-09-18-10:24:25.259.678 170528 OpParamMaker.cpp:ExecFuncOpApi:461: "[PTA]:Custom hand fail! name=fsa_prefill_dma, ret=100000"
+27514-[ERROR] APP(166082,):2026-09-18-10:24:25.259.683 170528 NPUQueue.cpp:ReadQueue:455: "[PTA]:---Thread---281425853018368: device = 0, write_idx = 3898, read_idx = 3893, status = 1, ret = 100000"
+27515-[ERROR] APP(166082,):2026-09-18-10:24:25.259.891 166082 NPUQueue.cpp:MakeSureQueueEmpty:344: "[PTA]:Inner error happened, detail: the current working operator name is fsa_prefill_dma"
+27516-[ERROR] APP(166082,):2026-09-18-10:24:25.259.902 166082 NPUQueue.cpp:MakeSureQueueEmpty:347: "[PTA]:runtime_error: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is fsa_prefill_dma.
+27517-Since the operator is called asynchronously, the stacktrace may be inaccurate. If you want to get the accurate stacktrace, please set the environment variable ASCEND_LAUNCH_BLOCKING=1.

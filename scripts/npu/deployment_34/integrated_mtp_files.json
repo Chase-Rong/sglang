@@ -1,0 +1,52 @@
+[
+  {
+    "path": "python/sglang/srt/hardware_backend/npu/offload_config.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/python/sglang/srt/hardware_backend/npu/offload_config.py",
+    "sha256": "a7d773a231a4f9ecfa7b8d8d7f578a87b92a0eba1b7202a11b08bf824025cec9"
+  },
+  {
+    "path": "python/sglang/srt/hardware_backend/npu/memfabric_host_kv.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/python/sglang/srt/hardware_backend/npu/memfabric_host_kv.py",
+    "sha256": "b8463efc9f4fadfb83d1eb05a59245f6e12ad6a5a6eb1003566b19da5a5232e4"
+  },
+  {
+    "path": "python/sglang/srt/hardware_backend/npu/decode_host_kv.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/python/sglang/srt/hardware_backend/npu/decode_host_kv.py",
+    "sha256": "6c6b862bd20e765874caa4ae06c5baf3f0ab3463135a24a0daea493ad21f9a9b"
+  },
+  {
+    "path": "python/sglang/srt/model_executor/model_runner.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/python/sglang/srt/model_executor/model_runner.py",
+    "sha256": "e1e7b2f3a73d89030eda663599a4808b04fe57defe78010b29c7d214068ced84"
+  },
+  {
+    "path": "python/sglang/srt/speculative/eagle_worker_v2.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/python/sglang/srt/speculative/eagle_worker_v2.py",
+    "sha256": "d4a26e41e08f203089cddfd4e373149ee59b5a3dcd0805348c3c982f913ff901"
+  },
+  {
+    "path": "test/registered/unit/npu/test_integrated_mtp.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/test/registered/unit/npu/test_integrated_mtp.py",
+    "sha256": "b975bf950e44fe89577620322697ee545c84844af86639f30264149132776db3"
+  },
+  {
+    "path": "test/registered/unit/npu/test_offload_config.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/test/registered/unit/npu/test_offload_config.py",
+    "sha256": "83080a6a9bace5224e80fc6af01e753c1f0d5c09b494dd5a3a2bd610a7c488c4"
+  },
+  {
+    "path": "test/registered/unit/npu/test_memfabric_kv_pool.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/test/registered/unit/npu/test_memfabric_kv_pool.py",
+    "sha256": "b24a074178573ff0b303970d46d731fa0b1feb642de54d02210f1f0c0df6db40"
+  },
+  {
+    "path": "test/registered/unit/npu/test_fused_sparse_attention_dispatch.py",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/sglang_remote/test/registered/unit/npu/test_fused_sparse_attention_dispatch.py",
+    "sha256": "ceb2140b36f1b51b7274f8cab9e3339f76ba21c4de3589677f547188c77de02e"
+  },
+  {
+    "path": "launcher",
+    "remote": "/home/j00628475/sglang_release_20260917_f524c79a/handoff_launch_offload_mtp_graph32.sh",
+    "sha256": "5b80a4a3e5354b7ad4d8288ab97ca3d02df9033c7283f0f5c91ac188cde69e30"
+  }
+]

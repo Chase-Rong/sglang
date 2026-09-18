@@ -1,0 +1,110 @@
+<frozen runpy>:128: RuntimeWarning: 'torch.distributed.run' found in sys.modules after import of package 'torch.distributed', but prior to execution of 'torch.distributed.run'; this may result in unpredictable behaviour
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+..                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 27.44s
+                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 27.44s
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 28.37s
+....                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 28.62s
+                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 28.63s
+                                                                        [100%]                                                                        [100%]
+
+=============================== warnings summary ===============================
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 28.64s
+1 passed, 15 warnings in 28.64s
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 29.52s
+PASS DMA boundary hardware verification

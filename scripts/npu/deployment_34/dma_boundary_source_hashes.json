@@ -1,0 +1,22 @@
+{
+  "native/fsa/prefill_dma.cpp": {
+    "before": "f2b0ed066389b600e3183e45e532f2f7f88477feb9f5d2b157eb9f65dea9e4db",
+    "after": "77f9a21fa82b1e3dfd1385cc9ebd4efd9c140a6739c2999142c15b0a08aa46de"
+  },
+  "native/fsa/external_host_mapping.cpp": {
+    "before": "6ae8256052091490098206098d97a3e7e91e8450d3feac88902c857ac25efea3",
+    "after": "441b93f22c51f5b1a3518f2f2aa3f814107b0fc1890dd509ee8178b42eabe37f"
+  },
+  "native/fsa/external_host_mapping.h": {
+    "before": "7d6893102bede7f60af4fab7b43fa94f96d96394aa82744d388a66782d7b10c6",
+    "after": "78eba0cc81ffb60f2b33f36dac78f286a9e007dd1194c07c9f19e42598a97597"
+  },
+  "native/fsa/dma_segments.h": {
+    "before": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "after": "0d802593461e6392ea89f471534a6fba4116677538157b8c5f68dc987fbe8812"
+  },
+  "native/fsa/tests/dma_segments_test.cpp": {
+    "before": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "after": "60889201c6c3bdec73e85a28a65d4945bc84ddc68cedb22ec6ef113b6f44d571"
+  }
+}

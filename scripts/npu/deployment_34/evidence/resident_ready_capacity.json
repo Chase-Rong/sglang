@@ -1,0 +1,25 @@
+{
+  "submitted": 9,
+  "completed": 9,
+  "input_tokens_per_request": 262144,
+  "output_tokens_per_request": 1024,
+  "max_simultaneous_after_prefill": 8,
+  "max_full_context_decode": 8,
+  "max_full_context_graph_decode": 8,
+  "max_batch_graph_log_samples": 6,
+  "mtp_accept_length_range": [
+    3.471186440677966,
+    3.9233716475095783
+  ],
+  "retractions": 0,
+  "errors": [],
+  "elapsed_s": 442.3369039300014,
+  "peak_graph_evidence": [
+    "[2026-09-18 09:48:43 TP0] Decode batch, #running-req: 8, #full token: 2099200, full token usage: 0.89, mamba num: 8, mamba usage: 0.12, accept len: 3.49, accept rate: 0.83, npu graph: True, gen throughput (token/s): 2.60, #queue-req: 1",
+    "[2026-09-18 09:48:46 TP0] Decode batch, #running-req: 8, #full token: 2100224, full token usage: 0.89, mamba num: 8, mamba usage: 0.12, accept len: 3.51, accept rate: 0.84, npu graph: True, gen throughput (token/s): 446.50, #queue-req: 1",
+    "[2026-09-18 09:48:48 TP0] Decode batch, #running-req: 8, #full token: 2101248, full token usage: 0.89, mamba num: 8, mamba usage: 0.12, accept len: 3.63, accept rate: 0.88, npu graph: True, gen throughput (token/s): 452.05, #queue-req: 1",
+    "[2026-09-18 09:48:51 TP0] Decode batch, #running-req: 8, #full token: 2102272, full token usage: 0.89, mamba num: 8, mamba usage: 0.12, accept len: 3.63, accept rate: 0.88, npu graph: True, gen throughput (token/s): 457.99, #queue-req: 1",
+    "[2026-09-18 09:48:53 TP0] Decode batch, #running-req: 8, #full token: 2103296, full token usage: 0.90, mamba num: 8, mamba usage: 0.12, accept len: 3.73, accept rate: 0.91, npu graph: True, gen throughput (token/s): 472.35, #queue-req: 1",
+    "[2026-09-18 09:48:56 TP0] Decode batch, #running-req: 8, #full token: 2104448, full token usage: 0.90, mamba num: 8, mamba usage: 0.12, accept len: 3.81, accept rate: 0.94, npu graph: True, gen throughput (token/s): 482.73, #queue-req: 1"
+  ]
+}

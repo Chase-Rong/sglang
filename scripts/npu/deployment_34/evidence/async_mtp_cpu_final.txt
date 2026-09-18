@@ -1,0 +1,14 @@
+CPU_ONLY torch=2.10.0+cpu
+........................................................................ [ 38%]
+........................................................................ [ 77%]
+...........................................                              [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437
+  /usr/local/python3.12.13/lib/python3.12/site-packages/_pytest/config/__init__.py:1437: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+187 passed, 1 warning in 0.73s
+
+EXIT=0

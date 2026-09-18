@@ -1,0 +1,11 @@
+{
+  "sglang_remote/native/fsa/prefill_dma.cpp": "77f9a21fa82b1e3dfd1385cc9ebd4efd9c140a6739c2999142c15b0a08aa46de",
+  "sglang_remote/native/fsa/external_host_mapping.cpp": "441b93f22c51f5b1a3518f2f2aa3f814107b0fc1890dd509ee8178b42eabe37f",
+  "sglang_remote/native/fsa/external_host_mapping.h": "78eba0cc81ffb60f2b33f36dac78f286a9e007dd1194c07c9f19e42598a97597",
+  "sglang_remote/native/fsa/dma_segments.h": "0d802593461e6392ea89f471534a6fba4116677538157b8c5f68dc987fbe8812",
+  "sglang_remote/native/fsa/tests/dma_segments_test.cpp": "60889201c6c3bdec73e85a28a65d4945bc84ddc68cedb22ec6ef113b6f44d571",
+  "handoff_launch_offload_mtp_graph32.sh": "1df51714fc35f2071850a05458ccaa07962d503fdaeaac30a74ded2aee3337cf",
+  "handoff_launch_resident_mtp_graph4.sh": "6054ff51fee4d70ce34e4fa6d5020ee6fba96461707925787ffd31427a36f3ec",
+  "sglang_remote/scripts/npu/fsa_pd_role.sh": "4d66a0ed252da9fa5a0b57a3084a74768e129b4ad04613ab55784be5035f3138",
+  "fsa-binding-dma-segments/libsgl_fsa_extension.so": "3eaf2d5a6afe7e1ad492c454688b99cb201f04ba5dadeb1ba57bf7c7e018519e"
+}

@@ -41,6 +41,15 @@ fsa_model=${FSA_MODEL_PATH:-/mnt/share/w00936111/weights/GLM-5.3-Flash}
 fsa_module=sglang.launch_server
 fsa_tp=4
 if [ "$fsa_role" = integrated ] || [ "$fsa_role" = resident ]; then fsa_tp=8; fi
+fsa_graph_bs=(1 2 4 8 16 32)
+fsa_graph_max=32
+if [ "$fsa_role" = integrated ]; then
+    fsa_graph_bs=(1 2 4 8 11)
+    fsa_graph_max=11
+elif [ "$fsa_role" = resident ]; then
+    fsa_graph_bs=(1 2 4 8)
+    fsa_graph_max=8
+fi
 fsa_args=(--model-path "$fsa_model" --served-model-name glm53flash
     --host 127.0.0.1 --tp-size "$fsa_tp" --dp-size 1 --nnodes 1
     --attention-backend ascend --device npu --quantization fp8 --kv-cache-dtype bf16
@@ -48,7 +57,8 @@ fsa_args=(--model-path "$fsa_model" --served-model-name glm53flash
     --enable-metrics
     --mem-fraction-static "${FSA_MEM_FRACTION:-0.85}"
     --context-length "${FSA_CONTEXT_LENGTH:-32768}"
-    --page-size 128 --cuda-graph-bs-decode 1 2 4
+    --page-size 128 --cuda-graph-backend-decode full
+    --cuda-graph-bs-decode "${fsa_graph_bs[@]}" --cuda-graph-max-bs-decode "$fsa_graph_max"
     --chunked-prefill-size "${FSA_PREFILL_CHUNK:-8192}"
     --max-prefill-tokens "${FSA_PREFILL_CHUNK:-8192}"
     --watchdog-timeout "${FSA_WATCHDOG_TIMEOUT:-1200}")
