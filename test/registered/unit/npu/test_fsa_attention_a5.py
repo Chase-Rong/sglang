@@ -38,7 +38,8 @@ def reference_attention(query, keys, indices, batch):
 @pytest.mark.parametrize("batch,heads,tail", [(1, 16, 0), (1, 64, 3), (4, 16, 1), (1, 128, 2)])
 @pytest.mark.parametrize("seed,valid_prefix", [(137, 2048), (271, 31), (911, 0)])
 @pytest.mark.parametrize("mode", ["fused", "reference"])
-def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, heads, tail, seed, valid_prefix, mode):
+@pytest.mark.parametrize("order", ["ascending", "shuffled"])
+def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, heads, tail, seed, valid_prefix, mode, order):
     from sglang.srt.hardware_backend.npu.fsa_native import RegisteredHostRegion
     from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
         FusedSparseAttentionState,
@@ -55,6 +56,8 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
     ids[:, :valid_prefix] = torch.arange(valid_prefix, device="cpu")
     if tail:
         ids[:, 2048 : 2048 + tail] = torch.arange(sequence - tail, sequence, device="cpu")
+    if order == "shuffled":
+        ids = ids[:, torch.randperm(topk)]
     indices = ids.to(device)
     expected = reference_attention(query_cpu, source, ids, batch)
     region = RegisteredHostRegion.allocate(
@@ -93,6 +96,18 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
                        Path(os.environ["SGLANG_FSA_WORK_DIR"]) / "tmp/attention_failure.pt")
             raise
 
+    def check_selection(inputs):
+        slots = inputs.selection_plan.slots.cpu()
+        keys = inputs.selection_plan.physical_keys.cpu()
+        selection = inputs.selection_kv_cache.cpu().reshape(batch, 4096, 512)
+        full = source.reshape(-1, 512)
+        for row in range(batch):
+            valid = keys[row] >= 0
+            torch.testing.assert_close(
+                selection[row, slots[row, valid].long()], full[keys[row, valid].long()],
+                atol=0, rtol=0,
+            )
+
     try:
         output, inputs = invoke()
         torch.npu.synchronize()
@@ -122,8 +137,23 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
                 "selection": inputs.selection_kv_cache.cpu(),
             }, Path(os.environ["SGLANG_FSA_WORK_DIR"]) / "tmp/attention_precision.pt")
         check(output)
+        check_selection(inputs)
         assert inputs.selection_plan.miss_mask.sum().item() == batch * (valid_prefix + tail)
         torch.npu.synchronize()
+        region.tensor.zero_()
+        indices.copy_(indices.flip(-1))
+        output, inputs = invoke()
+        check(output)
+        assert not inputs.selection_plan.miss_mask.any().item()
+        region.tensor.copy_(source.view_as(region.tensor))
+        replacement = (ids >= 0) & (ids < 1024) & (ids % 4 == 0)
+        ids[replacement] += 2048
+        indices.copy_(ids.to(device))
+        expected = reference_attention(query_cpu, source, ids, batch)
+        output, inputs = invoke()
+        check(output)
+        check_selection(inputs)
+        assert inputs.selection_plan.miss_mask.sum().item() == replacement.sum().item()
         region.tensor.zero_()
         indices.copy_(indices.flip(-1))
         output, inputs = invoke()
@@ -132,7 +162,19 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
         state.reserve(0, batch, topk, rope, region.tensor)
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            output, _ = invoke()
+            output, graph_inputs = invoke()
+        indices.copy_(indices.flip(-1))
+        graph.replay()
+        check(output)
+        region.tensor.copy_(source.view_as(region.tensor))
+        replacement = (ids >= 0) & (ids < 1024) & (ids % 4 == 1)
+        ids[replacement] += 2048
+        indices.copy_(ids.to(device))
+        expected = reference_attention(query_cpu, source, ids, batch)
+        graph.replay()
+        check(output)
+        check_selection(graph_inputs)
+        region.tensor.zero_()
         indices.copy_(indices.flip(-1))
         graph.replay()
         check(output)
