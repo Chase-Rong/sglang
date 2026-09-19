@@ -7,6 +7,7 @@
 #include "fused_sparse_attention_overlap_torch_adpt.h"
 #include "sparsity_driven_kv_offload/shm_allocator/shm_allocator.h"
 #include "external_host_mapping.h"
+#include "mapped_attention.h"
 
 thread_local char g_hashBuf[kHashBufSize];
 thread_local int g_hashOffset = 0;
@@ -37,7 +38,7 @@ void ValidateFullSource(const at::Tensor &source, const at::Tensor &query,
 
 }
 
-at::Tensor fused_sparse_attention_overlap(
+at::Tensor fused_sparse_attention_overlap_mapped(
     const at::Tensor &query,
     const at::Tensor &selection_k_rope,
     const at::Tensor &selection_kv_cache,
@@ -57,7 +58,8 @@ at::Tensor fused_sparse_attention_overlap(
     c10::string_view layout_kv,
     int64_t sparse_mode,
     c10::optional<int64_t> full_rope_address,
-    c10::optional<int64_t> full_kv_address) {
+    c10::optional<int64_t> full_kv_address,
+    c10::optional<int64_t> membership_address) {
     TORCH_CHECK(query.device().type() == at::DeviceType::PrivateUse1,
                 "FSA query must be an NPU tensor");
     TORCH_CHECK(c10_npu::getCurrentNPUStream().device_index() == query.device().index(),
@@ -75,6 +77,18 @@ at::Tensor fused_sparse_attention_overlap(
                     "FSA NoPE does not accept a registered RoPE address");
     }
     ValidateFullSource(full_kv_cache, query, full_kv_address);
+    if (membership_address.has_value()) {
+        TORCH_CHECK(selection_membership_map.device().is_cpu() &&
+                    selection_membership_map.is_contiguous() &&
+                    selection_membership_map.scalar_type() == at::kShort &&
+                    selection_membership_map.storage_offset() == 0 &&
+                    shm_validate_mapping(selection_membership_map.data_ptr(), *membership_address,
+                        selection_membership_map.nbytes(), query.device().index()) == 0,
+                    "FSA plan requires a live registered CPU int16 mapping");
+    } else {
+        TORCH_CHECK(selection_membership_map.device() == query.device(),
+                    "FSA Host plan requires a registered address");
+    }
     const auto q_actual = full_q_actual_seq.has_value()
         ? full_q_actual_seq.value()
         : at::Tensor();
@@ -84,7 +98,26 @@ at::Tensor fused_sparse_attention_overlap(
         selection_membership_map, selection_topk_indices, full_k_rope,
         full_kv_cache, full_kv_block_table, full_kv_actual_seq, q_actual,
         scale_value, sparse_block_size, selection_topk_block_size,
-        layout_query, layout_kv, sparse_mode, full_rope_address, full_kv_address);
+        layout_query, layout_kv, sparse_mode, full_rope_address, full_kv_address, membership_address);
+}
+
+at::Tensor fused_sparse_attention_overlap(
+    const at::Tensor &query, const at::Tensor &selection_k_rope,
+    const at::Tensor &selection_kv_cache, const at::Tensor &selection_kv_block_table,
+    const at::Tensor &selection_kv_block_status, const at::Tensor &selection_membership_map,
+    const at::Tensor &selection_topk_indices, const at::Tensor &full_k_rope,
+    const at::Tensor &full_kv_cache, const at::Tensor &full_kv_block_table,
+    const at::Tensor &full_kv_actual_seq, const c10::optional<at::Tensor> &full_q_actual_seq,
+    double scale_value, int64_t sparse_block_size, int64_t selection_topk_block_size,
+    c10::string_view layout_query, c10::string_view layout_kv, int64_t sparse_mode,
+    c10::optional<int64_t> full_rope_address, c10::optional<int64_t> full_kv_address)
+{
+    return fused_sparse_attention_overlap_mapped(query, selection_k_rope, selection_kv_cache,
+        selection_kv_block_table, selection_kv_block_status, selection_membership_map,
+        selection_topk_indices, full_k_rope, full_kv_cache, full_kv_block_table,
+        full_kv_actual_seq, full_q_actual_seq, scale_value, sparse_block_size,
+        selection_topk_block_size, layout_query, layout_kv, sparse_mode,
+        full_rope_address, full_kv_address, c10::nullopt);
 }
 
 }  // namespace npu_kernel

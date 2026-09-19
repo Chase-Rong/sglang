@@ -4,10 +4,14 @@
 #include "fused_sparse_attention_overlap/fsa_lru_planner.h"
 #include "external_host_mapping.h"
 #include "prefill_dma.h"
+#include "host_plan.h"
+#include "mapped_attention.h"
 
 TORCH_LIBRARY(sgl_fsa, module)
 {
+    module.def("fsa_host_plan(Tensor trigger, Tensor keys, Tensor slots, Tensor owners, Tensor lengths, Tensor cacheable, Tensor(a!) applied, Tensor(b!) state, Tensor(c!) membership, Tensor(d!) misses, int rows, bool commit) -> ()");
     module.def("abi_version() -> int", []() -> int64_t { return 1; });
+    module.def("npu_fused_sparse_attention_overlap_mapped(Tensor query, Tensor(a!) selection_k_rope, Tensor(b!) selection_kv_cache, Tensor(c!) selection_kv_block_table, Tensor(d!) selection_kv_block_status, Tensor(e!) selection_membership_map, Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache, Tensor full_kv_block_table, Tensor full_kv_actual_seq, Tensor? full_q_actual_seq, float scale_value, int sparse_block_size, int selection_topk_block_size, str layout_query, str layout_kv, int sparse_mode, int? full_rope_address=None, int? full_kv_address=None, int? membership_address=None) -> Tensor");
     module.def("memfabric_region(int address, int[] shape, Tensor dtype_template, int device_id, bool shared_gva) -> (Tensor, int)",
                TORCH_FN(sglang::npu_kernel::CreateMemFabricRegion));
     module.def("prefill_dma_copy(Tensor(a!) device_tensor, Tensor(b!) host_metadata, int device_address, Tensor runs, bool to_host) -> ()");
@@ -32,6 +36,8 @@ TORCH_LIBRARY(sgl_fsa, module)
 
 TORCH_LIBRARY_IMPL(sgl_fsa, PrivateUse1, module)
 {
+    module.impl("fsa_host_plan", TORCH_FN(sglang::npu_kernel::MaterializeHostPlan));
+    module.impl("npu_fused_sparse_attention_overlap_mapped", TORCH_FN(sglang::npu_kernel::fused_sparse_attention_overlap_mapped));
     module.impl("prefill_dma_copy", TORCH_FN(sglang::npu_kernel::PrefillDmaCopy));
     module.impl("unidex_copy", TORCH_FN(sglang::npu_kernel::unidex_copy));
     module.impl("fsa_enqueue_lru_plan", TORCH_FN(sglang::npu_kernel::enqueue_fsa_lru_plan));

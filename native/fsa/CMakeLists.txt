@@ -24,6 +24,7 @@ list(GET FSA_PYTHON_PATHS 1 FSA_TORCH_NPU_ROOT)
 list(GET FSA_PYTHON_PATHS 2 FSA_CXX11_ABI)
 list(APPEND CMAKE_PREFIX_PATH "${FSA_TORCH_ROOT}/share/cmake")
 find_package(Torch REQUIRED)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 file(GLOB FSA_ASCENDC_MODULES
     "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
     "${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
@@ -41,6 +42,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/version.h" "#pragma once\n")
 add_library(sgl_fsa_extension SHARED registration.cpp
     external_host_mapping.cpp
     prefill_dma.cpp
+    host_plan.cpp
     fused_sparse_attention_overlap.cpp
     "${FSA_CSRC}/fused_sparse_attention_overlap/fsa_lru_planner.cpp"
     "${FSA_CSRC}/sparsity_driven_kv_offload/shm_allocator/shm_allocator.cpp"
@@ -57,5 +59,5 @@ target_include_directories(sgl_fsa_extension PRIVATE
 target_link_directories(sgl_fsa_extension PRIVATE
     "${FSA_TORCH_NPU_ROOT}/lib" "${ASCEND_CANN_PACKAGE_PATH}/lib64"
     "${ASCEND_DRIVER_PATH}/lib64/driver")
-target_link_libraries(sgl_fsa_extension PRIVATE fsa_unidex_kernel ${TORCH_LIBRARIES}
+target_link_libraries(sgl_fsa_extension PRIVATE fsa_unidex_kernel OpenMP::OpenMP_CXX ${TORCH_LIBRARIES}
     torch_npu ascendcl ascend_hal Python3::Python dl)

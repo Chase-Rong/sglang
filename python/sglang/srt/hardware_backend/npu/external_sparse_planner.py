@@ -15,7 +15,7 @@ class SparseSelectionPlan:
 
 
 class NativeSparsePlanner:
-    def __init__(self, device, rows, topk, capacity):
+    def __init__(self, device, rows, topk, capacity, *, device_slots=True):
         from sglang.srt.hardware_backend.npu import fsa_native as kernel
 
         self.kernel = kernel
@@ -46,11 +46,14 @@ class NativeSparsePlanner:
         self.resident = torch.full((rows, capacity), -1, dtype=torch.int64)
         self.ages = torch.zeros_like(self.resident)
         self.row_state = torch.full((rows, 3), -1, dtype=torch.int64)
-        self.slots = torch.empty((rows, topk), dtype=torch.int64, device=self.device)
+        self.slots = (
+            torch.empty((rows, topk), dtype=torch.int64, device=self.device)
+            if device_slots else self.regions["slots"].tensor
+        )
         self.indices = torch.arange(rows, dtype=torch.int64, device=self.device)
         self.valid = torch.ones(rows, dtype=torch.bool, device=self.device)
 
-    def enqueue(self, keys, owners, lengths):
+    def enqueue(self, keys, owners, lengths, *, device_slots=True):
         if self.closed:
             raise RuntimeError("native sparse planner is closed")
         rows = keys.shape[0]
@@ -80,9 +83,10 @@ class NativeSparsePlanner:
             self.regions["slots"].tensor,
             rows,
         )
-        self.kernel.copy_rows_from_registered_host(
-            self.regions["slots"], self.slots, indices, indices, valid
-        )
+        if device_slots:
+            self.kernel.copy_rows_from_registered_host(
+                self.regions["slots"], self.slots, indices, indices, valid
+            )
         return self.slots[:rows]
 
     def close(self, *, drained=False):
@@ -98,6 +102,86 @@ class NativeSparsePlanner:
         for name, region in tuple(self.regions.items()):
             region.close(drained=True)
             del self.regions[name]
+
+
+class MappedSparsePlanner(NativeSparsePlanner):
+    def __init__(self, device, rows, topk, capacity):
+        super().__init__(device, rows, topk, capacity, device_slots=False)
+        self.regions["cacheable"] = self.kernel.RegisteredHostRegion.allocate(
+            (rows, topk), torch.bool, device_id=self.device.index
+        )
+        self.regions["cacheable"].tensor.fill_(True)
+        self.stage_indices = torch.arange(rows * 2, device=self.device, dtype=torch.int64)
+        self.stage_valid = torch.ones(rows * 2, device=self.device, dtype=torch.bool)
+        self.layers = {}
+
+    def enqueue(self, keys, owners, lengths, *, cacheable=None):
+        super().enqueue(keys, owners, lengths, device_slots=False)
+        if cacheable is not None:
+            rows = keys.shape[0]
+            self.kernel.copy_rows_to_registered_host(
+                cacheable.contiguous(), self.regions["cacheable"],
+                self.indices[:rows], self.indices[:rows], self.valid[:rows],
+            )
+
+    def reserve_layer(self, layer_id):
+        if self.closed:
+            raise RuntimeError("native sparse planner is closed")
+        if layer_id not in self.layers:
+            region = self.kernel.RegisteredHostRegion.allocate(
+                (self.rows, 16400), torch.int16, device_id=self.device.index
+            )
+            region.tensor.fill_(-1)
+            self.regions[f"plan-{layer_id}"] = region
+            self.layers[layer_id] = (
+                torch.full((self.rows, self.capacity), -1, dtype=torch.int64),
+                torch.full((self.rows, 2), -1, dtype=torch.int64),
+                torch.empty((self.rows, self.topk), dtype=torch.bool),
+                region,
+            )
+
+    def materialize(self, trigger, layer_id, rows, *, commit=False):
+        if self.closed:
+            raise RuntimeError("native sparse planner is closed")
+        applied, state, misses, region = self.layers[layer_id]
+        self.kernel.native_ops().fsa_host_plan(
+            trigger, self.regions["keys"].tensor, self.regions["slots"].tensor,
+            self.regions["owners"].tensor, self.regions["lengths"].tensor,
+            self.regions["cacheable"].tensor, applied, state, region.tensor, misses,
+            rows, commit,
+        )
+        return MappedSelectionPlan(self, layer_id, rows, trigger), region
+
+    def stage(self, region, destination, rows):
+        self.kernel.unidex_copy_inplace(
+            region.tensor.view(-1, 8200), destination.view(-1, 8200),
+            self.stage_indices[:rows * 2], self.stage_indices[:rows * 2],
+            self.stage_valid[:rows * 2], src_address_ndims=1, dst_address_ndims=1,
+            src_ptr=region.device_ptr,
+        )
+
+
+@dataclass
+class MappedSelectionPlan:
+    planner: MappedSparsePlanner
+    layer_id: int
+    rows: int
+    trigger: torch.Tensor
+
+    @property
+    def physical_keys(self):
+        return self.planner.regions["keys"].tensor[:self.rows]
+
+    @property
+    def slots(self):
+        return self.planner.regions["slots"].tensor[:self.rows]
+
+    @property
+    def miss_mask(self):
+        return self.planner.layers[self.layer_id][2][:self.rows]
+
+    def commit(self):
+        self.planner.materialize(self.trigger, self.layer_id, self.rows, commit=True)
 
 
 def materialize_layer_plan(
@@ -145,6 +229,9 @@ def materialize_layer_plan(
 
 
 def commit_layer_plan(cache, plan):
+    if isinstance(plan, MappedSelectionPlan):
+        plan.commit()
+        return
     rows = plan.slots.shape[0]
     applied = cache.applied_keys[:rows]
     valid = plan.physical_keys >= 0
