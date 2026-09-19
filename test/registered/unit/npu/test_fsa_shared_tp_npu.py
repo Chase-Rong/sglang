@@ -129,7 +129,8 @@ def test_shared_allocation_one_writer_graph_and_independent_detach(tp, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("integrated", [False, True])
-def test_shared_decode_fused_replay_with_tp_output_collective(tp, dtype, integrated):
+@pytest.mark.parametrize("mapped", [False, True])
+def test_shared_decode_fused_replay_with_tp_output_collective(tp, dtype, integrated, mapped):
     from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
     from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
 
@@ -150,7 +151,8 @@ def test_shared_decode_fused_replay_with_tp_output_collective(tp, dtype, integra
     qlengths = torch.tensor([1], dtype=torch.int32, device=tp.device)
     requests = torch.tensor([1], dtype=torch.int64, device=tp.device)
     pool = SimpleNamespace(req_generation=torch.tensor([0, 1], device="cpu"))
-    state = FusedSparseAttentionState(tp.device, pool, external_planner=True, resident_capacity=4096)
+    state = FusedSparseAttentionState(tp.device, pool, external_planner=True,
+                                    resident_capacity=4096, mapped_host_plan=mapped)
     key, rope = backing.layer_views(0)
     key, rope = key.squeeze(2), rope.squeeze(2)
     graph = None

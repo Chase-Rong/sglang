@@ -464,6 +464,7 @@ class FusedSparseAttentionState:
         layer_anchors=None,
         row_capacity=None,
         mutable_tail_tokens=0,
+        mapped_host_plan=False,
     ):
         self.device = torch.device(device)
         if self.device.type == "npu" and self.device.index is None:
@@ -471,6 +472,9 @@ class FusedSparseAttentionState:
         self.pool = req_to_token_pool
         self.layers = {}
         self.external_planner = external_planner
+        if mapped_host_plan and not external_planner:
+            raise ValueError("mapped Host plans require the external planner")
+        self.mapped_host_plan = mapped_host_plan
         self.resident_capacity = resident_capacity
         self.layer_anchors = layer_anchors or {}
         self.row_capacity = row_capacity
@@ -527,6 +531,7 @@ class FusedSparseAttentionState:
 
     def _ensure_planner(self, layer_id, cache, topk):
         from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+            MappedSparsePlanner,
             NativeSparsePlanner,
         )
 
@@ -536,10 +541,13 @@ class FusedSparseAttentionState:
         if planner is None or planner.rows < cache.max_tokens:
             if self.layer(layer_id).capacity_locked:
                 raise RuntimeError("shared planner cannot grow after graph reservation")
-            planner = NativeSparsePlanner(self.device, cache.max_tokens, topk, capacity)
+            planner_type = MappedSparsePlanner if self.mapped_host_plan else NativeSparsePlanner
+            planner = planner_type(self.device, cache.max_tokens, topk, capacity)
             self.planners[anchor] = planner
         if planner.topk != topk or planner.capacity != capacity:
             raise ValueError("shared index layers have incompatible selection geometry")
+        if self.mapped_host_plan:
+            planner.reserve_layer(layer_id)
         return anchor, planner
 
     def build_inputs(
@@ -629,16 +637,13 @@ class FusedSparseAttentionState:
         selection_rope, selection_kv, selection_table, status, membership = (
             manager.views(cache, topk_indices)
         )
-        manager.invalidate_changed_rows(
-            cache,
-            status,
-            membership,
-            identities,
-            token_count,
-            1,
-            seq_lens=kv_lengths[row_requests],
-        )
+        if not self.mapped_host_plan:
+            manager.invalidate_changed_rows(
+                cache, status, membership, identities, token_count, 1,
+                seq_lens=kv_lengths[row_requests],
+            )
         selection_plan = None
+        membership_region = None
         if self.external_planner:
             from sglang.srt.hardware_backend.npu.external_sparse_planner import (
                 materialize_layer_plan,
@@ -659,16 +664,6 @@ class FusedSparseAttentionState:
             anchor, planner = self._ensure_planner(
                 layer_id, cache, topk_indices.shape[-1]
             )
-            if layer_id == anchor or self.plan_versions.get(anchor) != (
-                self.forward_serial,
-                token_count,
-            ):
-                slots = planner.enqueue(
-                    physical_keys, identities, kv_lengths[row_requests]
-                )
-                self.plan_versions[anchor] = (self.forward_serial, token_count)
-            else:
-                slots = planner.slots[:token_count]
             cacheable = None
             if self.mutable_tail_tokens:
                 stable_prefix = (
@@ -677,13 +672,30 @@ class FusedSparseAttentionState:
                 cacheable = (topk_indices[:, 0] >= 0) & (
                     topk_indices[:, 0] < stable_prefix[:, None]
                 )
-            selection_plan = materialize_layer_plan(
-                cache,
-                physical_keys,
-                slots,
-                membership,
-                cacheable_mask=cacheable,
-            )
+            if layer_id == anchor or self.plan_versions.get(anchor) != (
+                self.forward_serial,
+                token_count,
+            ):
+                slots = planner.enqueue(
+                    physical_keys, identities, kv_lengths[row_requests],
+                    **({"cacheable": cacheable} if self.mapped_host_plan else {}),
+                )
+                self.plan_versions[anchor] = (self.forward_serial, token_count)
+            else:
+                slots = planner.slots[:token_count]
+            if self.mapped_host_plan:
+                selection_plan, membership_region = planner.materialize(
+                    physical_keys, layer_id, token_count,
+                )
+                if token_count > 16:
+                    planner.stage(membership_region, cache.selection_membership_map, token_count)
+                    membership_region = None
+                else:
+                    membership = membership_region.tensor[:token_count]
+            else:
+                selection_plan = materialize_layer_plan(
+                    cache, physical_keys, slots, membership, cacheable_mask=cacheable,
+                )
         return FusedSparseAttentionInputs(
             query=(
                 q_nope if q_rope.shape[-1] == 0 else torch.cat((q_nope, q_rope), dim=-1)
@@ -704,6 +716,7 @@ class FusedSparseAttentionState:
             scale_value=scale,
             selection_plan=selection_plan,
             selection_cache=cache if selection_plan is not None else None,
+            membership_region=membership_region,
         )
 
 
@@ -733,6 +746,7 @@ class FusedSparseAttentionInputs:
     full_kv_region: Optional[object] = None
     selection_plan: Optional[object] = None
     selection_cache: Optional[object] = None
+    membership_region: Optional[object] = None
 
 
 def _resolve_fused_op():
@@ -777,6 +791,7 @@ def fused_sparse_attention_overlap(
     sparse_mode: int = 3,
     full_rope_region=None,
     full_kv_region=None,
+    membership_region=None,
 ):
     """Call the standalone side-effect fused op with the frozen ABI."""
 
@@ -790,6 +805,15 @@ def fused_sparse_attention_overlap(
         )
     op = _resolve_fused_op()
     addresses = {}
+    if membership_region is not None:
+        from sglang.srt.hardware_backend.npu.fsa_native import native_ops
+
+        membership_region._require_live()
+        if (selection_membership_map.data_ptr() != membership_region.host_ptr
+                or membership_region.device_id != query.device.index):
+            raise ValueError("Host plan metadata does not match its registration")
+        op = native_ops().npu_fused_sparse_attention_overlap_mapped
+        addresses["membership_address"] = membership_region.device_ptr
     has_rope = full_k_rope.shape[-1] != 0
     if has_rope and ((full_rope_region is None) != (full_kv_region is None)):
         raise ValueError("both registered full-KV components must be supplied")
@@ -846,6 +870,10 @@ def run_fused_sparse_attention(inputs: FusedSparseAttentionInputs, mode="fused")
         if name not in ("selection_plan", "selection_cache")
     }
     if mode == "reference":
+        from sglang.srt.hardware_backend.npu.external_sparse_planner import MappedSelectionPlan
+
+        if isinstance(inputs.selection_plan, MappedSelectionPlan):
+            raise ValueError("reference attention requires device-resident plan metadata")
         if inputs.selection_plan is None:
             raise ValueError(
                 "miss-only reference attention requires the production planner"

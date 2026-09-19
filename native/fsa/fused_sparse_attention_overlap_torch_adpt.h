@@ -114,7 +114,8 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectImpl(
     const std::string &layout_kv_str,
     int64_t sparse_mode,
     c10::optional<int64_t> full_rope_address = c10::nullopt,
-    c10::optional<int64_t> full_kv_address = c10::nullopt)
+    c10::optional<int64_t> full_kv_address = c10::nullopt,
+    c10::optional<int64_t> membership_address = c10::nullopt)
 {
     TORCH_CHECK(selection_topk_block_size == 1,
                 "fused sparse attention overlap standalone side-effect path requires selection_topk_block_size=1, "
@@ -150,6 +151,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectImpl(
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
     sglang::npu_kernel::RegisteredAclTensor key_input{key, full_kv_address};
     sglang::npu_kernel::RegisteredAclTensor value_input{value, full_kv_address};
+    sglang::npu_kernel::RegisteredAclTensor plan_input{selection_membership_map, membership_address};
     sglang::npu_kernel::RegisteredAclTensor rope_input{
         key_rope_opt.value_or(at::Tensor()),
         key_rope_opt.has_value() ? full_rope_address : c10::nullopt};
@@ -167,7 +169,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectImpl(
                  selection_kv_cache,
                  selection_kv_block_table,
                  selection_kv_block_status,
-                 selection_membership_map,
+                 plan_input,
                  scale_value,
                  sparse_block_size,
                  layout_query_ptr,
@@ -199,7 +201,8 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
     const std::string &layout_kv_str,
     int64_t sparse_mode,
     c10::optional<int64_t> full_rope_address = c10::nullopt,
-    c10::optional<int64_t> full_kv_address = c10::nullopt)
+    c10::optional<int64_t> full_kv_address = c10::nullopt,
+    c10::optional<int64_t> membership_address = c10::nullopt)
 {
     CheckPositiveShape(query, "query");
     int64_t last_dim = query.dim() - 1;
@@ -235,7 +238,8 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
         layout_kv_str,
         sparse_mode,
         full_rope_address,
-        full_kv_address);
+        full_kv_address,
+        membership_address);
 
     return sfa_output;
 }
@@ -260,7 +264,8 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
     c10::string_view layout_kv,
     int64_t sparse_mode,
     c10::optional<int64_t> full_rope_address = c10::nullopt,
-    c10::optional<int64_t> full_kv_address = c10::nullopt)
+    c10::optional<int64_t> full_kv_address = c10::nullopt,
+    c10::optional<int64_t> membership_address = c10::nullopt)
 {
     return RunFusedSparseAttentionOverlapSideEffect(
         query,
@@ -282,7 +287,8 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
         std::string(layout_kv),
         sparse_mode,
         full_rope_address,
-        full_kv_address);
+        full_kv_address,
+        membership_address);
 }
 
 inline at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
