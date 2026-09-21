@@ -1,5 +1,6 @@
-"""Stream-ordered LRU planning over registered metadata, including graph replay."""
+"""Stream-ordered cache planning over registered metadata, including graph replay."""
 
+import os
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -25,6 +26,9 @@ class NativeSparsePlanner:
             raise ValueError(
                 "planner capacity must cover TopK and fit the native int16 ABI"
             )
+        self.policy = os.environ.get("SGLANG_NPU_FSA_PLANNER_POLICY", "clock").lower()
+        if self.policy not in ("clock", "lru"):
+            raise ValueError("SGLANG_NPU_FSA_PLANNER_POLICY must be clock or lru")
         allocation = uuid4().hex
         device_id = self.device.index
         if device_id is None:
@@ -46,6 +50,12 @@ class NativeSparsePlanner:
         self.resident = torch.full((rows, capacity), -1, dtype=torch.int64)
         self.ages = torch.zeros_like(self.resident)
         self.row_state = torch.full((rows, 3), -1, dtype=torch.int64)
+        # Persistent state follows the resident table across all graph payloads.
+        buckets = 1 << (2 * capacity - 1).bit_length()
+        self.clock_workspace = (
+            torch.full((rows, buckets + 3 * capacity + 1), -1, dtype=torch.int64)
+            if self.policy == "clock" else None
+        )
         self.slots = (
             torch.empty((rows, topk), dtype=torch.int64, device=self.device)
             if device_slots else self.regions["slots"].tensor
@@ -72,7 +82,7 @@ class NativeSparsePlanner:
                 indices,
                 valid,
             )
-        self.kernel.native_ops().fsa_enqueue_lru_plan(
+        args = (
             keys,
             self.regions["keys"].tensor,
             self.regions["owners"].tensor,
@@ -81,8 +91,13 @@ class NativeSparsePlanner:
             self.ages,
             self.row_state,
             self.regions["slots"].tensor,
-            rows,
         )
+        if self.policy == "clock":
+            self.kernel.native_ops().fsa_enqueue_clock_plan(
+                *args, self.clock_workspace, rows
+            )
+        else:
+            self.kernel.native_ops().fsa_enqueue_lru_plan(*args, rows)
         if device_slots:
             self.kernel.copy_rows_from_registered_host(
                 self.regions["slots"], self.slots, indices, indices, valid

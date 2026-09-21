@@ -194,12 +194,13 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mtp_graph_rewrites_mutable_tail_without_owner_change(device, dtype):
+@pytest.mark.parametrize("draft_rows", [3, 6])
+def test_mtp_graph_rewrites_mutable_tail_without_owner_change(device, dtype, draft_rows):
     from sglang.srt.hardware_backend.npu.fsa_native import RegisteredHostRegion
     from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
 
     torch.manual_seed(721)
-    requests, draft_rows, heads, sequence, page_size = 2, 3, 16, 256, 128
+    requests, heads, sequence, page_size = 2, 16, 256, 128
     rows = requests * draft_rows
     source = torch.randn(requests, sequence, 512, dtype=dtype, device="cpu") * 0.25
     query_cpu = torch.randn(rows, heads, 512, dtype=dtype, device="cpu") * 0.25
@@ -211,13 +212,13 @@ def test_mtp_graph_rewrites_mutable_tail_without_owner_change(device, dtype):
     ids[:, :32] = torch.arange(32, device=device)
     ids[:, 2048:] = torch.arange(253, 256, device=device)
     lengths = torch.full((requests,), sequence, dtype=torch.int32, device=device)
-    cumulative = torch.tensor([3, 6], dtype=torch.int32, device=device)
-    positions = torch.tensor([253, 254, 255] * 2, device=device)
+    cumulative = torch.tensor([draft_rows, 2 * draft_rows], dtype=torch.int32, device=device)
+    positions = torch.tensor(list(range(sequence - draft_rows, sequence)) * 2, device=device)
     table = torch.arange(4, dtype=torch.int32, device=device).view(2, 2)
     slots = torch.tensor([1, 2], dtype=torch.int64, device=device)
     pool = SimpleNamespace(req_generation=torch.tensor([0, 1, 1], device="cpu"))
     state = FusedSparseAttentionState(device, pool, external_planner=True,
-                                     resident_capacity=4096, mutable_tail_tokens=3)
+                                     resident_capacity=4096, mutable_tail_tokens=draft_rows)
     graph = None
 
     def invoke():

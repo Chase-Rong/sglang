@@ -3,11 +3,26 @@
 This target builds a small `sgl_fsa` Torch extension against the installed Torch
 and Torch NPU. It does not build or install an sgl-kernel-npu wheel and does not
 replace the `npu` operator namespace. It contains the FSA ACLNN binding, native
-external LRU planner, Host registration and unidex copy.
+external cache planner, Host registration and unidex copy.
+
+The external planner defaults to CLOCK replacement with a persistent hash index.
+Rebuild the extension with the Python adapter: it requires the new
+`fsa_enqueue_clock_plan` binding. Set `SGLANG_NPU_FSA_PLANNER_POLICY=lru` before
+constructing planners to select the legacy sorting implementation for comparisons
+or rollback; other values are rejected. Do not switch policy on a live planner.
+
+CLOCK protects all requested hits before selecting victims and retains distinct
+slots for duplicate keys. It changes replacement order, not attention's selected
+keys or mutable-tail validity. Each query row still has its own cache. Hash links,
+reference bits and the CLOCK hand live in CPU tensors owned by the planner and
+shared by all captured graphs and eager calls. They reset with owner changes,
+length rollback and epoch rollover. At capacity 4096 the workspace adds 163848
+CPU bytes per reserved row. The callback performs no sorting, device operation,
+or scratch allocation; the existing metadata transfers remain.
 
 The optional `FusedSparseAttentionState(mapped_host_plan=True)` uses registered
 Host external plans. Production backend defaults are unchanged pending TP
-qualification. The CPU LRU
+qualification. The CPU cache
 planner retains slot placement on Host, and `fsa_host_plan` encodes the per-layer
 hit/miss plan using separate applied-key state. An ordered callback commits that
 state after attention. Above 16 query rows, independent CPU rows use up to four

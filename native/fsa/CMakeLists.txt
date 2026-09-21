@@ -42,6 +42,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/version.h" "#pragma once\n")
 add_library(sgl_fsa_extension SHARED registration.cpp
     external_host_mapping.cpp
     prefill_dma.cpp
+    clock_plan.cpp
     host_plan.cpp
     fused_sparse_attention_overlap.cpp
     "${FSA_CSRC}/fused_sparse_attention_overlap/fsa_lru_planner.cpp"

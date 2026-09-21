@@ -91,6 +91,59 @@ def test_native_planner_expanded_topk_and_graph_replay(device):
         planner.close(drained=True)
 
 
+def test_clock_state_shared_by_two_graphs_and_eager(device, monkeypatch):
+    from sglang.srt.hardware_backend.npu.external_sparse_planner import NativeSparsePlanner
+
+    monkeypatch.setenv("SGLANG_NPU_FSA_PLANNER_POLICY", "clock")
+    planner = NativeSparsePlanner(device, rows=6, topk=7, capacity=8)
+    keys = torch.arange(42, dtype=torch.int64, device=device).view(6, 7)
+    owners = torch.arange(6, dtype=torch.int64, device=device)
+    lengths = torch.full((6,), 100, dtype=torch.int64, device=device)
+    graphs = []
+
+    def invoke():
+        return planner.enqueue(keys, owners, lengths)
+
+    def check():
+        torch.npu.synchronize()
+        slots, expected = planner.slots.cpu(), keys.cpu()
+        assert ((slots >= 0) & (slots < 8)).all()
+        for row in slots:
+            assert row.unique().numel() == 7
+        valid = expected >= 0
+        assert torch.equal(planner.resident.gather(1, slots)[valid], expected[valid])
+
+    try:
+        invoke()
+        check()
+        for _ in range(2):
+            graph = torch.npu.NPUGraph()
+            graphs.append(graph)
+            with torch.npu.graph(graph):
+                invoke()
+        for step in range(36):
+            # Frequent eviction and collisions, including duplicate keys and
+            # invalid positions. Alternate payloads against the same resident.
+            values = (torch.arange(42).view(6, 7) + step * 3) * 8192
+            values[:, 1] = values[:, 0]
+            values[:, -1] = -1
+            keys.copy_(values.to(device))
+            if step == 11:
+                owners.add_(1)
+            if step == 23:
+                lengths.sub_(1)
+            if step % 3 == 2:
+                invoke()
+            else:
+                graphs[step % 3].replay()
+            check()
+    finally:
+        torch.npu.synchronize()
+        for graph in graphs:
+            graph.reset()
+        planner.close(drained=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("backing", ["registered_host", "npu"])
 def test_copy_across_four_gib_and_graph(device, dtype, backing):
