@@ -336,3 +336,51 @@ def test_layer_hook_cannot_change_compute_stream(setup):
             with case.device.stream(case.device.Stream("cpu")):
                 case.runtime.prepare_layer(7)
     assert case.runtime.failed and not case.runtime.active
+
+
+def test_completed_request_prefix_is_shared_without_suffix_aliasing(setup):
+    case = setup()
+    runtime = case.runtime
+    # These rows represent two Radix hits: immutable prefix, private suffixes.
+    runtime.request_pool.req_to_token = torch.tensor([[8, 3, 10, 5], [8, 3, 12, 7]])
+    for layer in range(4):
+        case.host[layer, [8, 3]] = torch.tensor([[layer + 1, 11], [layer + 2, 12]], dtype=case.host.dtype)
+    cached = case.host[:, [8, 3]].clone()
+    # Releasing the producer must drain copies, never free/zero radix-owned rows.
+    runtime.release_request("completed-prefix-producer")
+    new_rows = torch.tensor([10, 5, 12, 7])
+    batch = SimpleNamespace(
+        extend_prefix_lens_cpu=[2, 2], req_pool_indices=torch.tensor([0, 1]),
+        out_cache_loc=new_rows,
+        forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True),
+    )
+    with runtime.forward(batch):
+        for layer in range(7, 11):
+            runtime.prepare_layer(layer)
+            slot = case.pool.raw_layer_components(layer)[0]
+            torch.testing.assert_close(slot[[8, 3]], cached[layer - 7])
+            slot[new_rows] = torch.tensor([[20, 21], [22, 23], [30, 31], [32, 33]], dtype=slot.dtype)
+            case.device.current.mark(f"scatter-{runtime.generation}-{layer - 7}")
+            runtime.on_kv_written(layer, new_rows)
+            runtime.on_compute_start(layer)
+            runtime.finish_layer(layer)
+    runtime.release_request("consumer-0")
+    torch.testing.assert_close(case.host[:, [8, 3]], cached)
+    assert case.host[0, [10, 5, 12, 7]].tolist() == [[20, 21], [22, 23], [30, 31], [32, 33]]
+    # A later request can still restore the retained prefix after both finish.
+    runtime.release_request("consumer-1")
+    batch.req_pool_indices = torch.tensor([1])
+    batch.extend_prefix_lens_cpu = [2]
+    batch.out_cache_loc = torch.tensor([12, 7])
+    with runtime.forward(batch):
+        for layer in range(7, 11):
+            runtime.prepare_layer(layer)
+            slot = case.pool.raw_layer_components(layer)[0]
+            torch.testing.assert_close(slot[[8, 3]], cached[layer - 7])
+            slot[batch.out_cache_loc] = 50
+            case.device.current.mark(f"scatter-{runtime.generation}-{layer - 7}")
+            runtime.on_kv_written(layer, batch.out_cache_loc)
+            runtime.on_compute_start(layer)
+            runtime.finish_layer(layer)
+    runtime.release_request("later-consumer")
+    torch.testing.assert_close(case.host[:, [8, 3]], cached)
