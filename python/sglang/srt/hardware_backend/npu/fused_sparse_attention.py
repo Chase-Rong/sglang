@@ -492,6 +492,7 @@ class FusedSparseAttentionState:
         self._generation_snapshot = self.pool.req_generation.clone()
         self._pool_epoch = getattr(self.pool, "req_generation_epoch", 0)
         self._epoch = 0
+        self._generations_initialized = False
         self.refresh_generations()
 
     def refresh_generations(self):
@@ -499,6 +500,16 @@ class FusedSparseAttentionState:
         current = self.pool.req_generation
         self.forward_serial += 1
         pool_epoch = getattr(self.pool, "req_generation_epoch", 0)
+        # Request generations live on CPU and usually stay unchanged throughout
+        # decode. Avoid a blocking H2D copy while still advancing plan versions.
+        if (
+            self._generations_initialized
+            and pool_epoch == self._pool_epoch
+            and torch.equal(current, self._generation_snapshot)
+        ):
+            return
+        # A failed upload must be retried even after the CPU snapshot advances.
+        self._generations_initialized = False
         if (
             pool_epoch != self._pool_epoch
             or torch.any(current < self._generation_snapshot).item()
@@ -508,6 +519,7 @@ class FusedSparseAttentionState:
         self._generation_snapshot.copy_(current)
         identities = current + (self._epoch << 32)
         self.generations.copy_(identities)
+        self._generations_initialized = True
 
     def layer(self, layer_id: int) -> FusedSparseAttentionCacheManager:
         if layer_id not in self.layers:
