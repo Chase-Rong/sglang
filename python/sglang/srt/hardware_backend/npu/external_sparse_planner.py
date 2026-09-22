@@ -216,6 +216,19 @@ def materialize_layer_plan(
         * cache.selection_kv_cache.shape[1]
         // cache.max_tokens
     )
+    if physical_keys.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.fsa_layer_plan import build_layer_plan
+
+        safe_slots, miss = build_layer_plan(
+            physical_keys,
+            slots,
+            cache.applied_keys[:rows],
+            membership,
+            capacity=capacity,
+            cacheable_mask=cacheable_mask,
+            control_offset=control_offset,
+        )
+        return SparseSelectionPlan(physical_keys, safe_slots, miss, cacheable_mask)
     valid = (physical_keys >= 0) & (slots >= 0) & (slots < capacity)
     safe_slots = slots.clamp(min=0, max=capacity - 1)
     applied = cache.applied_keys[:rows]
