@@ -193,6 +193,42 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
         region.close(drained=True)
 
 
+@pytest.mark.parametrize("inference_mode", [False, True])
+def test_generation_refresh_preserves_graph_values_and_storage(device, inference_mode):
+    from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState
+
+    pool = SimpleNamespace(req_generation=torch.tensor([0, 1, 1], device="cpu"), req_generation_epoch=0)
+    graph = torch.npu.NPUGraph()
+    with torch.inference_mode(inference_mode):
+        state = FusedSparseAttentionState(device, pool)
+        address = state.generations.data_ptr()
+        with torch.npu.graph(graph):
+            output = state.generations + 10
+        try:
+            serial = state.forward_serial
+            for _ in range(6):
+                state.refresh_generations()
+            graph.replay()
+            assert output.cpu().tolist() == [10, 11, 11]
+            assert state.forward_serial == serial + 6
+            pool.req_generation[1] = 2
+            state.refresh_generations()
+            graph.replay()
+            assert output.cpu().tolist() == [10, 12, 11]
+            pool.req_generation_epoch += 1
+            state.refresh_generations()
+            graph.replay()
+            assert output.cpu().tolist() == [4294967306, 4294967308, 4294967307]
+            pool.req_generation.zero_()
+            state.refresh_generations()
+            graph.replay()
+            assert output.cpu().tolist() == [8589934602] * 3
+            assert state.generations.data_ptr() == address
+        finally:
+            torch.npu.synchronize()
+            graph.reset()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("draft_rows", [3, 6])
 def test_mtp_graph_rewrites_mutable_tail_without_owner_change(device, dtype, draft_rows):

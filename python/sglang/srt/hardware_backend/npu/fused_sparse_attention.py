@@ -451,6 +451,15 @@ def mask_causal_topk(topk, row_requests, query_lengths, kv_lengths, *, positions
     return topk.masked_fill((topk < 0) | (topk >= row_limit[:, None, None]), -1)
 
 
+def build_external_metadata_plan(*args, **kwargs):
+    # Keep CPU contract users independent of Triton and the NPU runtime.
+    from sglang.srt.hardware_backend.npu.fsa_metadata import (
+        build_external_metadata_plan as build,
+    )
+
+    return build(*args, **kwargs)
+
+
 class FusedSparseAttentionState:
     """Separate mutable KV state by layer and track request-slot lifetimes."""
 
@@ -492,6 +501,7 @@ class FusedSparseAttentionState:
         self._generation_snapshot = self.pool.req_generation.clone()
         self._pool_epoch = getattr(self.pool, "req_generation_epoch", 0)
         self._epoch = 0
+        self._generations_initialized = False
         self.refresh_generations()
 
     def refresh_generations(self):
@@ -499,6 +509,16 @@ class FusedSparseAttentionState:
         current = self.pool.req_generation
         self.forward_serial += 1
         pool_epoch = getattr(self.pool, "req_generation_epoch", 0)
+        # Request generations live on CPU and usually stay unchanged throughout
+        # decode. Avoid a blocking H2D copy while still advancing plan versions.
+        if (
+            self._generations_initialized
+            and pool_epoch == self._pool_epoch
+            and torch.equal(current, self._generation_snapshot)
+        ):
+            return
+        # A failed upload must be retried even after the CPU snapshot advances.
+        self._generations_initialized = False
         if (
             pool_epoch != self._pool_epoch
             or torch.any(current < self._generation_snapshot).item()
@@ -508,6 +528,7 @@ class FusedSparseAttentionState:
         self._generation_snapshot.copy_(current)
         identities = current + (self._epoch << 32)
         self.generations.copy_(identities)
+        self._generations_initialized = True
 
     def layer(self, layer_id: int) -> FusedSparseAttentionCacheManager:
         if layer_id not in self.layers:
@@ -602,32 +623,58 @@ class FusedSparseAttentionState:
             raise ValueError("request, query-length and KV-length counts must match")
         if block_table.dim() != 2 or block_table.shape[0] != batch_size:
             raise ValueError("full block table must have one row per request")
-        query_rows = torch.arange(token_count, device=q_nope.device, dtype=torch.int32)
-        row_requests = torch.bucketize(query_rows, query_lengths, right=True)
-        valid = row_requests < batch_size
-        row_requests = row_requests.clamp(max=batch_size - 1)
-        slots = request_slots[row_requests]
-        valid = (
-            valid
-            & (slots > 0)
-            & (slots < self.generations.numel())
-            & (kv_lengths[row_requests] > 0)
+        fused_metadata = (
+            self.external_planner
+            and not self.mapped_host_plan
+            and q_nope.device.type == "npu"
         )
-        safe_slots = slots.clamp(min=0, max=self.generations.numel() - 1)
-        identities = (
-            self.generations[safe_slots] * self.generations.numel() + safe_slots
-        )
-        identities = torch.where(valid, identities, -1)
-        topk_indices = topk_indices.to(dtype=torch.int32).masked_fill(
-            ~valid[:, None, None], -1
-        )
-        topk_indices = mask_causal_topk(
-            topk_indices,
-            row_requests,
-            query_lengths,
-            kv_lengths,
-            positions=query_positions,
-        )
+        if fused_metadata:
+            topk_indices, physical_keys, identities, row_lengths, cacheable = (
+                build_external_metadata_plan(
+                    topk_indices,
+                    block_table.to(q_nope.device).contiguous(),
+                    kv_lengths,
+                    query_lengths,
+                    request_slots.contiguous(),
+                    self.generations,
+                    positions=None
+                    if query_positions is None
+                    else query_positions.to(q_nope.device).contiguous(),
+                    page_size=full_kv.shape[1],
+                    full_token_count=full_kv.shape[0] * full_kv.shape[1],
+                    mutable_tail_tokens=self.mutable_tail_tokens,
+                )
+            )
+        else:
+            query_rows = torch.arange(
+                token_count, device=q_nope.device, dtype=torch.int32
+            )
+            row_requests = torch.bucketize(query_rows, query_lengths, right=True)
+            valid = row_requests < batch_size
+            row_requests = row_requests.clamp(max=batch_size - 1)
+            slots = request_slots[row_requests]
+            valid = (
+                valid
+                & (slots > 0)
+                & (slots < self.generations.numel())
+                & (kv_lengths[row_requests] > 0)
+            )
+            safe_slots = slots.clamp(min=0, max=self.generations.numel() - 1)
+            identities = (
+                self.generations[safe_slots] * self.generations.numel() + safe_slots
+            )
+            identities = torch.where(valid, identities, -1)
+            topk_indices = topk_indices.to(dtype=torch.int32).masked_fill(
+                ~valid[:, None, None], -1
+            )
+            topk_indices = mask_causal_topk(
+                topk_indices,
+                row_requests,
+                query_lengths,
+                kv_lengths,
+                positions=query_positions,
+            )
+            row_lengths = kv_lengths[row_requests]
         manager = self.layer(layer_id)
         if manager.cache is None and self.row_capacity is not None:
             self.reserve(
@@ -639,8 +686,13 @@ class FusedSparseAttentionState:
         )
         if not self.mapped_host_plan:
             manager.invalidate_changed_rows(
-                cache, status, membership, identities, token_count, 1,
-                seq_lens=kv_lengths[row_requests],
+                cache,
+                status,
+                membership,
+                identities,
+                token_count,
+                1,
+                seq_lens=row_lengths,
             )
         selection_plan = None
         membership_region = None
@@ -649,23 +701,25 @@ class FusedSparseAttentionState:
                 materialize_layer_plan,
             )
 
-            reference = build_reference_sparse_plan(
-                topk_indices,
-                block_table,
-                kv_lengths,
-                query_lengths,
-                page_size=full_kv.shape[1],
-            )
-            physical_keys = reference.physical_token_ids[:, 0].contiguous()
-            physical_keys = physical_keys.masked_fill(
-                physical_keys >= full_kv.shape[0] * full_kv.shape[1], -1
-            )
-            topk_indices = topk_indices.masked_fill(physical_keys[:, None] < 0, -1)
+            if not fused_metadata:
+                reference = build_reference_sparse_plan(
+                    topk_indices,
+                    block_table,
+                    kv_lengths,
+                    query_lengths,
+                    page_size=full_kv.shape[1],
+                )
+                physical_keys = reference.physical_token_ids[:, 0].contiguous()
+                physical_keys = physical_keys.masked_fill(
+                    physical_keys >= full_kv.shape[0] * full_kv.shape[1], -1
+                )
+                topk_indices = topk_indices.masked_fill(physical_keys[:, None] < 0, -1)
             anchor, planner = self._ensure_planner(
                 layer_id, cache, topk_indices.shape[-1]
             )
-            cacheable = None
-            if self.mutable_tail_tokens:
+            if not fused_metadata:
+                cacheable = None
+            if not fused_metadata and self.mutable_tail_tokens:
                 stable_prefix = (
                     kv_lengths[row_requests] - self.mutable_tail_tokens
                 ).clamp(min=0)
@@ -677,7 +731,9 @@ class FusedSparseAttentionState:
                 token_count,
             ):
                 slots = planner.enqueue(
-                    physical_keys, identities, kv_lengths[row_requests],
+                    physical_keys,
+                    identities,
+                    row_lengths,
                     **({"cacheable": cacheable} if self.mapped_host_plan else {}),
                 )
                 self.plan_versions[anchor] = (self.forward_serial, token_count)
@@ -685,16 +741,24 @@ class FusedSparseAttentionState:
                 slots = planner.slots[:token_count]
             if self.mapped_host_plan:
                 selection_plan, membership_region = planner.materialize(
-                    physical_keys, layer_id, token_count,
+                    physical_keys,
+                    layer_id,
+                    token_count,
                 )
                 if token_count > 16:
-                    planner.stage(membership_region, cache.selection_membership_map, token_count)
+                    planner.stage(
+                        membership_region, cache.selection_membership_map, token_count
+                    )
                     membership_region = None
                 else:
                     membership = membership_region.tensor[:token_count]
             else:
                 selection_plan = materialize_layer_plan(
-                    cache, physical_keys, slots, membership, cacheable_mask=cacheable,
+                    cache,
+                    physical_keys,
+                    slots,
+                    membership,
+                    cacheable_mask=cacheable,
                 )
         return FusedSparseAttentionInputs(
             query=(

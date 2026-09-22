@@ -11,9 +11,11 @@
 using sglang::npu_kernel::ClockWorkspaceSize;
 using sglang::npu_kernel::PlanClockRow;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::abort(); } } while(0)
+template<typename Index>
 struct Row {
     int64_t capacity;
-    std::vector<int64_t> resident, ages, workspace;
+    std::vector<int64_t> resident, ages;
+    std::vector<Index> workspace;
     std::vector<uint8_t> protected_slots;
     int64_t state[3]={-1,-1,-1};
     explicit Row(int64_t c):capacity(c),resident(c,-1),ages(c,0),workspace(ClockWorkspaceSize(c),-1),protected_slots(c){}
@@ -41,8 +43,9 @@ struct Row {
         return out;
     }
 };
-int main() {
-    Row r(8);auto first=r.run({11,22,33,44});auto warm=r.run({44,11,33,22});
+template<typename Index>
+void CheckContract() {
+    Row<Index> r(8);auto first=r.run({11,22,33,44});auto warm=r.run({44,11,33,22});
     CHECK(warm[0]==first[3] && warm[1]==first[0] && warm[2]==first[2] && warm[3]==first[1]);
     r.run({100,200,300,400,44,11,33,22});
     auto dup=r.run({77,77,77,-1,-1,11,22,33});
@@ -58,7 +61,7 @@ int main() {
     std::vector<int64_t> collisions;
     for(int64_t key=0;collisions.size()<32;++key)
         if(sglang::npu_kernel::ClockBucket(key,15)==0)collisions.push_back(key);
-    Row collided(8);
+    Row<Index> collided(8);
     for(int step=0;step<100;++step) {
         std::vector<int64_t> keys;
         for(int i=0;i<7;++i)keys.push_back(collisions[(step*3+i)%32]);
@@ -71,7 +74,7 @@ int main() {
     CHECK(std::count(r.resident.begin(),r.resident.end(),-1)==7);
     std::mt19937_64 rng(917);
     for(int capacity:{1,2,3,8,31,64,4096}) {
-        Row a(capacity),b(capacity);
+        Row<Index> a(capacity),b(capacity);
         for(int step=0;step<1500;++step) {
             int width=1+rng()%std::min(capacity,2051);
             std::vector<int64_t> keys(width);
@@ -80,5 +83,41 @@ int main() {
             row.run(keys,step/137+1,100+step%89);
         }
     }
+}
+void CheckMaximumSlotAndHandWrap() {
+    constexpr int64_t capacity=32767, width=2051;
+    Row<int64_t> legacy(capacity);
+    Row<int16_t> compact(capacity);
+    std::vector<int64_t> keys(width), legacy_slots(width), compact_slots(width);
+    bool maximum_slot_seen=false, hand_wrapped=false;
+    int64_t previous_hand=0;
+    for(int64_t step=0;step<20;++step) {
+        // Keep one owner and increasing lengths so the table fills past the
+        // largest legal int16 slot without an intervening reset.
+        for(int64_t i=0;i<width;++i)keys[i]=(step*width+i)*128;
+        PlanClockRow(keys.data(),width,1,100+step,legacy.resident.data(),
+                     legacy.ages.data(),legacy.state,legacy_slots.data(),capacity,
+                     legacy.workspace.data(),legacy.protected_slots.data());
+        PlanClockRow(keys.data(),width,1,100+step,compact.resident.data(),
+                     compact.ages.data(),compact.state,compact_slots.data(),capacity,
+                     compact.workspace.data(),compact.protected_slots.data());
+        CHECK(legacy_slots==compact_slots);
+        CHECK(legacy.resident==compact.resident && legacy.ages==compact.ages);
+        CHECK(std::equal(legacy.state,legacy.state+3,compact.state));
+        CHECK(std::equal(legacy.workspace.begin(),legacy.workspace.end(),compact.workspace.begin()));
+        CHECK(legacy.protected_slots==compact.protected_slots);
+        for(auto slot:compact_slots) {
+            CHECK(slot>=0 && slot<capacity);
+            maximum_slot_seen|=slot==capacity-1;
+        }
+        hand_wrapped|=compact.workspace.back()<previous_hand;
+        previous_hand=compact.workspace.back();
+    }
+    CHECK(maximum_slot_seen && hand_wrapped);
+}
+int main() {
+    CheckContract<int64_t>();
+    CheckContract<int16_t>();
+    CheckMaximumSlotAndHandWrap();
     std::puts("CLOCK_CONTRACT_OK");
 }

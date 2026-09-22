@@ -263,6 +263,87 @@ def test_pool_clear_and_reallocate_between_forwards_invalidates_selection():
     assert torch.all(updated.selection_kv_block_status == -1)
 
 
+def test_unchanged_generations_do_not_rewrite_graph_buffer():
+    state, _ = make_state_and_inputs()
+    # Initialization must upload even when the initial snapshot matches.
+    assert state.generations.tolist() == [0, 1, 1]
+    address = state.generations.data_ptr()
+    version = state.generations._version
+    serial = state.forward_serial
+    for _ in range(6):
+        state.refresh_generations()
+    assert state.generations.tolist() == [0, 1, 1]
+    assert state.generations.data_ptr() == address
+    assert state.generations._version == version
+    # TopK plans must still be refreshed for each forward with the same owner.
+    assert state.forward_serial == serial + 6
+
+
+def test_generation_changes_upload_once_and_preserve_graph_address():
+    state, _ = make_state_and_inputs()
+    address = state.generations.data_ptr()
+    state.pool.req_generation[1] += 1
+    state.refresh_generations()
+    assert state.generations.tolist() == [0, 2, 1]
+    version = state.generations._version
+    state.refresh_generations()
+    assert state.generations._version == version
+    # Clearing and reallocating can restore identical generation values.
+    state.pool.req_generation_epoch = 1
+    state.refresh_generations()
+    assert state.generations.tolist() == [4294967296, 4294967298, 4294967297]
+    assert state.generations.data_ptr() == address
+    version = state.generations._version
+    state.refresh_generations()
+    assert state.generations._version == version
+
+
+def test_generation_snapshots_are_independent_for_shared_request_pool():
+    first, _ = make_state_and_inputs()
+    second = _MODULE.FusedSparseAttentionState("cpu", first.pool)
+    first.pool.req_generation[1] += 1
+    first.refresh_generations()
+    assert first.generations.tolist() == [0, 2, 1]
+    assert second.generations.tolist() == [0, 1, 1]
+    second.refresh_generations()
+    assert second.generations.tolist() == [0, 2, 1]
+    for state in (first, second):
+        version = state.generations._version
+        state.refresh_generations()
+        assert state.generations._version == version
+
+
+@pytest.mark.parametrize("change, expected", [
+    ("generation", [0, 2, 1]),
+    ("epoch", [4294967296, 4294967297, 4294967297]),
+    ("rollback", [4294967296, 4294967296, 4294967296]),
+])
+def test_failed_generation_upload_is_retried(monkeypatch, change, expected):
+    state, _ = make_state_and_inputs()
+    if change == "generation":
+        state.pool.req_generation[1] += 1
+    elif change == "epoch":
+        state.pool.req_generation_epoch = 1
+    else:
+        state.pool.req_generation.zero_()
+    original_copy = torch.Tensor.copy_
+    fail_upload = True
+
+    def copy_with_one_upload_failure(destination, source, *args, **kwargs):
+        nonlocal fail_upload
+        if destination is state.generations and fail_upload:
+            fail_upload = False
+            raise RuntimeError("generation upload failed")
+        return original_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_with_one_upload_failure)
+    with pytest.raises(RuntimeError, match="generation upload failed"):
+        state.refresh_generations()
+    assert state.generations.tolist() == [0, 1, 1]
+    state.refresh_generations()
+    assert state.generations.tolist() == expected
+
+
 def test_builder_maps_cumulative_query_rows_and_masks_padding():
     state, arguments = make_state_and_inputs()
     arguments.update(
