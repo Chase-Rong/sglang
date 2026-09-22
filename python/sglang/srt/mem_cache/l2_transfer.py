@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from functools import cache
+from inspect import getattr_static
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
@@ -55,6 +56,14 @@ class L2TransferEngine:
         self.host_to_device_stream = device_module.Stream()
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        """Join each pool's backup work into the transfer stream's completion.
+
+        A pool adopting existing Host backing must enqueue waits for its backing's
+        ready events on the current stream inside backup_from_device_all_layer.
+        That method may omit its payload copy, but must not omit readiness waits.
+        The finish event covers these waits and every side pool's actual copy.
+        """
+        reader_bindings = self._reader_bindings(transfers)
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         with device_module.stream(self.device_to_host_stream):
@@ -68,8 +77,22 @@ class L2TransferEngine:
                     self.io_backend,
                 )
             ack_finish.record()
+            for binding in reader_bindings:
+                binding.record_reader(ack_finish)
             self._record_stream(transfers, self.device_to_host_stream)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
+
+    def drain_device_to_host(self) -> None:
+        """Drain failed write submission before the caller releases its pages.
+
+        Index preparation may have submitted work on the caller's stream before
+        backup started. Both streams must finish successfully before rollback;
+        a synchronization failure leaves ownership with the caller for recovery.
+        """
+        try:
+            device_module.current_stream().synchronize()
+        finally:
+            self.device_to_host_stream.synchronize()
 
     def submit_host_to_device(
         self,
@@ -79,6 +102,38 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
+        """Invoke pool loads inline before publishing layer and transfer events.
+
+        Pools binding Host mappings must update CPU-visible mappings inside
+        load_to_device_per_layer before returning, so later CPU submission sees
+        them. Device work must join the current stream before on_layer_done;
+        a stream event alone cannot defer or publish CPU mapping updates.
+        Optional prepare_load_to_device runs once on the caller stream and must
+        return a callable taking the local layer id, with immutable copy plans.
+        """
+        reader_bindings = self._reader_bindings(transfers)
+        prepared_loads = []
+        for transfer in transfers:
+            prepare = (
+                getattr(transfer.host_pool, "prepare_load_to_device")
+                if getattr_static(transfer.host_pool, "prepare_load_to_device", None)
+                is not None
+                else None
+            )
+            load_layer = None
+            if callable(prepare):
+                load_layer = prepare(
+                    transfer.device_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    self.io_backend,
+                    is_draft=transfer.is_draft,
+                )
+                if not callable(load_layer):
+                    raise TypeError(
+                        "prepare_load_to_device must return a layer callable"
+                    )
+            prepared_loads.append(load_layer)
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
@@ -86,7 +141,7 @@ class L2TransferEngine:
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
             for layer_id in range(layer_num):
-                for transfer in transfers:
+                for transfer, load_layer in zip(transfers, prepared_loads):
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -98,19 +153,45 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
-                    transfer.host_pool.load_to_device_per_layer(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                    if load_layer is not None:
+                        load_layer(local_layer_id)
+                    else:
+                        transfer.host_pool.load_to_device_per_layer(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
             ack_finish.record()
+            for binding in reader_bindings:
+                binding.record_reader(ack_finish)
             self._record_stream(transfers, self.host_to_device_stream)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
+
+    @staticmethod
+    def _reader_bindings(transfers: list[L2Transfer]) -> list[Any]:
+        """Require adopted backing to retain all anchor and sidecar readers."""
+        bindings = {}
+        for transfer in transfers:
+            binding = getattr(transfer.host_pool, "binding", None)
+            if binding is None and (
+                transfer is not transfers[0]
+                or not callable(
+                    getattr(transfer.host_pool, "acquire_device_pages", None)
+                )
+            ):
+                continue
+            if not callable(getattr(binding, "record_reader", None)):
+                raise RuntimeError(
+                    "Adopted HiCache backing requires binding.record_reader(event) "
+                    "to protect transfer-stream readers."
+                )
+            bindings[id(binding)] = binding
+        return list(bindings.values())
 
     @staticmethod
     def _start_event(start_event):
@@ -123,5 +204,10 @@ class L2TransferEngine:
     def _record_stream(transfers: list[L2Transfer], stream) -> None:
         for transfer in transfers:
             for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
+                if indices.device.type in (
+                    "cuda",
+                    "npu",
+                    "privateuseone",
+                    "privateuse1",
+                ):
                     indices.record_stream(stream)

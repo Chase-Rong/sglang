@@ -85,3 +85,33 @@ hardware qualification must be evaluated separately: the A5 helper build/load
 and three registered-copy/planner tests passed. The separately built arch35
 attention vendor and corrected wrapper passed54 attention/lifecycle cases. See
 `FSA_OFFLOAD_MIGRATION.md` for exact logs and limitations.
+
+## HiCache-managed integrated offload
+
+Integrated offload uses HiCache page ownership over the existing MemFabric
+regions. It does not allocate a second complete Host KV payload. The default
+UnifiedRadix FULL/MAMBA stack owns prefix matching, cache references and
+eviction; the offload runtime retains Prefill slot reuse and direct Host reads
+in fused Decode attention. There is no switch selecting the previous private
+integrated memory-management path.
+
+Device KV page IDs and Host page IDs can differ. Prefill DMA accepts CPU int64
+`[source_row, destination_row, count]` runs, coalescing only when both ends are
+contiguous. Rebuild this extension before using the HiCache Python adapter.
+The older two-column native copy contract remains available to other callers.
+Decode keeps its current-token writeback operation and maps its destination to
+the HiCache Host slot. Attention consumes a separate Host page table; the
+compressed Indexer keeps its device addressing.
+
+Backing allocation precedes graph capture. HiCache adopts completed pages
+without repeating their D2H copy. Indexer and KDA checkpoint sidecars have
+separate Host allocations and completion events. Page recycling waits for
+outstanding readers; shared TP backing also requires agreement across ranks
+before reuse. Closing the backing requires all graphs and streams to be drained.
+
+This integration targets the single-service, non-speculative CP1/DCP1 path.
+L3 storage, external linkers and speculative state restoration are not included.
+Existing integrated-offload configuration enables the required HiCache/radix
+settings automatically. Non-offload allocation remains unchanged. Compilation
+and CPU contract tests alone do not qualify NPU, TP8, prefix-hit model accuracy,
+or end-to-end performance; each requires its corresponding hardware validation.

@@ -26,7 +26,10 @@ def initialize_fsa_backend(backend, model_runner):
     from sglang.srt.configs.model_config import dsa_layer_skips_topk
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-    from sglang.srt.hardware_backend.npu.speculative_sparse import sparse_mtp_rows, sparse_mtp_tail
+    from sglang.srt.hardware_backend.npu.speculative_sparse import (
+        sparse_mtp_rows,
+        sparse_mtp_tail,
+    )
     from sglang.srt.runtime_context import get_exec, get_spec
 
     backend.fused_sparse_state = None
@@ -58,9 +61,14 @@ def initialize_fsa_backend(backend, model_runner):
     state = getattr(owner, "fsa_runtime_state", None)
     if state is None:
         graph = get_exec().graph.cuda_graph_config.decode
-        graph_requests = (max([graph.max_bs or 0, *(graph.bs or ())])
-                          if graph.backend != "disabled" else 0)
-        row_capacity = max(backend.req_to_token_pool.size, graph_requests) * sparse_mtp_rows(
+        graph_requests = (
+            max([graph.max_bs or 0, *(graph.bs or ())])
+            if graph.backend != "disabled"
+            else 0
+        )
+        row_capacity = max(
+            backend.req_to_token_pool.size, graph_requests
+        ) * sparse_mtp_rows(
             model_runner.spec_algorithm, get_spec(), model_runner.model_config
         )
         state = FusedSparseAttentionState(
@@ -113,6 +121,13 @@ def forward_fsa(
         raise ValueError("FSA requires the baseline Indexer's expanded token IDs")
     if topk_indices.shape[-1] != backend.fused_sparse_topk:
         raise ValueError("FSA TopK width must include every KPool tail column")
+    pool, local_layer = sparse_pool_and_layer(backend.token_to_kv_pool, layer.layer_id)
+    backing = getattr(pool, "decode_host_backing", None)
+    full_table = metadata.real_page_table
+    if backing is not None and backing.integrated:
+        full_table = metadata.host_page_table
+        if full_table is None:
+            raise RuntimeError("Integrated FSA requires the HiCache Host page table")
     inputs = backend.fused_sparse_state.build_inputs(
         layer_id=layer.layer_id,
         q_nope=q,
@@ -120,15 +135,13 @@ def forward_fsa(
         topk_indices=topk_indices,
         full_kv=paged_kv_view(full_kv, backend.page_size, backend.kv_lora_rank),
         full_rope=paged_kv_view(full_rope, backend.page_size, backend.qk_rope_head_dim),
-        block_table=metadata.real_page_table,
+        block_table=full_table,
         kv_lengths=lengths,
         query_lengths=query_lengths,
         request_slots=forward_batch.req_pool_indices[: counts.numel()],
         scale=layer.scaling,
         query_positions=getattr(forward_batch, "positions", None),
     )
-    pool, local_layer = sparse_pool_and_layer(backend.token_to_kv_pool, layer.layer_id)
-    backing = getattr(pool, "decode_host_backing", None)
     if backing is not None:
         latent_region, rope_region = backing.regions[local_layer]
         inputs = replace(

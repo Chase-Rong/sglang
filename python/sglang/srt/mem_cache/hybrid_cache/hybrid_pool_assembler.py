@@ -141,6 +141,28 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    if getattr(kv_pool, "integrated_offload", False):
+        _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
+        backing = getattr(kv_pool, "decode_host_backing", None)
+        host_pool = getattr(backing, "hicache_pool", None)
+        if host_pool is None:
+            raise RuntimeError(
+                "integrated offload must create decode_host_backing.hicache_pool "
+                "before assembling HiCache; allocating a second KV backing is forbidden"
+            )
+        if (
+            host_pool.device_pool is not kv_pool
+            or host_pool.page_size != kv_pool.page_size
+            or page_size <= 0
+            or page_size % host_pool.page_size
+            or host_pool.layer_num != kv_pool.layer_num
+        ):
+            raise ValueError("Integrated HiCache backing does not match the KV pool")
+        if override_kv_cache_dim is not None and (
+            override_kv_cache_dim != host_pool.kv_cache_dim
+        ):
+            raise ValueError("Integrated HiCache backing cannot change KV dimensions")
+        return host_pool
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -167,6 +189,25 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+
+
+def _has_npu_compressed_indexer(kv_pool: Any) -> bool:
+    return str(getattr(kv_pool, "device", "")).split(":")[0] == "npu" and bool(
+        getattr(kv_pool, "_kpool_use_compress", False)
+    )
+
+
+def _validate_npu_hicache_parallel(kv_pool: Any, draft_pools: tuple) -> None:
+    parallel = get_parallel()
+    if (
+        getattr(parallel, "attn_cp_size", 1) != 1
+        or getattr(parallel, "attn_dcp_size", 1) != 1
+        or getattr(parallel, "dcp_enabled", False)
+        or getattr(kv_pool, "layer_shard_enabled", False)
+    ):
+        raise NotImplementedError("NPU integrated/indexer HiCache CP is unsupported")
+    if draft_pools or getattr(kv_pool, "tail_extra_slots", 0):
+        raise NotImplementedError("NPU integrated/indexer HiCache MTP is unsupported")
 
 
 def _split_hicache_size(
@@ -794,6 +835,25 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
         for pool in params.mtp_draft_device_pools
     )
+    if (
+        getattr(kv_pool, "integrated_offload", False)
+        and getattr(params.req_to_token_pool, "mamba_ckpt_pool", None) is not None
+    ):
+        raise NotImplementedError(
+            "NPU integrated HiCache cannot use INT8 Mamba checkpoint slots as "
+            "active KDA state slots"
+        )
+    has_npu_indexer = getattr(kv_pool, "integrated_offload", False) and (
+        _has_npu_compressed_indexer(kv_pool)
+    )
+    if has_npu_indexer:
+        _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
+        if get_memory().hicache_size > 0:
+            raise ValueError(
+                "NPU compressed-indexer HiCache does not support --hicache-size: "
+                "the existing KV backing, compressed indexer and Mamba have separate "
+                "budgets. Use --hicache-ratio; indexer bytes are checked and logged."
+            )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -813,12 +873,21 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool_cls = MambaPoolHost
+    mamba_layout = get_memory().hicache_mem_layout
+    if getattr(kv_pool, "integrated_offload", False):
+        from sglang.srt.hardware_backend.npu.hicache_mamba_pool import (
+            NpuMambaPoolHost,
+        )
+
+        mamba_host_pool_cls = NpuMambaPoolHost
+        mamba_layout = "page_first"
+    mamba_host_pool = mamba_host_pool_cls(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(),
-        layout=get_memory().hicache_mem_layout,
+        layout=mamba_layout,
     )
     entries = [
         build_pool_entry(
@@ -842,6 +911,21 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if has_npu_indexer:
+        from sglang.srt.hardware_backend.npu.hicache_indexer_pool import (
+            NPUIndexerPoolHost,
+        )
+
+        indexer_host_pool = NPUIndexerPoolHost(kv_pool, kv_host_pool)
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=indexer_host_pool,
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1417,9 +1501,23 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=(
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.INDEXER,
+                        indices_from_pool=PoolName.KV,
+                    )
+                ]
+                if PoolName.INDEXER in host_pool_group.entry_map
+                else []
+            ),
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
-            pools_desc="KV + MAMBA",
+            pools_desc=(
+                "KV + MAMBA + INDEXER(NPU compressed)"
+                if PoolName.INDEXER in host_pool_group.entry_map
+                else "KV + MAMBA"
+            ),
         )
 
 
@@ -1787,6 +1885,9 @@ def _apply_stack_result(
 ) -> None:
     cache.host_pool_group = result.host_pool_group
     cache.cache_controller = result.cache_controller
+    binding = getattr(result.host_pool_group.anchor_entry.host_pool, "binding", None)
+    if binding is not None:
+        binding.evict_host = cache.evict_host
 
     for ct, host_pool in result.component_host_pools.items():
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]

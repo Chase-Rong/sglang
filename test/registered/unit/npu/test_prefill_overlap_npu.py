@@ -35,7 +35,7 @@ PAGE_SIZE = 128
 POOL_SIZE = 512
 POOL_ROWS = (POOL_SIZE // PAGE_SIZE + 1) * PAGE_SIZE
 MAPPING_ROWS = 256
-SLOT_ROW_SPAN = (POOL_ROWS - 2) // 2
+SLOT_ROW_SPAN = POOL_SIZE // 2
 REQUEST_IDS = ("pipelined-a", "pipelined-b")
 CHUNKS = ((0, 128), (128, 192), (192, 256))
 SETTLED_PASSES = ((0, 128), (128, 128))
@@ -64,14 +64,39 @@ def _request_rows(device):
     value of that row would legitimately be ambiguous.
     """
     base = torch.arange(MAPPING_ROWS, dtype=torch.int64)
-    first = 1 + (base * 5) % SLOT_ROW_SPAN
-    second = 1 + SLOT_ROW_SPAN + (base * 7) % SLOT_ROW_SPAN
+    first = PAGE_SIZE + (base * 5) % SLOT_ROW_SPAN
+    second = PAGE_SIZE + SLOT_ROW_SPAN + (base * 7) % SLOT_ROW_SPAN
     rows = torch.stack((first, second)).to(device)
-    assert int(rows.min()) >= 1 and int(rows.max()) < POOL_ROWS
+    assert int(rows.min()) >= PAGE_SIZE and int(rows.max()) < POOL_ROWS
     assert len(set(first.tolist())) == MAPPING_ROWS
     assert len(set(second.tolist())) == MAPPING_ROWS
     assert not set(first.tolist()) & set(second.tolist())
     return rows
+
+
+def bind_hicache_rows(pool, rows):
+    """Bind real borrowed Host pages in reverse order before any forward."""
+    from sglang.srt.hardware_backend.npu.hicache_host_pool import MemFabricHiCachePool
+
+    backing = pool.decode_host_backing
+    host_pool = backing.bind_hicache(pool)
+    assert isinstance(host_pool, MemFabricHiCachePool)
+    assert host_pool.binding is backing.page_binding
+    pages = torch.unique(rows.detach().cpu() // pool.page_size)
+    assert pages.numel() > 1 and pages.min() > 0
+    for page in pages.flip(0):
+        assert backing.page_binding.ensure_pages(page.reshape(1))
+    mapped = backing.page_binding.device_to_host_cpu[pages]
+    assert torch.all(mapped > 0) and torch.any(mapped != pages)
+    for layer, regions in enumerate(backing.regions):
+        for view, region in zip(host_pool.layer_views(layer), regions):
+            if region is not None:
+                assert view.data_ptr() == region.tensor.data_ptr()
+    shared = backing.pool.shared_group
+    if shared is not None:
+        mappings = shared.group.all_gather_object(mapped.tolist())
+        assert all(mapping == mappings[0] for mapping in mappings)
+    return host_pool
 
 
 def _row_generations(length, passes):
@@ -207,14 +232,18 @@ def _compare_checks(checks):
 
 
 def _check_host_kv(backing, rows, length, passes, *, dtype):
-    if backing.pool.shared_group is not None and not backing.pool.shared_group.is_writer:
+    if (
+        backing.pool.shared_group is not None
+        and not backing.pool.shared_group.is_writer
+    ):
         return
     cpu_rows = rows[:, :length].reshape(-1).cpu()
+    host_rows = backing.page_binding.host_rows(rows[:, :length].reshape(-1)).cpu()
     generations = _row_generations(length, passes).repeat(rows.shape[0])
     for layer in range(LAYER_NUM):
         latent_region, rope_region = backing.regions[layer]
         torch.testing.assert_close(
-            latent_region.tensor[cpu_rows].cpu(),
+            latent_region.tensor[host_rows].cpu(),
             _logical_rows(
                 layer, cpu_rows, generations, width=KV_LORA_RANK, dtype=dtype
             ).cpu(),
@@ -223,7 +252,7 @@ def _check_host_kv(backing, rows, length, passes, *, dtype):
             msg=f"host latent layer {layer}",
         )
         torch.testing.assert_close(
-            rope_region.tensor[cpu_rows].cpu(),
+            rope_region.tensor[host_rows].cpu(),
             _logical_rows(
                 layer, cpu_rows, generations, width=ROPE_DIM, dtype=dtype
             ).cpu(),
@@ -273,9 +302,12 @@ def _check_decode_replay(pool, backing, rows, device, *, dtype):
         rope.copy_(updated_rope)
         graph.replay()
         torch.npu.synchronize()
-        if backing.pool.shared_group is not None and not backing.pool.shared_group.is_writer:
+        if (
+            backing.pool.shared_group is not None
+            and not backing.pool.shared_group.is_writer
+        ):
             return
-        host_rows = locations.cpu()
+        host_rows = backing.page_binding.host_rows(locations).cpu()
         torch.testing.assert_close(
             backing.regions[layer][0].tensor[host_rows].cpu(),
             updated.squeeze(1).cpu(),
@@ -358,6 +390,7 @@ def _exercise_pipelined_overlap(
     slot_pointers = []
     drained = False
     try:
+        bind_hicache_rows(pool, rows)
         for chunk, (prefix, length) in enumerate(passes):
             if interleave is not None:
                 interleave("pass", chunk)
@@ -400,6 +433,8 @@ def _exercise_pipelined_overlap(
                         dtype=dtype,
                     )
                     runtime.finish_layer(layer)
+            assert backing.page_binding.ready_event is runtime.host_visible
+            assert runtime.prefix_plan.shape[1] == runtime.new_plan.shape[1] == 3
         runtime.drain()
         drained = True
         torch.npu.synchronize()

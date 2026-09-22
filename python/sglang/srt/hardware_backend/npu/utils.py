@@ -31,7 +31,6 @@ class NPUACLFormat(IntEnum):
 
 
 def _call_once(fn: Callable):
-
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if getattr(fn, "_has_been_called", False):
@@ -50,6 +49,27 @@ def set_default_server_args(args: "ServerArgs"):
     """
 
     cfg = resolving_view(args)
+
+    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get():
+        if (
+            cfg.enable_unified_cache_external_linker
+            or cfg.hicache_storage_backend is not None
+        ):
+            raise ValueError("Integrated sparse offload requires the HiCache Host tier")
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "HiCache sparse offload does not yet support speculative decoding"
+            )
+        declare_resolution(
+            args,
+            "integrated_offload_hicache",
+            enable_hierarchical_cache=True,
+            disable_radix_cache=False,
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode="cache",
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="page_first_kv_split",
+        )
 
     # NPU only works with "ascend" attention backend for now
     declare_resolution(

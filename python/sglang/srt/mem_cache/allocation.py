@@ -271,6 +271,8 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
+    if _is_npu:
+        return batch.tree_cache.token_to_kv_pool_allocator.page_size
     # DCP swaps in an allocator whose page_size is the configured page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
@@ -365,6 +367,14 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
     try:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
+                maybe_update_indexer_mapping,
+            )
+
+            maybe_update_indexer_mapping(
+                batch, req_pool_indices_cpu, batch.seq_lens_cpu
+            )
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu,
@@ -569,6 +579,17 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         )
 
     try:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
+                maybe_update_indexer_mapping,
+            )
+
+            maybe_update_indexer_mapping(
+                batch,
+                batch.req_pool_indices_cpu,
+                batch.seq_lens_cpu + token_per_req,
+                start_lens_cpu=batch.seq_lens_cpu,
+            )
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
