@@ -24,6 +24,65 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
+        from sglang.srt.hardware_backend.npu.hicache_offload import get_offload_backing
+
+        self.offload_backing = get_offload_backing(kvcache)
+        if self.offload_backing is not None:
+            self.offload_backing.bind_hicache(getattr(kvcache, "full_kv_pool", kvcache))
+
+    def _reserve_host_pages(self, pages):
+        backing = getattr(self, "offload_backing", None)
+        return backing is None or backing.page_binding.ensure_pages(pages)
+
+    def alloc(self, need_size):
+        count = need_size // self.page_size
+        if count > len(self.free_pages):
+            self.merge_and_sort_free()
+        if count > len(self.free_pages) or not self._reserve_host_pages(
+            self.free_pages[:count]
+        ):
+            return None
+        return super().alloc(need_size)
+
+    def _release_page_ids(self, *page_ids):
+        backing = getattr(self, "offload_backing", None)
+        if backing is not None and page_ids:
+            backing.page_binding.release_device_pages(torch.cat(page_ids))
+        return super()._release_page_ids(*page_ids)
+
+    def alloc_for_host_restore(self, host_indices):
+        if self.offload_backing is None:
+            raise RuntimeError("Host restore allocation requires integrated offload")
+        device_indices = super().alloc(host_indices.numel())
+        if device_indices is None:
+            return None
+        try:
+            self.offload_backing.page_binding.restore_mapping(
+                host_indices, device_indices
+            )
+        except Exception:
+            super()._release_page_ids(
+                device_indices[:: self.page_size] // self.page_size
+            )
+            raise
+        return device_indices
+
+    def clear(self):
+        backing = getattr(self, "offload_backing", None)
+        if backing is not None:
+            backing.hicache_pool.clear()
+        super().clear()
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens):
+        super().evict_to_free_tokens(tree_cache, num_tokens)
+        backing = getattr(self, "offload_backing", None)
+        if backing is not None:
+            binding = backing.page_binding
+            binding.reclaim_for_capacity(num_tokens)
+            shortfall = num_tokens - backing.hicache_pool.available_size()
+            if shortfall > 0:
+                tree_cache.evict_host(shortfall)
+                binding.reclaim_for_capacity(num_tokens)
 
     def alloc_extend(
         self,
@@ -52,6 +111,9 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
+            return None
+
+        if not self._reserve_host_pages(self.free_pages[:num_new_pages_item]):
             return None
 
         if num_new_pages_item < 200:
@@ -117,6 +179,9 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_new_pages > len(self.free_pages):
+            return None
+
+        if not self._reserve_host_pages(self.free_pages[:num_new_pages]):
             return None
 
         need_new_pages = (seq_lens % self.page_size == 1).int()

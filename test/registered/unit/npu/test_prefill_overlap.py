@@ -9,7 +9,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-
 ROOT = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu"
 
 
@@ -88,7 +87,7 @@ def setup(monkeypatch):
         module.__path__ = []
         monkeypatch.setitem(sys.modules, name, module)
     loaded = {}
-    for name in ("integrated_offload", "prefill_overlap"):
+    for name in ("prefill_dma", "prefill_overlap"):
         qualified = prefix + "." + name
         spec = importlib.util.spec_from_file_location(qualified, ROOT / (name + ".py"))
         module = importlib.util.module_from_spec(spec)
@@ -101,20 +100,44 @@ def setup(monkeypatch):
         storage = torch.zeros(slots, 24, 2)
         copies = []
         publications = []
+        plans = []
+        device_to_host = torch.tensor([0, 7, 8, 9, 10, 11, 1, 2, 3, 4, 5, 6])
 
-        def restore(name, target, src, dst, valid):
+        def host_rows(rows):
+            return device_to_host[rows // 2] * 2 + rows.remainder(2)
+
+        def plan_prefill_rows(prefix_rows, new_rows):
+            prefix_rows = torch.unique(prefix_rows)
+            result = (
+                loaded["prefill_dma"].mapped_row_runs(
+                    host_rows(prefix_rows), prefix_rows, 24, 24
+                ),
+                loaded["prefill_dma"].mapped_row_runs(
+                    new_rows, host_rows(new_rows), 24, 24
+                ),
+            )
+            plans.append(result)
+            return result
+
+        def restore(name, target, plan):
             stream = device.current
             copies.append(
                 ("restore", name, runtime.generation, stream.name, stream.tail)
             )
-            target[dst[valid]] = host[name, src[valid]]
+            for source, destination, count in plan.tolist():
+                target[destination : destination + count] = host[
+                    name, source : source + count
+                ]
             stream.mark(f"restore-{runtime.generation}-{name}")
 
-        def save(layer, components, rows, valid):
+        def save(layer, components, rows, valid, *, plan):
             stream = device.current
             assert f"scatter-{runtime.generation}-{layer}" in stream.tail
             copies.append(("save", layer, runtime.generation, stream.name, stream.tail))
-            host[layer, rows[valid]] = components[0].view(-1, 2)[rows[valid]]
+            for source, destination, count in plan.tolist():
+                host[layer, destination : destination + count] = components[0].view(
+                    -1, 2
+                )[source : source + count]
             stream.mark(f"save-{runtime.generation}-{layer}")
 
         def publish():
@@ -124,7 +147,9 @@ def setup(monkeypatch):
             pages=12,
             page_size=2,
             _component_names=[(layer, None) for layer in range(4)],
-            pool=SimpleNamespace(copy_from_host=restore),
+            pool=SimpleNamespace(copy_prefill_from_host=restore),
+            page_binding=SimpleNamespace(ready_event=None, host_rows=host_rows),
+            plan_prefill_rows=plan_prefill_rows,
             enqueue_prefill_rows_from_slot=save,
             publish_prefill_writes=publish,
         )
@@ -163,6 +188,8 @@ def setup(monkeypatch):
             publications=publications,
             device=device,
             mapping=request_pool.req_to_token[0],
+            host_rows=host_rows,
+            plans=plans,
         )
 
     return build
@@ -189,19 +216,26 @@ def test_prefix_and_slot_reuse_dependencies(setup, h2d, d2h, slots):
                 current = case.pool.raw_layer_components(layer)[0]
                 torch.testing.assert_close(
                     current[case.mapping[:prefix]],
-                    case.host[layer - 7, case.mapping[:prefix]],
+                    case.host[layer - 7, case.host_rows(case.mapping[:prefix])],
                 )
                 current[case.mapping[prefix:length]] = layer * 10 + prefix
                 case.device.current.mark(f"scatter-{runtime.generation}-{layer - 7}")
                 if d2h:
                     runtime.on_kv_written(layer, case.mapping[prefix:length])
                 else:
-                    case.host[layer - 7, case.mapping[prefix:length]] = current[
-                        case.mapping[prefix:length]
-                    ]
+                    case.host[
+                        layer - 7, case.host_rows(case.mapping[prefix:length])
+                    ] = current[case.mapping[prefix:length]]
                 runtime.on_compute_start(layer)
                 case.device.current.mark(f"attention-{runtime.generation}-{layer - 7}")
                 runtime.finish_layer(layer)
+        assert (
+            case.pool.decode_host_backing.page_binding.ready_event
+            is runtime.host_visible
+        )
+        assert len(case.plans) == runtime.generation
+        assert all(plan.shape[1] == 3 for plan in case.plans[-1])
+        assert all(torch.all(plan[:, 0] != plan[:, 1]) for plan in case.plans[-1])
         if d2h:
             assert all(
                 f"save-{runtime.generation}-{layer}" in case.publications[-1]
@@ -320,6 +354,9 @@ def test_decode_on_another_stream_waits_for_host_visibility(setup):
     )
     with case.device.stream(decoder), case.runtime.forward(batch):
         assert "last-generation-published" in case.device.current.tail
+        case.device.current.mark("decode-reader")
+    ready = case.pool.decode_host_backing.page_binding.ready_event
+    assert "decode-reader" in ready.dependencies
     assert not case.runtime.active
 
 
@@ -338,49 +375,141 @@ def test_layer_hook_cannot_change_compute_stream(setup):
     assert case.runtime.failed and not case.runtime.active
 
 
-def test_completed_request_prefix_is_shared_without_suffix_aliasing(setup):
-    case = setup()
-    runtime = case.runtime
-    # These rows represent two Radix hits: immutable prefix, private suffixes.
-    runtime.request_pool.req_to_token = torch.tensor([[8, 3, 10, 5], [8, 3, 12, 7]])
-    for layer in range(4):
-        case.host[layer, [8, 3]] = torch.tensor([[layer + 1, 11], [layer + 2, 12]], dtype=case.host.dtype)
-    cached = case.host[:, [8, 3]].clone()
-    # Releasing the producer must drain copies, never free/zero radix-owned rows.
-    runtime.release_request("completed-prefix-producer")
-    new_rows = torch.tensor([10, 5, 12, 7])
-    batch = SimpleNamespace(
-        extend_prefix_lens_cpu=[2, 2], req_pool_indices=torch.tensor([0, 1]),
-        out_cache_loc=new_rows,
-        forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True),
+@pytest.fixture
+def memfabric_runtime(monkeypatch):
+    import test_hicache_memfabric_pool as host_tests
+
+    yield from host_tests.runtime.__wrapped__(monkeypatch)
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_real_hicache_binding_drives_async_pipeline(
+    memfabric_runtime, monkeypatch, slots
+):
+    """Production plans/ownership and virtual streams; only DMA/storage are simulated."""
+    import test_hicache_memfabric_pool as host_tests
+
+    prefix = "sglang.srt.hardware_backend.npu"
+    for name in ("prefill_overlap",):
+        host_tests.load_module(monkeypatch, prefix + "." + name, ROOT / (name + ".py"))
+    device = Device()
+    monkeypatch.setattr(torch, "npu", device)
+    backing, pool = memfabric_runtime.make()
+    latent_slots = torch.full((slots, 20, 8), -7, dtype=torch.bfloat16)
+    rope_slots = torch.full((slots, 20, 2), -7, dtype=torch.bfloat16)
+    pool.integrated_offload = True
+    pool.decode_host_backing = backing
+    pool.prefill_layer_slots = slots
+    pool.k_buffer = latent_slots
+    pool.physical_layer_index = lambda layer: (layer - pool.start_layer) % slots
+    pool.raw_layer_components = lambda layer: (
+        latent_slots[pool.physical_layer_index(layer)],
+        rope_slots[pool.physical_layer_index(layer)],
     )
-    with runtime.forward(batch):
-        for layer in range(7, 11):
-            runtime.prepare_layer(layer)
-            slot = case.pool.raw_layer_components(layer)[0]
-            torch.testing.assert_close(slot[[8, 3]], cached[layer - 7])
-            slot[new_rows] = torch.tensor([[20, 21], [22, 23], [30, 31], [32, 33]], dtype=slot.dtype)
-            case.device.current.mark(f"scatter-{runtime.generation}-{layer - 7}")
-            runtime.on_kv_written(layer, new_rows)
-            runtime.on_compute_start(layer)
-            runtime.finish_layer(layer)
-    runtime.release_request("consumer-0")
-    torch.testing.assert_close(case.host[:, [8, 3]], cached)
-    assert case.host[0, [10, 5, 12, 7]].tolist() == [[20, 21], [22, 23], [30, 31], [32, 33]]
-    # A later request can still restore the retained prefix after both finish.
-    runtime.release_request("consumer-1")
-    batch.req_pool_indices = torch.tensor([1])
-    batch.extend_prefix_lens_cpu = [2]
-    batch.out_cache_loc = torch.tensor([12, 7])
-    with runtime.forward(batch):
-        for layer in range(7, 11):
-            runtime.prepare_layer(layer)
-            slot = case.pool.raw_layer_components(layer)[0]
-            torch.testing.assert_close(slot[[8, 3]], cached[layer - 7])
-            slot[batch.out_cache_loc] = 50
-            case.device.current.mark(f"scatter-{runtime.generation}-{layer - 7}")
-            runtime.on_kv_written(layer, batch.out_cache_loc)
-            runtime.on_compute_start(layer)
-            runtime.finish_layer(layer)
-    runtime.release_request("later-consumer")
-    torch.testing.assert_close(case.host[:, [8, 3]], cached)
+    host_pool = backing.bind_hicache(pool)
+    assert isinstance(host_pool, memfabric_runtime.pool_type)
+    assert backing.page_binding.ensure_pages(torch.tensor([3]))
+    assert backing.page_binding.ensure_pages(torch.tensor([1, 2]))
+    mapping = torch.tensor([12, 13, 4, 5, 8, 9])
+    mapped = backing.page_binding.host_rows(mapping)
+    assert torch.all(mapped != mapping)
+    runtime = sys.modules[
+        prefix + ".prefill_overlap"
+    ].PipelinedIntegratedOffloadRuntime(
+        pool, SimpleNamespace(req_to_token=mapping.reshape(1, -1))
+    )
+    transfers = []
+
+    def dma_copy(device_tensor, host_tensor, address, plan, to_host):
+        assert plan.device.type == "cpu" and plan.dtype == torch.int64
+        assert plan.shape[1] == 3
+        assert torch.all(plan[:, 0] != plan[:, 1])
+        assert address == host_tensor.data_ptr() + 4096
+        assert device.current is (
+            runtime.d2h_stream
+            if to_host
+            else (
+                runtime.h2d_stream if runtime.h2d_prefetch else runtime.compute_stream
+            )
+        )
+        transfers.append((to_host, plan.clone(), device.current.tail))
+        source, destination = (
+            (device_tensor, host_tensor) if to_host else (host_tensor, device_tensor)
+        )
+        for source_row, destination_row, count in plan.tolist():
+            destination[destination_row : destination_row + count] = source[
+                source_row : source_row + count
+            ]
+        device.current.mark(f"dma-{runtime.generation}-{len(transfers)}")
+
+    operations = sys.modules[prefix + ".memfabric_host_kv"].native_ops()
+    monkeypatch.setattr(operations, "prefill_dma_copy", dma_copy)
+    expected = {}
+    for layer, regions in enumerate(backing.regions):
+        for component, region in enumerate(regions):
+            region.tensor.fill_(-91)
+            expected[layer, component] = region.tensor.clone()
+            assert (
+                host_pool.layer_views(layer)[component].data_ptr()
+                == region.tensor.data_ptr()
+            )
+    try:
+        for prefix_count, length in ((0, 2), (2, 4), (4, 6), (6, 6)):
+            batch = SimpleNamespace(
+                extend_prefix_lens_cpu=[prefix_count],
+                req_pool_indices=torch.tensor([0]),
+                out_cache_loc=mapping[prefix_count:length],
+                forward_mode=SimpleNamespace(
+                    is_extend_without_speculative=lambda: True
+                ),
+            )
+            with runtime.forward(batch):
+                for layer in range(pool.start_layer, pool.end_layer):
+                    local_layer = layer - pool.start_layer
+                    runtime.prepare_layer(layer)
+                    components = pool.raw_layer_components(layer)
+                    for component, target in enumerate(components):
+                        torch.testing.assert_close(
+                            target[mapping[:prefix_count]],
+                            expected[local_layer, component][mapped[:prefix_count]],
+                        )
+                        target[mapping[prefix_count:length]] = (
+                            layer * 10 + runtime.generation
+                        )
+                        expected[local_layer, component][
+                            mapped[prefix_count:length]
+                        ] = layer * 10 + runtime.generation
+                    device.current.mark(f"scatter-{runtime.generation}-{local_layer}")
+                    if length > prefix_count:
+                        runtime.on_kv_written(layer, batch.out_cache_loc)
+                    runtime.on_compute_start(layer)
+                    device.current.mark(f"attention-{runtime.generation}-{local_layer}")
+                    runtime.finish_layer(layer)
+            assert backing.page_binding.ready_event is runtime.host_visible
+            for layer, regions in enumerate(backing.regions):
+                for component, region in enumerate(regions):
+                    torch.testing.assert_close(
+                        region.tensor, expected[layer, component]
+                    )
+        assert any(to_host for to_host, _, _ in transfers)
+        assert any(not to_host for to_host, _, _ in transfers)
+        runtime.drain()
+        backing.page_binding.release_device_pages(torch.tensor([1, 2, 3]))
+        device.compute.synchronize()
+        backing.page_binding.reap()
+        assert host_pool.available_size() == host_pool.usable_size
+    finally:
+        runtime.drain()
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_missing_hicache_binding_rejected_before_stream_work(setup, prefill):
+    case = setup()
+    case.pool.decode_host_backing.page_binding = None
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: prefill)
+    )
+    with pytest.raises(RuntimeError, match="HiCache page ownership"):
+        with case.runtime.forward(batch):
+            pass
+    assert not case.copies and not case.runtime.active

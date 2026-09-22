@@ -150,6 +150,26 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: CacheInitParams,
     ):
+        from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
+            indexer_tree_page_size,
+        )
+
+        tree_page_size = indexer_tree_page_size(
+            params.token_to_kv_pool_allocator, params.page_size
+        )
+        self._indexer_grouped_pages = tree_page_size != params.page_size
+        if self._indexer_grouped_pages:
+            if ComponentType.SWA in (params.tree_components or ()):
+                raise NotImplementedError("Compressed indexer group sharing with SWA")
+            if (
+                ComponentType.MAMBA in (params.tree_components or ())
+                and not params.enable_mamba_extra_buffer
+            ):
+                raise ValueError(
+                    "HiCache compressed offload requires Mamba checkpoint buffers; "
+                    "use --mamba-radix-cache-strategy auto or extra_buffer"
+                )
+            params = replace(params, page_size=tree_page_size)
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
@@ -404,6 +424,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        if self._indexer_grouped_pages and storage_backend is not None:
+            raise NotImplementedError(
+                "Compressed indexer group radix pages require L3 hash/physical-page "
+                "translation; only device/Host prefix caching is supported"
+            )
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -1385,7 +1410,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
+        anchor = self.cache_controller.mem_pool_host.anchor_entry.host_pool
+        if host_avail < kv_tokens and not callable(
+            getattr(anchor, "acquire_device_pages", None)
+        ):
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
                 return None
@@ -1526,11 +1554,23 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
-        )
+        try:
+            prepare_device_indices = self._build_loadback_plan(kv_xfer)
+            load_kwargs = (
+                {"prepare_device_indices": prepare_device_indices}
+                if prepare_device_indices is not None
+                else {}
+            )
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+                **load_kwargs,
+            )
+        except Exception:
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            raise
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
@@ -1551,6 +1591,39 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return True
+
+    def _build_loadback_plan(self, kv_xfer: PoolTransfer):
+        """Prepare compressed destinations from the real FULL ancestor chain."""
+        allocator = self.token_to_kv_pool_allocator
+        allocator = getattr(allocator, "full_attn_allocator", allocator)
+        backing = getattr(allocator, "offload_backing", None)
+        if backing is None or not kv_xfer.host_indices.numel():
+            return None
+        mapping = getattr(backing.page_binding, "indexer_mapping", None)
+        if mapping is None:
+            if getattr(backing.hicache_pool.device_pool, "_kpool_use_compress", False):
+                raise RuntimeError(
+                    "Compressed HiCache requires binding.indexer_mapping"
+                )
+            return None
+        if not kv_xfer.nodes_to_load:
+            raise ValueError("Indexer restore requires the FULL radix load-back chain")
+        first_node = self.tree_core.node_by_id(kv_xfer.nodes_to_load[0])
+        resident_prefix = self.tree_core.collect_full_device_indices(
+            first_node.parent.id, self.root_node.id
+        )
+        if (
+            resident_prefix.numel() % self.page_size
+            or kv_xfer.host_indices.numel() % self.page_size
+        ):
+            raise ValueError("Indexer restore must cover complete radix groups")
+
+        def prepare_device_indices(device_indices):
+            if device_indices.numel() != kv_xfer.host_indices.numel():
+                raise ValueError("Indexer restore Host/device lengths differ")
+            mapping.prepare_restore(resident_prefix, device_indices)
+
+        return prepare_device_indices
 
     def _build_sidecar_transfers(
         self,
@@ -2672,6 +2745,12 @@ class UnifiedRadixCache(BasePrefixCache):
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Attach (enable) the HiCache storage backend at runtime."""
+        if self._indexer_grouped_pages:
+            return (
+                False,
+                "Compressed indexer group radix pages require L3 hash/physical-page "
+                "translation; only device/Host prefix caching is supported.",
+            )
         if self._storage_attachment is None:
             return (
                 False,

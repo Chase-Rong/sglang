@@ -313,29 +313,68 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        anchor_pool = (
+            anchor_entry.host_pool if anchor_entry is not None else self.mem_pool_host
+        )
+        acquire_device_pages = getattr(anchor_pool, "acquire_device_pages", None)
+        host_indices = (
+            acquire_device_pages(device_indices)
+            if callable(acquire_device_pages)
+            else self.mem_pool_host.alloc(len(device_indices))
+        )
         if host_indices is None:
             return None
-        pool_transfers = self.mem_pool_host.resolve_host_transfers(
-            extra_pools,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
+        original_transfers = [
+            (transfer, transfer.host_indices, transfer.device_indices)
+            for transfer in extra_pools or []
+        ]
+        try:
+            pool_transfers = self.mem_pool_host.resolve_host_transfers(
+                extra_pools,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+            )
+        except Exception:
+            self._rollback_write(host_indices, original_transfers)
+            raise
         if pool_transfers is None and extra_pools:
-            self.mem_pool_host.free(host_indices)
+            self._rollback_write(host_indices, original_transfers)
             return None
 
-        self.write_queue.append(
-            CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
-            )
+        operation = CacheOperation(
+            host_indices,
+            device_indices,
+            node_id,
+            priority,
+            pool_transfers=pool_transfers or None,
         )
-        self.start_writing()
+        previous_operations = list(self.write_queue)
+        self.write_queue.append(operation)
+        try:
+            self.start_writing()
+        except Exception:
+            self.write_queue[:] = [*previous_operations, operation]
+            self.l2_transfer_engine.drain_device_to_host()
+            self.write_queue[:] = previous_operations
+            self._rollback_write(host_indices, original_transfers)
+            raise
         return host_indices
+
+    def _rollback_write(self, host_indices, original_transfers) -> None:
+        """Release only this write's allocations and undo descriptor resolution."""
+        try:
+            for transfer, original_host, original_device in original_transfers:
+                if (
+                    transfer.indices_from_pool is None
+                    and original_host is None
+                    and transfer.host_indices is not None
+                ):
+                    self.mem_pool_host.free(transfer.host_indices, pool=transfer.name)
+                transfer.host_indices = original_host
+                transfer.device_indices = original_device
+        finally:
+            self.mem_pool_host.free(host_indices)
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -478,9 +517,16 @@ class HybridCacheController(BaseHiCacheController):
 
         Sidecar transfers riding another pool's indices are included here but
         excluded from the per-pool token counts.
+        An anchor exposing acquire_device_pages adopts backing on backup and
+        binds mappings on load, so neither direction copies its main payload.
         """
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        num_bytes = (
+            0
+            if callable(getattr(anchor_pool, "acquire_device_pages", None))
+            else kv_tokens * anchor_pool.size_per_token
+        )
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -503,6 +549,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        prepare_device_indices: Optional[Callable[[torch.Tensor], None]] = None,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
@@ -514,18 +561,45 @@ class HybridCacheController(BaseHiCacheController):
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+            anchor_pool = (
+                anchor_entry.host_pool
+                if anchor_entry is not None
+                else self.mem_pool_host
+            )
+            if callable(getattr(anchor_pool, "acquire_device_pages", None)):
+                alloc_for_host_restore = getattr(
+                    full_allocator, "alloc_for_host_restore", None
+                )
+                if not callable(alloc_for_host_restore):
+                    raise RuntimeError(
+                        "Incompatible HiCache offload configuration: an anchor with "
+                        "acquire_device_pages requires a device allocator with "
+                        "alloc_for_host_restore(host_indices)."
+                    )
+                device_indices = alloc_for_host_restore(host_indices)
+            else:
+                device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
 
-        pool_transfers = self._resolve_device_transfers(
-            extra_pools,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-        )
+        original_transfers = [
+            (transfer, transfer.host_indices, transfer.device_indices)
+            for transfer in extra_pools or []
+        ]
+        try:
+            if prepare_device_indices is not None:
+                prepare_device_indices(device_indices)
+            pool_transfers = self._resolve_device_transfers(
+                extra_pools,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+            )
+        except Exception:
+            self._rollback_load(full_allocator, device_indices, original_transfers)
+            raise
         if pool_transfers is None and extra_pools:
-            if need_load_kv:
-                full_allocator.free(device_indices)
+            self._rollback_load(full_allocator, device_indices, original_transfers)
             return None
 
         self.load_queue.append(
@@ -538,6 +612,26 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return device_indices
+
+    def _rollback_load(
+        self, full_allocator, device_indices, original_transfers
+    ) -> None:
+        """Undo this load's sidecar allocations and restored mapping references."""
+        try:
+            for transfer, original_host, original_device in original_transfers:
+                if (
+                    transfer.indices_from_pool is None
+                    and original_device is None
+                    and transfer.device_indices is not None
+                ):
+                    entry = self.mem_pool_host.entry_map[transfer.name]
+                    free_fn = entry.device_free_fn or entry.device_pool.free
+                    free_fn(transfer.device_indices)
+                transfer.host_indices = original_host
+                transfer.device_indices = original_device
+        finally:
+            if device_indices.numel() > 0:
+                full_allocator.free(device_indices)
 
     def prefetch(
         self,

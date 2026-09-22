@@ -5,7 +5,9 @@ def validate_offload_service(server_args, role, *, integrated=False):
     if integrated and role != "null":
         raise ValueError("integrated offload requires one non-disaggregated service")
     if not integrated and role not in ("prefill", "decode"):
-        raise ValueError("NPU sparse offload requires a separate Prefill or Decode service")
+        raise ValueError(
+            "NPU sparse offload requires a separate Prefill or Decode service"
+        )
     if hasattr(server_args, "get_attention_backends"):
         backends = server_args.get_attention_backends()
     else:
@@ -13,37 +15,52 @@ def validate_offload_service(server_args, role, *, integrated=False):
 
         backends = attention_backends()
     if tuple(backends) != ("ascend", "ascend"):
-        raise ValueError("NPU sparse offload requires Ascend for both attention backends")
-    if server_args.enable_hisparse:
-        raise ValueError("NPU sparse offload requires no HiSparse coordinator")
-    if not integrated:
-        if (server_args.disaggregation_transfer_backend not in ("ascend", "mooncake")
-                or not server_args.disable_radix_cache):
-            raise ValueError("separate NPU offload requires Ascend/Mooncake transport and disabled radix cache")
-    elif not server_args.disable_radix_cache:
-        # Integrated backing uses allocator row IDs for both Host MLA KV and
-        # resident Indexer KV. Built-in radix retains these rows until eviction,
-        # while Mamba owns its independent copy-on-write state checkpoints.
-        # External cache transfers do not implement this backing's lifecycle.
-        if any(getattr(server_args, name, False) for name in (
-            "enable_hierarchical_cache", "enable_lmcache", "enable_flexkv",
-            "radix_cache_backend", "enable_unified_cache_external_linker",
-        )):
-            raise ValueError("integrated offload Prefix Cache requires the built-in cache without external KV transfers")
+        raise ValueError(
+            "NPU sparse offload requires Ascend for both attention backends"
+        )
+    if integrated:
+        if server_args.disable_radix_cache or not getattr(
+            server_args, "enable_hierarchical_cache", False
+        ):
+            raise ValueError(
+                "Integrated offload requires HiCache and enabled radix cache"
+            )
+    if (
+        (
+            not integrated
+            and server_args.disaggregation_transfer_backend
+            not in ("ascend", "mooncake")
+        )
+        or (not integrated and not server_args.disable_radix_cache)
+        or server_args.enable_hisparse
+    ):
+        raise ValueError(
+            "NPU sparse offload requires Ascend/Mooncake transport, disabled radix cache and no HiSparse coordinator"
+        )
     if role == "prefill" and server_args.optimistic_prefill_attempts:
-        raise ValueError("bounded Prefill must finish layer bootstrap before forward; disable optimistic Prefill")
+        raise ValueError(
+            "bounded Prefill must finish layer bootstrap before forward; disable optimistic Prefill"
+        )
 
 
 def validate_mtp_pool_pair(target_pool, draft_pool):
-    for name in ("page_size", "size", "kv_lora_rank", "qk_rope_head_dim",
-                 "index_head_dim", "store_dtype"):
+    for name in (
+        "page_size",
+        "size",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "index_head_dim",
+        "store_dtype",
+    ):
         if getattr(target_pool, name) != getattr(draft_pool, name):
             raise ValueError(f"offload target/draft pools require matching {name}")
     target_runtime = getattr(target_pool, "prefill_offload_runtime", None)
     draft_runtime = getattr(draft_pool, "prefill_offload_runtime", None)
     if target_runtime is not None and draft_runtime is not None:
         if target_runtime.request_pool is not draft_runtime.request_pool:
-            raise ValueError("offload target/draft pools must share request page ownership")
+            raise ValueError(
+                "offload target/draft pools must share request page ownership"
+            )
 
 
 def resolve_transfer_device(logical_device, physical_override, visible_devices):
@@ -52,14 +69,21 @@ def resolve_transfer_device(logical_device, physical_override, visible_devices):
     if visible_devices is None:
         return logical_device if physical_override == -1 else physical_override
     entries = [entry.strip() for entry in visible_devices.split(",")]
-    if (not entries or any(not entry.isdecimal() for entry in entries)
-            or len(set(map(int, entries))) != len(entries)):
-        raise ValueError("offload requires a distinct numeric ASCEND_RT_VISIBLE_DEVICES list")
+    if (
+        not entries
+        or any(not entry.isdecimal() for entry in entries)
+        or len(set(map(int, entries))) != len(entries)
+    ):
+        raise ValueError(
+            "offload requires a distinct numeric ASCEND_RT_VISIBLE_DEVICES list"
+        )
     if logical_device >= len(entries):
         raise ValueError("Ascend transfer device is outside the visible device list")
     physical_device = int(entries[logical_device])
     if physical_override != -1 and physical_override != physical_device:
-        raise ValueError("ASCEND_NPU_PHY_ID conflicts with this rank's visible device mapping")
+        raise ValueError(
+            "ASCEND_NPU_PHY_ID conflicts with this rank's visible device mapping"
+        )
     return physical_device
 
 
@@ -67,13 +91,22 @@ def validate_integrated_layout(*, integrated, prefill, mixed_chunk, cp_size, dcp
     if not integrated or not prefill:
         raise ValueError("Integrated offload requires layerwise Prefill")
     if mixed_chunk or cp_size != 1 or dcp_size != 1:
-        raise ValueError("Integrated offload requires separate Prefill batches and CP1/DCP1")
+        raise ValueError(
+            "Integrated offload requires separate Prefill batches and CP1/DCP1"
+        )
 
 
-def validate_prefill_overlap(*, integrated, prefill, speculative, mixed_chunk, cp_size, dcp_size):
+def validate_prefill_overlap(
+    *, integrated, prefill, speculative, mixed_chunk, cp_size, dcp_size
+):
     try:
-        validate_integrated_layout(integrated=integrated, prefill=prefill,
-                                   mixed_chunk=mixed_chunk, cp_size=cp_size, dcp_size=dcp_size)
+        validate_integrated_layout(
+            integrated=integrated,
+            prefill=prefill,
+            mixed_chunk=mixed_chunk,
+            cp_size=cp_size,
+            dcp_size=dcp_size,
+        )
     except ValueError as error:
         raise ValueError(f"Prefill copy overlap: {error}") from error
     # MTP graph replay enters the Prefill runtime context before consuming KV;
@@ -85,7 +118,9 @@ def fsa_pool_options(kvc, layer_count):
 
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-    from sglang.srt.hardware_backend.npu.shared_host_kv import shared_host_group_from_runtime
+    from sglang.srt.hardware_backend.npu.shared_host_kv import (
+        shared_host_group_from_runtime,
+    )
     from sglang.srt.runtime_context import get_disagg
 
     prefill = envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
@@ -95,9 +130,11 @@ def fsa_pool_options(kvc, layer_count):
         from sglang.srt.runtime_context import get_parallel, get_schedule
 
         validate_integrated_layout(
-            integrated=integrated, prefill=prefill,
+            integrated=integrated,
+            prefill=prefill,
             mixed_chunk=get_schedule().enable_mixed_chunk,
-            cp_size=get_parallel().attn_cp_size, dcp_size=get_parallel().attn_dcp_size,
+            cp_size=get_parallel().attn_cp_size,
+            dcp_size=get_parallel().attn_dcp_size,
         )
     if not prefill and not host_budget and not integrated:
         return {}
@@ -109,8 +146,14 @@ def fsa_pool_options(kvc, layer_count):
         raise ValueError("FSA Host KV requires FP16 or BF16 storage")
     native_ops()
     if integrated:
-        if not prefill or host_budget <= 0 or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
-            raise ValueError("integrated offload requires Prefill slots, Host budget and fused attention")
+        if (
+            not prefill
+            or host_budget <= 0
+            or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get()
+        ):
+            raise ValueError(
+                "integrated offload requires Prefill slots, Host budget and fused attention"
+            )
         from sglang.srt.runtime_context import get_parallel
 
         if get_parallel().attn_cp_size != 1 or get_parallel().attn_dcp_size != 1:
@@ -121,12 +164,16 @@ def fsa_pool_options(kvc, layer_count):
         return {
             "prefill_layer_slots": slots,
             "decode_host_budget": host_budget,
-            "shared_host_group": shared_host_group_from_runtime(torch.npu.current_device()),
+            "shared_host_group": shared_host_group_from_runtime(
+                torch.npu.current_device()
+            ),
             "integrated_offload": True,
         }
     if prefill:
         if role != "prefill" or host_budget:
-            raise ValueError("Prefill layer slots and Decode Host budget belong to different services")
+            raise ValueError(
+                "Prefill layer slots and Decode Host budget belong to different services"
+            )
         slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), layer_count)
         if slots <= 0 or envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get() <= 0:
             raise ValueError("Prefill offload requires positive slot and Host budgets")

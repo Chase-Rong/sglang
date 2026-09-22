@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from test_prefill_overlap_npu import bind_hicache_rows
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("SGLANG_FSA_TEST_ATTENTION") != "1",
     reason="requires a verified idle NPU, native copy helpers and the A5 OPP",
@@ -23,9 +25,6 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
     from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
         FusedSparseAttentionState,
         run_fused_sparse_attention,
-    )
-    from sglang.srt.hardware_backend.npu.integrated_offload import (
-        IntegratedOffloadRuntime,
     )
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.hardware_backend.npu.prefill_overlap import (
@@ -58,13 +57,13 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
         integrated_offload=True,
     )
     backing = pool.decode_host_backing
+    mapping = torch.arange(128, sequence + 128, device=device).view(1, -1)
+    bind_hicache_rows(pool, mapping)
+    host_rows = backing.page_binding.host_rows(mapping[0]).cpu()
     generator = torch.Generator().manual_seed(217)
     source_cpu = (torch.randn(sequence, 512, generator=generator) * 0.125).to(dtype)
     for layer in range(4):
-        backing.regions[layer][0].tensor[128 : sequence + 128].copy_(
-            source_cpu + layer * 0.03125
-        )
-    mapping = torch.arange(128, sequence + 128, device=device).view(1, -1)
+        backing.regions[layer][0].tensor[host_rows] = source_cpu + layer * 0.03125
     request_pool = SimpleNamespace(
         req_to_token=torch.cat((torch.zeros_like(mapping), mapping)),
         req_generation=torch.tensor([0, 1]),
@@ -93,6 +92,8 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
     table = torch.arange(1, sequence // 128 + 1, device=device, dtype=torch.int32).view(
         1, -1
     )
+    host_table = backing.page_binding.host_table(table)
+    assert not torch.equal(host_table, table)
     qlength = torch.tensor([chunk], dtype=torch.int32, device=device)
     klength = torch.tensor([sequence], dtype=torch.int32, device=device)
     writes = [
@@ -104,7 +105,6 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
     runtime = None
     state = None
     graph = None
-    sdma_fixture = None
 
     def execute():
         result = []
@@ -117,8 +117,7 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
                     no_rope,
                 )
                 key, _ = pool.get_kv_buffer(layer)
-                if isinstance(runtime, PipelinedIntegratedOffloadRuntime):
-                    runtime.on_compute_start(layer)
+                runtime.on_compute_start(layer)
                 output, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=query,
                     key=key,
@@ -143,38 +142,21 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
 
     records = {}
     try:
-        if os.environ.get("SGLANG_SDMA_LAB_BACKEND") in ("sdma", "sdma_pinned_staging"):
-            from sdma_copy_lab import FixedPrefillSdmaFixture
-
-            sdma_fixture = FixedPrefillSdmaFixture(
-                pool,
-                prefix,
-                chunk,
-                os.environ["SGLANG_SDMA_TEST_LIBRARY"],
-                pinned_staging=os.environ.get("SGLANG_SDMA_LAB_BACKEND")
-                == "sdma_pinned_staging",
-            )
-        for h2d, d2h in (modes if modes is not None else ((False, False), (True, False), (False, True), (True, True))):
+        for h2d, d2h in (
+            modes
+            if modes is not None
+            else ((False, False), (True, False), (False, True), (True, True))
+        ):
             if runtime is not None:
                 torch.npu.synchronize()
             for layer in range(4):
-                backing.regions[layer][0].tensor[128 + prefix : 128 + sequence].fill_(
-                    float("nan")
-                )
-            runtime = (
-                PipelinedIntegratedOffloadRuntime(
-                    pool, request_pool, h2d_prefetch=h2d, d2h_async=d2h
-                )
-                if h2d or d2h
-                else IntegratedOffloadRuntime(pool, request_pool)
+                backing.regions[layer][0].tensor[host_rows[prefix:]] = float("nan")
+            runtime = PipelinedIntegratedOffloadRuntime(
+                pool, request_pool, h2d_prefetch=h2d, d2h_async=d2h
             )
             pool.prefill_offload_runtime = runtime
-            if sdma_fixture is not None:
-                sdma_fixture.verify_metadata = True
             execute()
             torch.npu.synchronize()
-            if sdma_fixture is not None:
-                sdma_fixture.verify_metadata = False
             samples = []
             for _ in range(repeats):
                 start, end = (
@@ -192,11 +174,9 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
                 "samples_ms": samples,
             }
             outputs.append([item.cpu() for item in output])
-            if sdma_fixture is not None:
-                sdma_fixture.export_staging_after_drain()
             for layer in range(4):
                 torch.testing.assert_close(
-                    backing.regions[layer][0].tensor[128 + prefix : 128 + sequence],
+                    backing.regions[layer][0].tensor[host_rows[prefix:]],
                     source_cpu[prefix:] + layer * 0.03125,
                     rtol=0,
                     atol=0,
@@ -239,7 +219,7 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
                 topk_indices=decode_indices,
                 full_kv=host_key,
                 full_rope=host_rope,
-                block_table=table,
+                block_table=host_table,
                 kv_lengths=klength,
                 query_lengths=decode_qlength,
                 request_slots=request_ids,
@@ -269,23 +249,12 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
         digest = hashlib.sha256()
         for output in outputs[0]:
             digest.update(output.contiguous().view(torch.uint8).numpy().tobytes())
-        copy_evidence = None
-        if sdma_fixture is not None:
-            segments = sdma_fixture.bridge.segments
-            assert segments[1] > 0 and segments[2] > 0
-            copy_evidence = {
-                "api": "aclrtMemcpyAsync",
-                "h2d_segments": segments[1],
-                "d2h_segments": segments[2],
-                "sdma_trace_verified": False,
-                "mapping": "fixed_contiguous_runs",
-                "task_queue_enable": 0,
-                "extra_pinned_host_bytes": sum(
-                    tensor.numel() * tensor.element_size()
-                    for tensor in sdma_fixture.staging.values()
-                ),
-                "staging_export_excluded_from_timing": bool(sdma_fixture.staging),
-            }
+        copy_evidence = {
+            "mapping": "HiCache independent Host/device pages",
+            "host_page_ids": host_table.cpu().tolist(),
+            "device_page_ids": table.cpu().tolist(),
+            "native_extension": os.environ.get("SGLANG_NPU_FSA_EXTENSION"),
+        }
         return {
             "prefix": prefix,
             "chunk": chunk,
@@ -298,10 +267,8 @@ def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=Non
         torch.npu.synchronize()
         if graph is not None:
             graph.reset()
-        if isinstance(runtime, PipelinedIntegratedOffloadRuntime):
+        if runtime is not None:
             runtime.drain()
-        if sdma_fixture is not None:
-            sdma_fixture.close_after_drain()
         if state is not None:
             for planner in state.planners.values():
                 planner.close(drained=True)

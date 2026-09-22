@@ -5,12 +5,22 @@ from collections import deque
 
 import torch
 
-from sglang.srt.hardware_backend.npu.integrated_offload import IntegratedOffloadRuntime
 
-
-class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
+class PipelinedIntegratedOffloadRuntime:
     def __init__(self, pool, request_pool, *, h2d_prefetch=True, d2h_async=True):
-        super().__init__(pool, request_pool)
+        if not pool.integrated_offload or pool.decode_host_backing is None:
+            raise ValueError(
+                "integrated runtime requires a shared Prefill/Decode backing"
+            )
+        self.pool = pool
+        self.request_pool = request_pool
+        self.active = False
+        self.failed = False
+        self.prepared = set()
+        self.completed = set()
+        self.prefix_rows = None
+        self.slot_events = {}
+        self.slot_layers = {}
         self.h2d_prefetch = h2d_prefetch and pool.prefill_layer_slots > 1
         self.d2h_async = d2h_async
         self.h2d_stream = None
@@ -52,11 +62,18 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
     def forward(self, batch):
         if self.failed or self.active:
             raise RuntimeError("Prefill pipeline is failed or already active")
+        if self.pool.decode_host_backing.page_binding is None:
+            raise RuntimeError("Prefill pipeline requires HiCache page ownership")
         self.compute_stream = torch.npu.current_stream()
         if not batch.forward_mode.is_extend_without_speculative():
             if self.host_visible is not None:
                 self.compute_stream.wait_event(self.host_visible)
-            yield
+            try:
+                yield
+            finally:
+                self.pool.decode_host_backing.page_binding.ready_event = self._record(
+                    self.compute_stream
+                )
             return
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("Pipelined Prefill does not support graph capture")
@@ -79,19 +96,13 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
             else batch.out_cache_loc.new_empty(0, dtype=torch.int64)
         )
         backing = self.pool.decode_host_backing
-        self.prefix_valid = (self.prefix_rows > 0) & (
-            self.prefix_rows < backing.pages * backing.page_size
-        )
         self.new_rows = batch.out_cache_loc.reshape(-1).to(dtype=torch.int64).clone()
         self.new_locations_ptr = batch.out_cache_loc.data_ptr()
         self.new_valid = (self.new_rows > 0) & (
             self.new_rows < backing.pages * backing.page_size
         )
-        planner = getattr(backing.pool, "plan_prefill_rows", None)
-        self.prefix_plan, self.new_plan = (
-            planner(self.prefix_rows, self.new_rows, backing.pages * backing.page_size)
-            if planner is not None
-            else (None, None)
+        self.prefix_plan, self.new_plan = backing.plan_prefill_rows(
+            self.prefix_rows, self.new_rows
         )
         self.inputs_ready = self._record(self.compute_stream)
         if self.h2d_prefetch and self.h2d_stream is None:
@@ -124,13 +135,13 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
             if self.d2h_async:
                 backing.publish_prefill_writes()
             self.host_visible = self._record(self.compute_stream)
+            backing.page_binding.ready_event = self.host_visible
             self.retired.append(
                 (
                     self.host_visible,
                     (
                         self.layers,
                         self.prefix_rows,
-                        self.prefix_valid,
                         self.new_rows,
                         self.new_valid,
                         self.prefix_plan,
@@ -172,18 +183,9 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
                     (self.pool.kv_lora_rank, self.pool.qk_rope_head_dim),
                 ):
                     if width:
-                        if self.prefix_plan is not None:
-                            backing.pool.copy_prefill_from_host(
-                                name, target.view(-1, width), self.prefix_plan
-                            )
-                        else:
-                            backing.pool.copy_from_host(
-                                name,
-                                target.view(-1, width),
-                                self.prefix_rows,
-                                self.prefix_rows,
-                                self.prefix_valid,
-                            )
+                        backing.pool.copy_prefill_from_host(
+                            name, target.view(-1, width), self.prefix_plan
+                        )
             ready = self._record(stream)
         self.layers[layer_id] = {"ready": ready}
         self.slot_layers[physical] = layer_id
@@ -221,12 +223,7 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
         else:
             rows = locations.reshape(-1).to(dtype=torch.int64).clone()
             valid = (rows > 0) & (rows < backing.pages * backing.page_size)
-            planner = getattr(backing.pool, "plan_prefill_rows", None)
-            plan = (
-                planner(rows[:0], rows, backing.pages * backing.page_size)[1]
-                if planner
-                else None
-            )
+            plan = backing.plan_prefill_rows(rows[:0], rows)[1]
         written = self._record(self.compute_stream)
         with torch.npu.stream(self.d2h_stream):
             self.d2h_stream.wait_event(written)
@@ -236,7 +233,7 @@ class PipelinedIntegratedOffloadRuntime(IntegratedOffloadRuntime):
                     self.pool.raw_layer_components(layer_id)[:2],
                     rows,
                     valid,
-                    **({"plan": plan} if plan is not None else {}),
+                    plan=plan,
                 )
             saved = self._record(self.d2h_stream)
         self.layers[layer_id].update(
