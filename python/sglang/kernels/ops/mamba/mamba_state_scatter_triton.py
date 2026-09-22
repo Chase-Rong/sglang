@@ -497,20 +497,13 @@ def _fused_conv_window_scatter_multi_kernel(
     is2 = pid_req >= n1
     off1 = pid_req
     off2 = pid_req - n1
-    # Keep inactive lanes within the allocation even on backends that
-    # materialize the pointer arithmetic for masked scalar loads.  In the
-    # second request set, off2 is negative for every lane belonging to the
-    # first set; forming step2_ptr + off2 was observed to raise 507035 on
-    # Ascend despite mask=False.
-    safe_off1 = tl.where(is1, off1, 0)
-    safe_off2 = tl.where(is2, off2, 0)
-    s1 = tl.load(step1_ptr + safe_off1, mask=is1, other=-1).to(tl.int64)
-    s2 = tl.load(step2_ptr + safe_off2, mask=is2, other=-1).to(tl.int64)
+    s1 = tl.load(step1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    s2 = tl.load(step2_ptr + off2, mask=is2, other=-1).to(tl.int64)
     step_idx = tl.where(is2, s2, s1)
     if step_idx < 0:
         return
-    d1 = tl.load(idx1_ptr + safe_off1, mask=is1, other=-1).to(tl.int64)
-    d2 = tl.load(idx2_ptr + safe_off2, mask=is2, other=-1).to(tl.int64)
+    d1 = tl.load(idx1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    d2 = tl.load(idx2_ptr + off2, mask=is2, other=-1).to(tl.int64)
     dst_idx = tl.where(is2, d2, d1)
     src_idx = tl.where(is2, off2, off1).to(tl.int64)
 

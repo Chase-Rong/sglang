@@ -51,23 +51,8 @@ def test_integrated_service_needs_explicit_admission_and_no_transport():
         MODULE.validate_offload_service(service(), "null")
     with pytest.raises(ValueError):
         MODULE.validate_offload_service(service(), "prefill", integrated=True)
-
-
-def test_integrated_service_keeps_builtin_prefix_cache_enabled():
-    args = service(disable_radix_cache=False, disaggregation_transfer_backend="unused")
-    MODULE.validate_offload_service(args, "null", integrated=True)
-    assert args.disable_radix_cache is False
-
-
-@pytest.mark.parametrize("option,value", [
-    ("enable_hierarchical_cache", True), ("enable_lmcache", True),
-    ("enable_flexkv", True), ("radix_cache_backend", "custom"),
-    ("enable_unified_cache_external_linker", True),
-])
-def test_integrated_prefix_cache_rejects_other_kv_ownership_domains(option, value):
-    with pytest.raises(ValueError, match="built-in"):
-        MODULE.validate_offload_service(
-            service(disable_radix_cache=False, **{option: value}), "null", integrated=True)
+    with pytest.raises(ValueError):
+        MODULE.validate_offload_service(service(disable_radix_cache=False), "null", integrated=True)
 
 
 @pytest.mark.parametrize("changes", [

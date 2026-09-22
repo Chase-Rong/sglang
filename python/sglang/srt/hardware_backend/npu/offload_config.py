@@ -14,22 +14,9 @@ def validate_offload_service(server_args, role, *, integrated=False):
         backends = attention_backends()
     if tuple(backends) != ("ascend", "ascend"):
         raise ValueError("NPU sparse offload requires Ascend for both attention backends")
-    if server_args.enable_hisparse:
-        raise ValueError("NPU sparse offload requires no HiSparse coordinator")
-    if not integrated:
-        if (server_args.disaggregation_transfer_backend not in ("ascend", "mooncake")
-                or not server_args.disable_radix_cache):
-            raise ValueError("separate NPU offload requires Ascend/Mooncake transport and disabled radix cache")
-    elif not server_args.disable_radix_cache:
-        # Integrated backing uses allocator row IDs for both Host MLA KV and
-        # resident Indexer KV. Built-in radix retains these rows until eviction,
-        # while Mamba owns its independent copy-on-write state checkpoints.
-        # External cache transfers do not implement this backing's lifecycle.
-        if any(getattr(server_args, name, False) for name in (
-            "enable_hierarchical_cache", "enable_lmcache", "enable_flexkv",
-            "radix_cache_backend", "enable_unified_cache_external_linker",
-        )):
-            raise ValueError("integrated offload Prefix Cache requires the built-in cache without external KV transfers")
+    if ((not integrated and server_args.disaggregation_transfer_backend not in ("ascend", "mooncake"))
+            or not server_args.disable_radix_cache or server_args.enable_hisparse):
+        raise ValueError("NPU sparse offload requires Ascend/Mooncake transport, disabled radix cache and no HiSparse coordinator")
     if role == "prefill" and server_args.optimistic_prefill_attempts:
         raise ValueError("bounded Prefill must finish layer bootstrap before forward; disable optimistic Prefill")
 
