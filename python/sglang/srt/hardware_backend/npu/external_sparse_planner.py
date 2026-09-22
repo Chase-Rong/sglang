@@ -52,8 +52,15 @@ class NativeSparsePlanner:
         self.row_state = torch.full((rows, 3), -1, dtype=torch.int64)
         # Persistent state follows the resident table across all graph payloads.
         buckets = 1 << (2 * capacity - 1).bit_length()
+        workspace_dtype = torch.int64
+        if self.policy == "clock":
+            supports_compact = getattr(
+                kernel.native_ops(), "supports_clock_workspace_int16", None
+            )
+            if supports_compact is not None and supports_compact():
+                workspace_dtype = torch.int16
         self.clock_workspace = (
-            torch.full((rows, buckets + 3 * capacity + 1), -1, dtype=torch.int64)
+            torch.full((rows, buckets + 3 * capacity + 1), -1, dtype=workspace_dtype)
             if self.policy == "clock" else None
         )
         self.slots = (

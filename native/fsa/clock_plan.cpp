@@ -48,9 +48,9 @@ void DeleteGraphPayloads(void *data) noexcept
     }
 }
 
-void PlanRows(void *data) noexcept
+template<typename Index>
+void PlanRowsTyped(PlannerPayload *payload) noexcept
 {
-    auto *payload = static_cast<PlannerPayload *>(data);
     const int64_t width = payload->keys.size(1);
     const int64_t capacity = payload->resident.size(1);
     const auto *keys = payload->keys.data_ptr<int64_t>();
@@ -60,13 +60,23 @@ void PlanRows(void *data) noexcept
     auto *ages = payload->ages.data_ptr<int64_t>();
     auto *states = payload->row_state.data_ptr<int64_t>();
     auto *outputs = payload->slots.data_ptr<int64_t>();
-    auto* workspace = payload->workspace.data_ptr<int64_t>();
+    auto* workspace = payload->workspace.data_ptr<Index>();
     for (int64_t row = 0; row < payload->rows; ++row) {
         PlanClockRow(keys + row * width, width, owners[row], lengths[row],
                      residents + row * capacity, ages + row * capacity,
                      states + row * 3, outputs + row * width, capacity,
                      workspace + row * ClockWorkspaceSize(capacity),
                      payload->protected_slots.data());
+    }
+}
+
+void PlanRows(void *data) noexcept
+{
+    auto *payload = static_cast<PlannerPayload *>(data);
+    if (payload->workspace.scalar_type() == at::kShort) {
+        PlanRowsTyped<int16_t>(payload);
+    } else {
+        PlanRowsTyped<int64_t>(payload);
     }
     if (payload->delete_after_run) {
         delete payload;
@@ -88,9 +98,12 @@ void enqueue_fsa_clock_plan(const at::Tensor &trigger, const at::Tensor &keys,
 {
     TORCH_CHECK(trigger.device().type() == at::DeviceType::PrivateUse1,
                 "FSA planner trigger must be an NPU tensor");
-    for (const auto &tensor : {keys, owners, lengths, resident, ages, row_state, slots, workspace}) {
+    for (const auto &tensor : {keys, owners, lengths, resident, ages, row_state, slots}) {
         CheckHostLong(tensor);
     }
+    TORCH_CHECK(workspace.device().is_cpu() && workspace.is_contiguous() &&
+                (workspace.scalar_type() == at::kLong || workspace.scalar_type() == at::kShort),
+                "FSA CLOCK workspace must be contiguous CPU int16 or int64 storage");
     TORCH_CHECK(keys.dim() == 2 && resident.dim() == 2 && active_rows > 0 && active_rows <= keys.size(0),
                 "invalid FSA planner row geometry");
     const int64_t capacity = resident.size(1);
