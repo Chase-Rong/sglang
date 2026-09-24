@@ -18,8 +18,15 @@ def indexer_tree_page_size(allocator, page_size):
     allocator = getattr(allocator, "full_attn_allocator", allocator)
     backing = getattr(allocator, "offload_backing", None)
     if backing is None:
-        return page_size
-    pool = backing.hicache_pool.device_pool
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return page_size
+        pool = get_kvcache()
+        # Hybrid KDA pools wrap the same NPU indexer used by resident MLA.
+        # Its compressed rows share a group-leading page even without offload.
+        pool = getattr(pool, "full_kv_pool", pool)
+    else:
+        pool = backing.hicache_pool.device_pool
     if not getattr(pool, "_kpool_use_compress", False):
         return page_size
     physical_page_size = pool.page_size

@@ -299,7 +299,8 @@ def test_radix_groups_preserve_physical_pages():
     assert MAPPING.indexer_tree_page_size(SimpleNamespace(), 128) == 128
 
 
-def test_real_radix_match_keeps_partial_group_private(monkeypatch):
+@pytest.mark.parametrize("resident", [False, True])
+def test_real_radix_match_keeps_partial_group_private(monkeypatch, resident):
     radix = definitions(
         monkeypatch,
         "indexer_mapping_radix",
@@ -312,7 +313,13 @@ def test_real_radix_match_keeps_partial_group_private(monkeypatch):
     branch[700] = -1
     first = radix.RadixKey(original)
     second = radix.RadixKey(branch)
-    group_size = MAPPING.indexer_tree_page_size(compressed_allocator(), 128)
+    allocator = compressed_allocator()
+    if resident:
+        pool = allocator.offload_backing.hicache_pool.device_pool
+        allocator = SimpleNamespace(
+            page_size=128, get_kvcache=lambda: SimpleNamespace(full_kv_pool=pool)
+        )
+    group_size = MAPPING.indexer_tree_page_size(allocator, 128)
     assert first.match(second, page_size=128) == 640
     assert first.match(second, page_size=group_size) == 512
     assert first[512:].child_key(group_size) != second[512:].child_key(group_size)

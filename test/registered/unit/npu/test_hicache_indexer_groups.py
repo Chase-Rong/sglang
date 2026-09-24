@@ -55,8 +55,8 @@ class CpuIndexerAllocator(PagedTokenToKVPoolAllocator):
         super()._release_page_ids(*page_ids)
 
 
-@pytest.fixture
-def grouped_cache(monkeypatch):
+@pytest.fixture(params=["offload", "resident"])
+def grouped_cache(monkeypatch, request):
     context = snapshot_context()
     monkeypatch.setattr(memory_pool, "_cpu_has_amx_support", False)
     physical_page = 128
@@ -108,7 +108,11 @@ def grouped_cache(monkeypatch):
             mamba_pool=requests.mamba_pool,
             full_kv_pool=full_pool,
         )
-        allocator = CpuIndexerAllocator(
+        offloaded = request.param == "offload"
+        allocator_cls = (
+            CpuIndexerAllocator if offloaded else PagedTokenToKVPoolAllocator
+        )
+        allocator = allocator_cls(
             size=capacity,
             page_size=physical_page,
             dtype=torch.float32,
@@ -116,15 +120,17 @@ def grouped_cache(monkeypatch):
             kvcache=hybrid_pool,
             need_sort=True,
         )
-        mapping = IndexerPageMapping(
-            physical_page, compression, capacity // physical_page + 1
-        )
-        allocator.offload_backing = SimpleNamespace(
-            hicache_pool=SimpleNamespace(
-                device_pool=full_pool, page_size=physical_page
-            ),
-            page_binding=SimpleNamespace(indexer_mapping=mapping),
-        )
+        mapping = None
+        if offloaded:
+            mapping = IndexerPageMapping(
+                physical_page, compression, capacity // physical_page + 1
+            )
+            allocator.offload_backing = SimpleNamespace(
+                hicache_pool=SimpleNamespace(
+                    device_pool=full_pool, page_size=physical_page
+                ),
+                page_binding=SimpleNamespace(indexer_mapping=mapping),
+            )
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=requests,
@@ -167,7 +173,8 @@ def test_real_unified_partial_group_branch_match_split_and_evict(grouped_cache):
     cache, allocator, mapping = fixture.cache, fixture.allocator, fixture.mapping
     initial_capacity = allocator.available_size()
     original_rows = allocator.alloc(1024)
-    mapping.update_request_pages(original_rows[::128] // 128)
+    if mapping is not None:
+        mapping.update_request_pages(original_rows[::128] // 128)
     states = fixture.requests.mamba_allocator.alloc(3)
     original_tokens = array("q", range(1024))
     cache.insert(
@@ -198,7 +205,8 @@ def test_real_unified_partial_group_branch_match_split_and_evict(grouped_cache):
     )
     branch_tail = allocator.alloc(512)
     branch_rows = torch.cat((match.device_indices, branch_tail))
-    mapping.update_request_pages(branch_rows[::128] // 128)
+    if mapping is not None:
+        mapping.update_request_pages(branch_rows[::128] // 128)
     cache.insert(
         InsertParams(
             key=RadixKey(branch_tokens),
@@ -221,8 +229,9 @@ def test_real_unified_partial_group_branch_match_split_and_evict(grouped_cache):
     )
     cache.evict(EvictParams(num_tokens=1536, mamba_num=3))
     assert allocator.available_size() == initial_capacity
-    with pytest.raises(RuntimeError, match="No logical"):
-        mapping.indexer_page_locations(original_rows[::128] // 128)
+    if mapping is not None:
+        with pytest.raises(RuntimeError, match="No logical"):
+            mapping.indexer_page_locations(original_rows[::128] // 128)
     cache.sanity_check()
 
 
@@ -230,3 +239,30 @@ def test_grouped_kda_rejects_missing_checkpoint_buffers(grouped_cache):
     params = replace(grouped_cache.params, enable_mamba_extra_buffer=False)
     with pytest.raises(ValueError, match="requires Mamba checkpoint buffers"):
         UnifiedRadixCache(params)
+
+
+@pytest.mark.parametrize("grouped_cache", ["resident"], indirect=True)
+@pytest.mark.parametrize("cuda_compressed", [False, True])
+def test_resident_non_npu_indexer_keeps_physical_prefix_boundaries(
+    grouped_cache, monkeypatch, cuda_compressed
+):
+    fixture = grouped_cache
+    # CUDA exposes kpool_use_compress (without the NPU-specific leading '_').
+    # Both an ordinary pool and a CUDA compressed pool retain their existing grid.
+    monkeypatch.delattr(fixture.full_pool, "_kpool_use_compress")
+    monkeypatch.setattr(
+        fixture.full_pool, "kpool_use_compress", cuda_compressed, raising=False
+    )
+    params = replace(fixture.params, tree_components=(ComponentType.FULL,))
+    with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+        cache = UnifiedRadixCache(params)
+    original_rows = fixture.allocator.alloc(512)
+    original_tokens = array("q", range(512))
+    cache.insert(InsertParams(key=RadixKey(original_tokens), value=original_rows))
+    branch_tokens = array("q", original_tokens)
+    branch_tokens[200] = -1
+    match = cache.match_prefix(MatchPrefixParams(key=RadixKey(branch_tokens)))
+    assert match.device_indices.numel() == 128
+    assert torch.equal(match.device_indices, original_rows[:128])
+    cache.evict(EvictParams(num_tokens=512))
+    cache.sanity_check()
