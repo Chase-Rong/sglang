@@ -6,13 +6,14 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Optional
 
 import pytest
 import torch
-
-from test_offload_config import MODULE as config, service
-from test_prefill_overlap import setup
-
+from test_hicache_memfabric_pool import runtime as runtime
+from test_offload_config import MODULE as config
+from test_offload_config import service
+from test_prefill_overlap import setup as setup
 
 ROOT = Path(__file__).parents[4] / "python/sglang/srt"
 
@@ -26,8 +27,143 @@ def production_method(relative_path, name, namespace):
     return namespace[name]
 
 
+
+
+def test_hicache_plan_binds_draft_before_attention_and_graph_initialization(runtime):
+    target_backing, target_pool = runtime.make()
+    draft_backing, draft_pool = runtime.make(layers=1)
+    target_backing.bind_hicache(target_pool)
+    target_runner = SimpleNamespace(
+        token_to_kv_pool=target_pool, spec_algorithm=object()
+    )
+    draft_runner = SimpleNamespace(
+        token_to_kv_pool=draft_pool,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
+    )
+    worker = SimpleNamespace(
+        target_worker=SimpleNamespace(model_runner=target_runner),
+        _draft_model_runners=lambda: (draft_runner,),
+    )
+    build = production_method(
+        "speculative/base_spec_worker.py",
+        "_build_hicache_draft_plan",
+        {
+            "HiCacheDraftPlan": SimpleNamespace,
+            "HiCacheDraftMode": SimpleNamespace(PACKED="packed", SIDECAR="sidecar"),
+            "get_memory": lambda: SimpleNamespace(enable_hierarchical_cache=True),
+            "_can_pack_hicache_mtp": lambda *args: True,
+        },
+    )
+    plan = build(worker)
+    assert plan.mode == "packed"
+    assert draft_backing.page_binding is target_backing.page_binding
+    assert target_backing.hicache_pool.mtp_draft_device_pools == (draft_pool,)
+
+
+def test_hicache_assembler_borrows_bound_target_and_draft_without_another_pool(runtime):
+    target, target_pool = runtime.make()
+    draft, draft_pool = runtime.make(layers=1)
+    host = target.bind_hicache(target_pool)
+    host.attach_mtp_drafts((draft_pool,))
+    target_pool.tail_extra_slots = 4
+    namespace = {
+        "Any": Any,
+        "Optional": Optional,
+        "get_parallel": lambda: SimpleNamespace(
+            attn_cp_size=1, attn_dcp_size=1, dcp_enabled=False
+        ),
+    }
+    validate = production_method(
+        "mem_cache/hybrid_cache/hybrid_pool_assembler.py",
+        "_validate_npu_hicache_parallel",
+        namespace,
+    )
+    namespace["_validate_npu_hicache_parallel"] = validate
+    build = production_method(
+        "mem_cache/hybrid_cache/hybrid_pool_assembler.py",
+        "build_kv_host_pool",
+        namespace,
+    )
+    before = list(runtime.events)
+    assert (
+        build(
+            kv_pool=target_pool,
+            page_size=8,
+            use_mla=True,
+            mtp_draft_device_pools=(draft_pool,),
+        )
+        is host
+    )
+    assert runtime.events == before
+    draft.page_binding = None
+    with pytest.raises((ValueError, RuntimeError), match="binding|ownership"):
+        validate(target_pool, (draft_pool,))
+
+
+@pytest.mark.parametrize("decode_graph", ["disabled", "full"])
+def test_startup_admits_fixed_width_nextn_hicache_and_keeps_prefix(decode_graph):
+    args = SimpleNamespace(
+        enable_unified_cache_external_linker=False,
+        hicache_storage_backend=None,
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        speculative_eagle_topk=1,
+        speculative_adaptive=False,
+        page_size=128,
+        chunked_prefill_size=8192,
+        tp_size=8,
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(backend=decode_graph, max_bs=1),
+            prefill=SimpleNamespace(backend="disabled"),
+        ),
+        enable_hierarchical_cache=True,
+        disable_radix_cache=False,
+    )
+
+    def resolve(cfg, reason, **values):
+        for key, value in values.items():
+            setattr(cfg, key, value)
+
+    startup = production_method(
+        "hardware_backend/npu/utils.py",
+        "set_default_server_args",
+        {
+            "resolving_view": lambda cfg: cfg,
+            "declare_resolution": resolve,
+            "envs": SimpleNamespace(
+                SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=SimpleNamespace(get=lambda: True)
+            ),
+            "get_npu_memory_capacity": lambda: 96 * 1024,
+            "use_mla_backend": lambda cfg: True,
+        },
+    )
+    startup(args)
+    assert args.enable_hierarchical_cache and not args.disable_radix_cache
+    assert args.hicache_io_backend == "kernel_ascend"
+    # NPU admission precedes the speculative hook, which supplies steps + 1.
+    args.speculative_num_draft_tokens = None
+    startup(args)
+    args.speculative_num_draft_tokens = 4
+    for key, value in [
+        ("speculative_eagle_topk", 2),
+        ("speculative_num_draft_tokens", 7),
+        ("speculative_adaptive", True),
+        ("speculative_algorithm", "EAGLE3"),
+    ]:
+        old = getattr(args, key)
+        setattr(args, key, value)
+        with pytest.raises(ValueError):
+            startup(args)
+        setattr(args, key, old)
+
+
 @pytest.mark.parametrize("speculative", [False, True])
-def test_integrated_pool_admits_mtp_without_enabling_copy_overlap(monkeypatch, speculative):
+def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
+    monkeypatch, speculative
+):
+    # This tests pool options after argument resolution, not startup admission.
+    # Integrated HiCache requires radix and shared target/draft page ownership.
     values = dict(SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD=True,
                   SGLANG_NPU_DECODE_HOST_KV_BYTES=1 << 30,
                   SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=True,
@@ -48,11 +184,20 @@ def test_integrated_pool_admits_mtp_without_enabling_copy_overlap(monkeypatch, s
         get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
         get_schedule=lambda: schedule, get_parallel=lambda: parallel,
         get_spec=lambda: SimpleNamespace(speculative_algorithm="EAGLE" if speculative else None)))
-    kvc = SimpleNamespace(device="npu", use_mla_backend=True,
-                          server_args=service(), kv_cache_dtype=torch.bfloat16)
+    kvc = SimpleNamespace(
+        device="npu",
+        use_mla_backend=True,
+        server_args=service(disable_radix_cache=False, enable_hierarchical_cache=True),
+        kv_cache_dtype=torch.bfloat16,
+    )
     options = config.fsa_pool_options(kvc, 4)
-    assert options == dict(prefill_layer_slots=2, decode_host_budget=1 << 30,
-                           shared_host_group=group, integrated_offload=True)
+    expected = dict(
+        prefill_layer_slots=2,
+        decode_host_budget=1 << 30,
+        shared_host_group=group,
+        integrated_offload=True,
+    )
+    assert options == expected
     # Admission still rejects layouts for which the bounded slots cannot be reused.
     schedule.enable_mixed_chunk = True
     with pytest.raises(ValueError):

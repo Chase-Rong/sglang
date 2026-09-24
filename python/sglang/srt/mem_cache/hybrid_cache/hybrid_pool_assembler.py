@@ -155,7 +155,7 @@ def build_kv_host_pool(
             or host_pool.page_size != kv_pool.page_size
             or page_size <= 0
             or page_size % host_pool.page_size
-            or host_pool.layer_num != kv_pool.layer_num
+            or host_pool.target_layer_num != kv_pool.layer_num
         ):
             raise ValueError("Integrated HiCache backing does not match the KV pool")
         if override_kv_cache_dim is not None and (
@@ -206,8 +206,21 @@ def _validate_npu_hicache_parallel(kv_pool: Any, draft_pools: tuple) -> None:
         or getattr(kv_pool, "layer_shard_enabled", False)
     ):
         raise NotImplementedError("NPU integrated/indexer HiCache CP is unsupported")
-    if draft_pools or getattr(kv_pool, "tail_extra_slots", 0):
-        raise NotImplementedError("NPU integrated/indexer HiCache MTP is unsupported")
+    if draft_pools:
+        backing = getattr(kv_pool, "decode_host_backing", None)
+        host = getattr(backing, "hicache_pool", None)
+        binding = getattr(backing, "page_binding", None)
+        attached = getattr(host, "mtp_draft_device_pools", ())
+        if (
+            binding is None
+            or len(attached) != len(draft_pools)
+            or any(
+                pool is not attached[index]
+                or pool.decode_host_backing.page_binding is not binding
+                for index, pool in enumerate(draft_pools)
+            )
+        ):
+            raise ValueError("NPU HiCache MTP requires shared target/draft page ownership")
 
 
 def _split_hicache_size(
@@ -923,7 +936,8 @@ def build_hybrid_mamba_stack(
                 host_pool=indexer_host_pool,
                 device_pool=kv_pool,
                 layer_mapping=full_layer_mapping,
-                transfer_layer_num=transfer_layer_num,
+                transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
             )
         )
     host_pool_group = HostPoolGroup(entries)
@@ -1898,6 +1912,13 @@ def _apply_stack_result(
         cache.register_sidecar_pool(sidecar)
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
+    if getattr(getattr(kvcache, "full_kv_pool", kvcache), "integrated_offload", False):
+        # Packed single-layer drafts restore in transfer stage 0. Register on
+        # the outer pool too: HybridLinearKVPool supplies global-layer waits.
+        for draft_pool in params.mtp_draft_device_pools:
+            draft_pool.register_layer_transfer_counter(
+                result.cache_controller.layer_done_counter
+            )
     if result.register_req_to_token_counter:
         params.req_to_token_pool.register_layer_transfer_counter(
             result.cache_controller.layer_done_counter

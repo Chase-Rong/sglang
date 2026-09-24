@@ -9,6 +9,7 @@ peers are device-address metadata, not CPU-readable storage.
 from threading import RLock
 
 import torch
+
 from sglang.srt.hardware_backend.npu.memfabric_host_kv import MemFabricHostKvPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, synchronized
 
@@ -47,6 +48,7 @@ class MemFabricHiCachePool(HostKVCache):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.layer_num = self.target_layer_num = len(backing.regions)
+        self.mtp_draft_device_pools = ()
         if (
             device_pool.store_dtype != self.dtype
             or device_pool.page_size != self.page_size
@@ -96,6 +98,68 @@ class MemFabricHiCachePool(HostKVCache):
     def _require_live(self):
         if self._destroyed or self.backing.pool._closed:
             raise RuntimeError("MemFabric Host pool or backing is closed")
+        if any(
+            pool.decode_host_backing.pool._closed
+            for pool in self.mtp_draft_device_pools
+        ):
+            raise RuntimeError("MemFabric draft backing is closed")
+
+    def attach_mtp_drafts(self, draft_pools):
+        """Borrow single-layer NextN backings under the target's page ownership.
+
+        Called before graph capture or request admission. Physical payloads stay
+        distinct; one allocator/refcount/mapping covers every participating layer.
+        No new Host KV payload is allocated and no draft owner may free pages.
+        """
+        self._require_binding()
+        draft_pools = tuple(draft_pools)
+        if len(draft_pools) != 1:
+            raise ValueError("Integrated HiCache supports one NextN draft pool")
+        pool = draft_pools[0]
+        if self.mtp_draft_device_pools:
+            if pool is self.mtp_draft_device_pools[0]:
+                return
+            raise ValueError("MTP draft backings are already attached")
+        if self.binding.references.any() or self.binding.retired:
+            raise ValueError("Attach MTP backings before allocating any pages")
+        backing = pool.decode_host_backing
+        if (
+            pool is self.device_pool
+            or pool.layer_num != 1
+            or not pool.integrated_offload
+            or backing.pages != self.page_num
+            or any(
+                getattr(pool, key) != getattr(self.device_pool, key)
+                for key in (
+                    "size",
+                    "page_size",
+                    "store_dtype",
+                    "device",
+                    "kv_lora_rank",
+                    "qk_rope_head_dim",
+                    "index_kpool",
+                    "_kpool_use_compress",
+                )
+            )
+        ):
+            raise ValueError("MTP draft/target backing geometry must match")
+        previous = backing.page_binding
+        if (
+            previous is not None
+            and previous is not self.binding
+            and (previous.references.any() or previous.retired)
+        ):
+            raise ValueError("MTP draft backing already owns live pages")
+        # bind_hicache also validates the backing's layout and parallel mode.
+        host = backing.bind_hicache(pool)
+        backing.page_binding = host.binding = self.binding
+        self.mtp_draft_device_pools = draft_pools
+        self.regions += host.regions
+        self.kv_buffer += host.kv_buffer
+        self.layer_num = self.target_layer_num + 1
+        self.k_buffer = tuple(views[0] for views in self.kv_buffer)
+        self.v_buffer = tuple(views[1] for views in self.kv_buffer)
+        self.size_per_token = self.get_size_per_token()
 
     def _require_cpu_access(self):
         self._require_live()
@@ -111,7 +175,12 @@ class MemFabricHiCachePool(HostKVCache):
 
     def init_kv_buffer(self):
         self._require_live()
-        return tuple(self.backing.layer_views(layer) for layer in range(self.layer_num))
+        return tuple(
+            self.backing.layer_views(layer) for layer in range(self.target_layer_num)
+        ) + tuple(
+            pool.decode_host_backing.layer_views(0)
+            for pool in self.mtp_draft_device_pools
+        )
 
     def layer_views(self, layer_id):
         """Return borrowed FSA views using a backing-local layer index."""
@@ -267,9 +336,20 @@ class MemFabricHiCachePool(HostKVCache):
         is_draft=False,
     ):
         self._require_binding()
-        if is_draft or device_pool is not self.device_pool:
+        if is_draft:
+            depth = layer_id - self.target_layer_num
+            if not 0 <= depth < len(self.mtp_draft_device_pools) or (
+                device_pool is not self.mtp_draft_device_pools[depth]
+            ):
+                raise ValueError("HiCache load names the wrong MTP draft layer")
+            # The target anchor already restored shared page ownership. Both
+            # payloads stay on Host; Prefill/Decode gather from their own backing.
+            if device_pool.decode_host_backing.page_binding is not self.binding:
+                raise RuntimeError("MTP draft lost shared HiCache page ownership")
+            return
+        if device_pool is not self.device_pool:
             raise NotImplementedError("This Host pool only binds its main KV pool")
-        if not 0 <= layer_id < self.layer_num:
+        if not 0 <= layer_id < self.target_layer_num:
             raise IndexError("HiCache load layer index is out of range")
         if layer_id == 0:
             self.binding.restore_mapping(host_indices, device_indices)

@@ -93,6 +93,7 @@ def device_and_anchor(with_scale=False):
         device="cpu",
         layout="layer_first",
         layer_num=2,
+        target_layer_num=2,
         device_pool=device,
         can_use_write_back_jit=False,
         binding=binding,
@@ -219,6 +220,34 @@ def test_fragmented_compressed_slices_roundtrip(pool_module, with_scale, io_back
     assert host.allocated_bytes == host.kv_buffer.nbytes
     assert host.logical_size == anchor.size
     assert host.get_size_per_token() * host.size == host.allocated_bytes
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_expanded_host_indexer_restores_high_pages_to_small_device(
+    pool_module, with_scale
+):
+    device, anchor = device_and_anchor(with_scale)
+    anchor.page_num = 33
+    anchor.size = anchor.logical_size = 264
+    original_shape = device.index_k_buffer.shape
+    host = pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+    saved = device.index_k_buffer[:, 3].clone()
+    scales = device.index_scale_buffer[:, 3].clone() if with_scale else None
+    host.backup_from_device_all_layer(
+        device, token_rows([31, 32]), token_rows([3, 5]), "kernel_ascend"
+    )
+    device.index_k_buffer.fill_(-1)
+    if with_scale:
+        device.index_scale_buffer.fill_(-1)
+    for layer in range(2):
+        host.load_to_device_per_layer(
+            device, token_rows([31, 32]), token_rows([1, 6]), layer, "kernel_ascend"
+        )
+    assert torch.equal(device.index_k_buffer[:, 1], saved)
+    if with_scale:
+        assert torch.equal(device.index_scale_buffer[:, 1], scales)
+    assert device.index_k_buffer.shape == original_shape
+    assert host.page_num == 33
 
 
 def test_split_node_backup_keeps_each_kv_pages_own_compressed_slice(pool_module):
@@ -388,17 +417,164 @@ def test_invalid_resolver_results_fail_before_copy(pool_module, locations):
     assert not torch.any(host.kv_buffer)
 
 
-def test_budget_and_unsupported_tail_fail_before_allocation(pool_module, monkeypatch):
+def test_budget_and_invalid_geometry_fail_before_allocation(pool_module, monkeypatch):
     device, anchor = device_and_anchor()
     monkeypatch.setattr(pool_module, "host_memory_budget_bytes", lambda: 1)
     with pytest.raises(ValueError, match="additional host bytes"):
         pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
-    device.tail_extra_slots = 3
-    with pytest.raises(NotImplementedError, match="MTP"):
-        pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
-    device.tail_extra_slots = 0
     device.index_kpool = 3
     with pytest.raises(ValueError, match="divide"):
+        pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+@pytest.mark.parametrize("draft_count", [0, 1, 2])
+def test_mtp_complete_groups_roundtrip_target_and_packed_drafts(
+    pool_module, with_scale, draft_count
+):
+    device, anchor = device_and_anchor(with_scale)
+    device.tail_extra_slots = 3
+    drafts = []
+    for depth in range(draft_count):
+        draft, _ = device_and_anchor(with_scale)
+        draft.layer_num = draft.end_layer = 1
+        draft.index_k_buffer = draft.index_k_buffer[:1].clone().fill_(40 + depth)
+        if with_scale:
+            draft.index_scale_buffer = (
+                draft.index_scale_buffer[:1].clone().fill_(3 + depth)
+            )
+        drafts.append(draft)
+    anchor.mtp_draft_device_pools = tuple(drafts)
+    anchor.layer_num += draft_count
+    host = pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+    assert host.target_layer_num == 2
+    assert host.layer_num == 2 + draft_count
+    pools = [device, *drafts]
+    names = ["index_k_buffer"] + (["index_scale_buffer"] if with_scale else [])
+    originals = [
+        [getattr(pool, name)[:, 3].clone() for name in names] for pool in pools
+    ]
+    host.backup_from_device_all_layer(
+        device, token_rows([4, 2]), token_rows([5, 3]), "direct"
+    )
+    serialized = host.get_data_page(32).clone()
+    assert serialized.numel() == host.bytes_per_layer * (2 + draft_count)
+    for pool in pools:
+        for name in names:
+            getattr(pool, name).fill_(-1)
+    load_target = host.prepare_load_to_device(
+        device, token_rows([4, 2]), token_rows([6, 1]), "direct"
+    )
+    with pytest.raises(IndexError):
+        load_target(2)
+    for layer in range(2):
+        load_target(layer)
+    for draft in drafts:
+        assert torch.all(draft.index_k_buffer == -1)
+    for depth, draft in enumerate(drafts):
+        load_draft = host.prepare_load_to_device(
+            draft, token_rows([4, 2]), token_rows([6, 1]), "direct", is_draft=True
+        )
+        with pytest.raises(IndexError):
+            load_draft(0)
+        with pytest.raises(IndexError):
+            load_draft(3 + depth)
+        load_draft(2 + depth)
+    for pool, expected in zip(pools, originals):
+        for name, value in zip(names, expected):
+            assert torch.equal(getattr(pool, name)[:, 1], value)
+    with pytest.raises(ValueError, match="device pool"):
+        host.prepare_load_to_device(
+            device_and_anchor(with_scale)[0],
+            token_rows([4, 2]),
+            token_rows([6, 1]),
+            "direct",
+            is_draft=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "indices", [torch.arange(7), token_rows([3]), token_rows([3, 3])]
+)
+def test_mtp_rejects_partial_or_duplicate_compression_groups(pool_module, indices):
+    device, anchor = device_and_anchor()
+    device.tail_extra_slots = 3
+    host = pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+    with pytest.raises(ValueError):
+        host.backup_from_device_all_layer(
+            device, token_rows([1, 2])[: indices.numel()], indices, "direct"
+        )
+    assert not torch.any(host.kv_buffer)
+    with pytest.raises(ValueError):
+        host.prepare_load_to_device(
+            device, token_rows([1, 2])[: indices.numel()], indices, "direct"
+        )
+
+
+def test_mtp_rejects_slices_from_two_incomplete_groups(pool_module):
+    device, anchor = device_and_anchor()
+    device.tail_extra_slots = 3
+    host = pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+    with pytest.raises(ValueError, match="complete compression"):
+        host.backup_from_device_all_layer(
+            device, token_rows([1, 2]), token_rows([3, 1]), "direct"
+        )
+    assert not torch.any(host.kv_buffer)
+
+
+def test_mtp_backup_and_restore_never_access_temporary_tail(pool_module):
+    class NoTailAccess(SimpleNamespace):
+        def __getattribute__(self, name):
+            if name in (
+                "_compress_tail_k",
+                "_compress_tail_score",
+                "get_compress_tail_buffers",
+            ):
+                pytest.fail("HiCache must not access speculative request tail rings")
+            return super().__getattribute__(name)
+
+    device, anchor = device_and_anchor()
+    device = NoTailAccess(**vars(device))
+    device.tail_extra_slots = 3
+    host = pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
+    expected = device.index_k_buffer[:, 3].clone()
+    host.backup_from_device_all_layer(
+        device, token_rows([1, 2]), token_rows([3, 5]), "direct"
+    )
+    device.index_k_buffer.fill_(-1)
+    for layer in range(2):
+        host.load_to_device_per_layer(
+            device, token_rows([1, 2]), token_rows([1, 6]), layer, "direct"
+        )
+    assert torch.equal(device.index_k_buffer[:, 1], expected)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["layers", "page_size", "index_kpool", "capacity", "dtype", "scale", "cp"],
+)
+def test_mtp_rejects_incompatible_draft_before_allocation(pool_module, invalid):
+    device, anchor = device_and_anchor()
+    draft, _ = device_and_anchor()
+    draft.layer_num = draft.end_layer = 1
+    draft.index_k_buffer = draft.index_k_buffer[:1]
+    if invalid == "layers":
+        draft.layer_num = 2
+    elif invalid == "page_size":
+        draft.page_size = 4
+    elif invalid == "index_kpool":
+        draft.index_kpool = 4
+    elif invalid == "capacity":
+        draft.index_k_buffer = draft.index_k_buffer[:, :8]
+    elif invalid == "dtype":
+        draft.index_k_buffer = draft.index_k_buffer.float()
+    elif invalid == "scale":
+        draft.index_scale_buffer = torch.zeros((1, 9, 8, 1, 1))
+    else:
+        draft.layer_shard_enabled = True
+    anchor.mtp_draft_device_pools = (draft,)
+    anchor.layer_num = 3
+    with pytest.raises((ValueError, NotImplementedError)):
         pool_module.NPUIndexerPoolHost(device, anchor, pin_memory=False)
 
 
@@ -420,7 +596,10 @@ def test_sidecar_never_owns_anchor_lifetime(pool_module):
         host.get_data_page(0)
 
 
-def test_aligned_prefix_needs_no_old_tail_in_existing_bf16_reference(monkeypatch):
+@pytest.mark.parametrize("tail_extra_slots", [0, 3])
+def test_aligned_prefix_needs_no_old_tail_in_existing_bf16_reference(
+    monkeypatch, tail_extra_slots
+):
     reference = definitions(
         monkeypatch,
         "hicache_indexer_tail_reference",
@@ -429,9 +608,13 @@ def test_aligned_prefix_needs_no_old_tail_in_existing_bf16_reference(monkeypatch
         torch=torch,
         INDEX_HEAD_DIM=128,
     )
-    pool = SimpleNamespace(index_kpool=4, tail_extra_slots=0, page_size=128)
+    pool = SimpleNamespace(
+        index_kpool=4, tail_extra_slots=tail_extra_slots, page_size=128
+    )
     cache = torch.full((6, 128, 128), -1, dtype=torch.bfloat16)
-    tail_keys = torch.full((1, 4, 128), float("nan"), dtype=torch.bfloat16)
+    tail_keys = torch.full(
+        (1, 4 + tail_extra_slots, 128), float("nan"), dtype=torch.bfloat16
+    )
     tail_scores = torch.full_like(tail_keys, float("nan"))
     for step in range(4):
         reference.kpool_decode_update_and_maybe_write_cache_bf16(
@@ -453,8 +636,9 @@ def test_aligned_prefix_needs_no_old_tail_in_existing_bf16_reference(monkeypatch
     expected = torch.full_like(cache, -1)
     expected[3, 32] = 2.5
     assert torch.equal(cache, expected)
-    assert not torch.isnan(tail_keys).any()
-    assert not torch.isnan(tail_scores).any()
+    written = torch.arange(128, 132) % (4 + tail_extra_slots)
+    assert not torch.isnan(tail_keys[:, written]).any()
+    assert not torch.isnan(tail_scores[:, written]).any()
 
 
 @pytest.fixture
@@ -558,17 +742,24 @@ def test_integrated_anchor_is_returned_by_identity(assembler):
         assembler.build_kv_host_pool(kv_pool=device, page_size=8, use_mla=True)
 
 
-@pytest.mark.parametrize("unsupported", ["cp", "dcp", "mtp"])
+@pytest.mark.parametrize("unsupported", ["cp", "dcp"])
 def test_integrated_rejects_unsupported_combinations(assembler, unsupported):
     device, anchor = device_and_anchor()
     if unsupported == "cp":
         assembler.parallel.attn_cp_size = 2
-    elif unsupported == "dcp":
-        assembler.parallel.dcp_enabled = True
     else:
-        device.tail_extra_slots = 3
+        assembler.parallel.dcp_enabled = True
     with pytest.raises(NotImplementedError):
         assembler.build_kv_host_pool(kv_pool=device, page_size=8, use_mla=True)
+
+
+def test_integrated_allows_mtp_aligned_prefixes(assembler):
+    device, anchor = device_and_anchor()
+    device.tail_extra_slots = 3
+    assert (
+        assembler.build_kv_host_pool(kv_pool=device, page_size=16, use_mla=True)
+        is anchor
+    )
 
 
 @pytest.mark.parametrize("integrated", [False, True])
@@ -674,7 +865,9 @@ def test_apply_result_wires_existing_host_eviction(assembler):
         transfer_layer_num=2,
     )
     device.register_layer_transfer_counter = Mock()
-    assembler._apply_stack_result(cache, device, None, result)
+    assembler._apply_stack_result(
+        cache, device, SimpleNamespace(mtp_draft_device_pools=()), result
+    )
     assert anchor.binding.evict_host is cache.evict_host
     device.register_layer_transfer_counter.assert_called_once_with(
         controller.layer_done_counter

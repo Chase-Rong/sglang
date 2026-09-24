@@ -130,9 +130,9 @@ def runtime(monkeypatch):
     monkeypatch.setattr(allocator.module, "native_ops", lambda: operations)
     backings = []
 
-    def make(*, rope_dim=2, page_size=4, pages=5):
+    def make(*, rope_dim=2, page_size=4, pages=5, layers=2):
         backing = allocator.backing.DecodeHostKvBacking(
-            layers=2,
+            layers=layers,
             pages=pages,
             page_size=page_size,
             latent_dim=8,
@@ -148,13 +148,17 @@ def runtime(monkeypatch):
             size=page_size * (pages - 1),
             page_size=page_size,
             start_layer=3,
-            end_layer=5,
-            layer_num=2,
+            end_layer=3 + layers,
+            layer_num=layers,
             kv_lora_rank=8,
             qk_rope_head_dim=rope_dim,
             device="cpu",
             layer_shard_enabled=False,
+            integrated_offload=True,
+            index_kpool=2,
+            _kpool_use_compress=False,
         )
+        device_pool.decode_host_backing = backing
         return backing, device_pool
 
     yield SimpleNamespace(
@@ -174,6 +178,75 @@ def runtime(monkeypatch):
 def make_pool(runtime, **kwargs):
     backing, device_pool = runtime.make(**kwargs)
     return runtime.pool_type(device_pool=device_pool, backing=backing)
+
+
+def test_mtp_borrowed_layers_share_one_owner_and_survive_device_remap(runtime):
+    target, target_device = runtime.make()
+    draft, draft_device = runtime.make(layers=1)
+    host = target.bind_hicache(target_device)
+    before = list(runtime.events)
+    host.attach_mtp_drafts((draft_device,))
+    assert runtime.events == before  # reuse both physical backing allocations
+    assert host.target_layer_num == 2 and host.layer_num == 3
+    assert host.mtp_draft_device_pools == (draft_device,)
+    assert draft.page_binding is target.page_binding
+    assert draft.hicache_pool.binding is target.page_binding
+    assert host.k_buffer[2].data_ptr() == draft.layer_views(0)[0].data_ptr()
+    assert host.layer_views(2)[0].data_ptr() == draft.layer_views(0)[0].data_ptr()
+    assert host.init_kv_buffer()[2][0].data_ptr() == draft.layer_views(0)[0].data_ptr()
+    binding = target.page_binding
+    assert binding.ensure_pages(torch.tensor([1]))
+    device_rows = torch.arange(4, 8)
+    cached_rows = host.acquire_device_pages(device_rows)
+    mapped = binding.host_rows(device_rows)
+    draft.regions[0][0].tensor[mapped] = 71
+    target.regions[0][0].tensor[mapped] = 19
+    binding.release_device_pages(torch.tensor([1]))
+    restored_rows = torch.arange(8, 12)
+    host.load_to_device_per_layer(
+        target_device, cached_rows, restored_rows, 0, "kernel_ascend"
+    )
+    host.load_to_device_per_layer(
+        draft_device, cached_rows, restored_rows, 2, "kernel_ascend", is_draft=True
+    )
+    assert torch.equal(draft.page_binding.host_rows(restored_rows), cached_rows)
+    assert torch.all(draft.regions[0][0].tensor[cached_rows] == 71)
+    assert torch.all(target.regions[0][0].tensor[cached_rows] == 19)
+    assert binding.references[cached_rows[0] // 4] == 2  # cache + one device owner
+    host.free(cached_rows)
+    binding.release_device_pages(torch.tensor([2]))
+    assert binding.references.sum() == 0
+
+
+def test_mtp_attachment_rejects_capacity_mismatch_before_binding(runtime):
+    target, device = runtime.make()
+    draft, draft_device = runtime.make(pages=6, layers=1)
+    host = target.bind_hicache(device)
+    with pytest.raises(ValueError, match="geometry"):
+        host.attach_mtp_drafts((draft_device,))
+    assert draft.page_binding is None
+    assert host.layer_num == 2
+
+
+def test_mtp_attachment_is_idempotent_but_cannot_replace_live_draft(runtime):
+    target, device = runtime.make()
+    draft, draft_device = runtime.make(layers=1)
+    host = target.bind_hicache(device)
+    host.attach_mtp_drafts((draft_device,))
+    host.attach_mtp_drafts((draft_device,))
+    assert host.layer_num == 3
+    _, other = runtime.make(layers=1)
+    with pytest.raises(ValueError, match="already"):
+        host.attach_mtp_drafts((other,))
+    with pytest.raises(ValueError, match="draft"):
+        host.load_to_device_per_layer(
+            other,
+            torch.arange(4, 8),
+            torch.arange(8, 12),
+            2,
+            "kernel_ascend",
+            is_draft=True,
+        )
 
 
 @pytest.mark.parametrize("end_layer", [4, 5])
@@ -481,7 +554,7 @@ def test_load_only_restores_mapping_and_backup_waits_for_ready_event(runtime):
     assert runtime.stream.waits == [ready]
     assert not ready.query()
     assert runtime.events == before
-    with pytest.raises(NotImplementedError, match="main KV"):
+    with pytest.raises(ValueError, match="draft"):
         pool.load_to_device_per_layer(
             device_pool, cached, destination, 0, "kernel", is_draft=True
         )

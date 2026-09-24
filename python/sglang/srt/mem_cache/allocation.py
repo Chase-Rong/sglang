@@ -727,6 +727,21 @@ def alloc_for_spec_decode(
             out_cache_loc,
             len(reqs),
         )
+        try:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
+                    maybe_update_indexer_mapping,
+                )
+
+                maybe_update_indexer_mapping(
+                    batch,
+                    batch.req_pool_indices_cpu,
+                    nxt_kv_lens_cpu,
+                    start_lens_cpu=cur_kv_lens_cpu,
+                )
+        except Exception:
+            tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+            raise
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):

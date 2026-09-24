@@ -270,6 +270,15 @@ class BaseSpecWorker(ABC):
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            target_pool = target_model_runner.token_to_kv_pool
+            target_pool = getattr(target_pool, "full_kv_pool", target_pool)
+            if getattr(target_pool, "integrated_offload", False):
+                backing = target_pool.decode_host_backing
+                if backing is None or backing.hicache_pool is None:
+                    raise RuntimeError("Initialize target HiCache ownership before MTP")
+                backing.hicache_pool.attach_mtp_drafts(
+                    tuple(getattr(pool, "full_kv_pool", pool) for pool in draft_pools)
+                )
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,

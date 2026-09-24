@@ -14,8 +14,10 @@ on the host. L2 completion protects the final pinned Host slots in both directio
 Only complete KV pages are accepted. A page boundary divisible by kpool has no
 live compression tail: kpool_index_npu.py compresses at slot == POOL_SIZE - 1;
 dsa_indexer_kpool.py builds subsequent pools from the new chunk. Old request
-tail rings are overwritten before reuse. Unaligned prefixes and speculative
-tail rollback require request state and are deliberately unsupported here.
+tail rings are overwritten before reuse. MTP transfers additionally require
+complete compression page groups and pack each one-layer draft after target
+layers. Only committed compressed keys are saved; speculative tail rings are
+rebuilt from the suffix starting at the aligned prefix boundary.
 The current NPU BF16 path has no scale; a separate index_scale_buffer, when
 present, is transferred with identical row mapping and its original dtype.
 """
@@ -84,12 +86,29 @@ class NPUIndexerPoolHost(HostKVCache):
             raise NotImplementedError(
                 "NPU HiCache indexer CP/layer sharding is unsupported"
             )
-        if getattr(device_pool, "tail_extra_slots", 0) or getattr(
-            anchor_host, "mtp_draft_device_pools", ()
-        ):
-            raise NotImplementedError(
-                "NPU HiCache indexer MTP tail restore is unsupported"
-            )
+        self.mtp_draft_device_pools = tuple(
+            getattr(anchor_host, "mtp_draft_device_pools", ())
+        )
+        pools = (device_pool, *self.mtp_draft_device_pools)
+        if len({id(pool) for pool in pools}) != len(pools):
+            raise ValueError("MTP indexer device pools must be distinct")
+        for draft in self.mtp_draft_device_pools:
+            if getattr(draft, "layer_shard_enabled", False):
+                raise NotImplementedError(
+                    "NPU HiCache indexer CP/layer sharding is unsupported"
+                )
+            if (
+                draft.layer_num != 1
+                or draft.page_size != self.page_size
+                or draft.index_kpool != self.index_kpool
+                or not getattr(draft, "_kpool_use_compress", False)
+            ):
+                raise ValueError(
+                    "MTP indexer requires one draft layer with matching geometry"
+                )
+        self._require_complete_groups = bool(
+            self.mtp_draft_device_pools or getattr(device_pool, "tail_extra_slots", 0)
+        )
         self.slots_per_page = self.page_size // self.index_kpool
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
@@ -97,8 +116,8 @@ class NPUIndexerPoolHost(HostKVCache):
             raise ValueError("Anchor capacity is not a whole number of KV pages")
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.layer_num = self.target_layer_num = device_pool.layer_num
-        self.mtp_draft_device_pools = ()
+        self.target_layer_num = device_pool.layer_num
+        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.layout = "layer_first"
         self.device = "cpu"
         self.dtype = torch.uint8
@@ -110,12 +129,20 @@ class NPUIndexerPoolHost(HostKVCache):
         self.bytes_per_layer = 0
         for name in ("index_k_buffer", "index_scale_buffer"):
             buffers = getattr(device_pool, name, None)
+            draft_buffers = [
+                getattr(draft, name, None) for draft in self.mtp_draft_device_pools
+            ]
+            if any((value is None) != (buffers is None) for value in draft_buffers):
+                raise ValueError(f"MTP indexer {name} components differ")
             if buffers is None:
                 if name == "index_k_buffer":
                     raise ValueError("NPU index_k_buffer is missing")
                 continue
-            if len(buffers) != self.layer_num or not self.layer_num:
+            if len(buffers) != self.target_layer_num or not self.target_layer_num:
                 raise ValueError(f"{name} must contain every logical FULL layer")
+            if any(len(value) != 1 for value in draft_buffers):
+                raise ValueError(f"MTP indexer {name} requires one layer per draft")
+            buffers = [*buffers, *(value[0] for value in draft_buffers)]
             reference = buffers[0]
             if reference.device.type != "cpu" and not pin_memory:
                 raise ValueError(
@@ -242,6 +269,12 @@ class NPUIndexerPoolHost(HostKVCache):
             or locations.unique().numel() != locations.numel()
         ):
             raise ValueError("Invalid, overlapping, or reserved indexer page locations")
+        if self._require_complete_groups:
+            _, counts = torch.unique(locations // self.page_size, return_counts=True)
+            if torch.any(counts != self.index_kpool):
+                raise ValueError(
+                    "MTP indexer transfers require complete compression page groups"
+                )
         return host_pages, locations
 
     def _copy_runs(self, host_pages, locations, byte_count):
@@ -320,9 +353,28 @@ class NPUIndexerPoolHost(HostKVCache):
     ):
         """Snapshot CPU metadata once before L2 enters its per-layer copy loop."""
         if is_draft:
-            raise NotImplementedError("NPU HiCache indexer MTP restore is unsupported")
+            draft_depth = next(
+                (
+                    depth
+                    for depth, pool in enumerate(self.mtp_draft_device_pools)
+                    if pool is device_pool
+                ),
+                None,
+            )
+            if draft_depth is None:
+                raise ValueError(
+                    "NPU indexer sidecar belongs to a different draft device pool"
+                )
+            first_layer = self.target_layer_num + draft_depth
+            last_layer = first_layer + 1
+        else:
+            if device_pool is not self.device_pool:
+                raise ValueError(
+                    "NPU indexer sidecar belongs to a different device pool"
+                )
+            first_layer, last_layer = 0, self.target_layer_num
         host_pages, locations = self._transfer_rows(
-            device_pool, host_indices, device_indices, io_backend
+            self.device_pool, host_indices, device_indices, io_backend
         )
         plans = tuple(
             self._copy_runs(host_pages, locations, component[2])
@@ -331,7 +383,7 @@ class NPUIndexerPoolHost(HostKVCache):
 
         def load_layer(layer_id):
             self._require_live()
-            if not 0 <= layer_id < self.layer_num:
+            if not first_layer <= layer_id < last_layer:
                 raise IndexError("NPU indexer layer is outside this pool")
             self._copy_layer(layer_id, plans, to_host=False)
 

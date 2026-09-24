@@ -56,9 +56,19 @@ def set_default_server_args(args: "ServerArgs"):
             or cfg.hicache_storage_backend is not None
         ):
             raise ValueError("Integrated sparse offload requires the HiCache Host tier")
-        if cfg.speculative_algorithm is not None:
+        if cfg.speculative_algorithm is not None and (
+            cfg.speculative_algorithm not in ("EAGLE", "NEXTN")
+            or cfg.speculative_eagle_topk != 1
+            or cfg.speculative_num_steps is None
+            or cfg.speculative_num_steps < 1
+            # The later speculative hook fills an omitted width with steps + 1.
+            or cfg.speculative_num_draft_tokens
+            not in (None, cfg.speculative_num_steps + 1)
+            or cfg.speculative_adaptive
+        ):
             raise ValueError(
-                "HiCache sparse offload does not yet support speculative decoding"
+                "HiCache sparse offload requires fixed-width NEXTN/EAGLE, "
+                "topk=1, draft_tokens=steps+1 and disabled speculative adaptive"
             )
         declare_resolution(
             args,
