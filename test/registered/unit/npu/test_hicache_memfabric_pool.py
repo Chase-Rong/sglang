@@ -130,7 +130,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(allocator.module, "native_ops", lambda: operations)
     backings = []
 
-    def make(*, rope_dim=2, page_size=4, pages=5, layers=2):
+    def make(*, rope_dim=2, page_size=4, pages=5, layers=2, host_tokens=0):
         backing = allocator.backing.DecodeHostKvBacking(
             layers=layers,
             pages=pages,
@@ -141,6 +141,7 @@ def runtime(monkeypatch):
             device_id=0,
             host_budget=1 << 20,
             integrated=True,
+            host_token_capacity=host_tokens,
         )
         backings.append(backing)
         device_pool = SimpleNamespace(

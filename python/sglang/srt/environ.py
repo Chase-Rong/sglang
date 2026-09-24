@@ -914,6 +914,9 @@ class Envs:
     SGLANG_NPU_PREFILL_LAYER_SLOTS = EnvInt(2)
     SGLANG_NPU_PREFILL_HOST_KV_BYTES = EnvInt(0)
     SGLANG_NPU_DECODE_HOST_KV_BYTES = EnvInt(0)
+    # Integrated offload only: minimum usable Host KV tokens, page aligned.
+    # Zero follows device capacity; the byte budget still bounds target + MTP.
+    SGLANG_NPU_HICACHE_HOST_TOKENS = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)

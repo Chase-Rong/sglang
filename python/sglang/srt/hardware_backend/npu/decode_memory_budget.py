@@ -20,6 +20,7 @@ class DecodeKvMemoryBudget:
     staging_bytes: int = 0
     rows_per_request: int = 1
     prefill_layer_slots: int = 0
+    host_token_capacity: int = 0
 
     def __post_init__(self):
         if (
@@ -56,6 +57,8 @@ class DecodeKvMemoryBudget:
             raise ValueError("Decode query rows per request must be positive")
         if not 0 <= self.prefill_layer_slots <= self.layers:
             raise ValueError("Prefill slots must fit the Host layer count")
+        if type(self.host_token_capacity) is not int or self.host_token_capacity < 0:
+            raise ValueError("Host token capacity must be a nonnegative integer")
 
     @property
     def host_bytes_per_token(self):
@@ -109,9 +112,12 @@ class DecodeKvMemoryBudget:
                 "Decode token capacity must be nonnegative and page aligned"
             )
         host_fixed, device_fixed = self.fixed_bytes(request_rows, page_size)
+        if self.host_token_capacity % page_size:
+            raise ValueError("Host token capacity must be page aligned")
         storage_rows = tokens + page_size
+        host_storage_rows = max(tokens, self.host_token_capacity) + page_size
         return (
-            host_fixed + storage_rows * self.host_bytes_per_token,
+            host_fixed + host_storage_rows * self.host_bytes_per_token,
             device_fixed + storage_rows * self.device_bytes_per_token,
         )
 
@@ -280,7 +286,9 @@ def budget_from_config(kvc, layers):
         model.qk_rope_head_dim,
         model.index_head_dim,
         2,
-        int(model.hf_text_config.index_topk) + int(getattr(model.hf_text_config, "index_kpool", 1)) - 1,
+        int(model.hf_text_config.index_topk)
+        + int(getattr(model.hf_text_config, "index_kpool", 1))
+        - 1,
         envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get(),
         envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get(),
         graph_rows,
@@ -295,4 +303,9 @@ def budget_from_config(kvc, layers):
         staging_bytes=envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
         rows_per_request=rows_per_request,
         prefill_layer_slots=prefill_slots,
+        host_token_capacity=(
+            envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
+            if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+            else 0
+        ),
     )

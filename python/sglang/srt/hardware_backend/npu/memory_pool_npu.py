@@ -550,6 +550,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         decode_host_budget: Optional[int] = None,
         shared_host_group=None,
         integrated_offload: bool = False,
+        decode_host_token_capacity: int = 0,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -579,6 +580,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             raise ValueError("Prefill layer slots must fit the logical layer count")
         self.prefill_layer_slots = prefill_layer_slots
         self.integrated_offload = integrated_offload
+        if decode_host_token_capacity and not integrated_offload:
+            raise ValueError("Independent Host capacity requires integrated offload")
         if integrated_offload and (prefill_layer_slots is None or decode_host_budget is None
                                    or not self._kpool_use_compress):
             raise ValueError("integrated offload requires Prefill slots, Host KV and resident KPool")
@@ -587,7 +590,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if decode_host_budget is not None:
             if (prefill_layer_slots is not None and not integrated_offload) or index_head_dim is None:
                 raise ValueError("Decode Host KV requires a dedicated DSA Decode pool")
-            from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
+            from sglang.srt.hardware_backend.npu.decode_host_kv import (
+                DecodeHostKvBacking,
+            )
 
             self.decode_host_backing = DecodeHostKvBacking(
                 layers=layer_num, pages=size // page_size + 1, page_size=page_size,
@@ -595,6 +600,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype, device_id=torch.npu.current_device(),
                 host_budget=decode_host_budget, shared_group=shared_host_group,
                 integrated=integrated_offload,
+                host_token_capacity=decode_host_token_capacity,
             )
         physical_layers = prefill_layer_slots or layer_num
         self.custom_mem_pool = None
@@ -659,7 +665,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         from sglang.srt.hardware_backend.npu.layer_protocol import LayerReceiveLease
         from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
-        from sglang.srt.hardware_backend.npu.prefill_offload import KvComponent, PdSourceKind
+        from sglang.srt.hardware_backend.npu.prefill_offload import (
+            KvComponent,
+            PdSourceKind,
+        )
 
         if self.decode_host_backing is None:
             raise RuntimeError("layer receive requires registered Decode Host backing")

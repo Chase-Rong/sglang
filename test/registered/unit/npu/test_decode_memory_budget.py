@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 SOURCE = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/decode_memory_budget.py"
 SPEC = importlib.util.spec_from_file_location("decode_budget_under_test", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -47,6 +46,38 @@ def test_full_kv_scales_host_while_indexer_scales_npu():
     after = model.required_bytes(16384, 4, 64)
     assert after[0] - before[0] == 8192 * 4 * 576 * 2
     assert after[1] - before[1] == 8192 * 4 * 128 * 2
+
+
+def test_independent_host_capacity_does_not_consume_device_kv_budget():
+    ordinary = budget(prefill_layer_slots=2)
+    expanded = budget(prefill_layer_slots=2, host_token_capacity=131072)
+    before = ordinary.required_bytes(8192, 4, 128)
+    after = expanded.required_bytes(8192, 4, 128)
+    assert after[0] - before[0] == 122880 * 4 * 576 * 2
+    assert after[1] == before[1]
+    assert expanded.max_tokens(before[1], 128, lambda _: 4) == 8192
+    # This is a minimum Host capacity, not a cap on the device solver.
+    assert expanded.required_bytes(262144, 4, 128) == ordinary.required_bytes(
+        262144, 4, 128
+    )
+
+
+def test_independent_host_budget_includes_target_draft_and_reserved_page():
+    model = budget(layers=5, host_token_capacity=131072)
+    host_fixed, _ = model.fixed_bytes(4, 128)
+    assert model.required_bytes(8192, 4, 128)[0] == host_fixed + 131200 * 5 * 576 * 2
+    required, device_bytes = model.required_bytes(8192, 4, 128)
+    too_small = replace(model, host_bytes=required - 1)
+    with pytest.raises(MemoryError, match="Host"):
+        too_small.validate(8192, 4, 128, device_bytes)
+    assert too_small.max_tokens(device_bytes, 128, lambda _: 4) == 0
+
+
+def test_independent_host_capacity_requires_nonnegative_aligned_tokens():
+    with pytest.raises(ValueError, match="Host"):
+        budget(host_token_capacity=-1)
+    with pytest.raises(ValueError, match="Host"):
+        budget(host_token_capacity=129).required_bytes(8192, 4, 128)
 
 
 def test_integrated_slots_add_device_capacity_without_duplicating_host():

@@ -27,6 +27,99 @@ def production_method(relative_path, name, namespace):
     return namespace[name]
 
 
+@pytest.mark.parametrize("integrated", [False, True])
+@pytest.mark.parametrize("host_tokens", [0, 131072])
+def test_host_capacity_budget_route_includes_mtp_layers(
+    monkeypatch, integrated, host_tokens
+):
+    from test_decode_memory_budget import MODULE as budget_module
+    from test_speculative_sparse import MODULE as speculative_module
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.hardware_backend.npu.speculative_sparse",
+        speculative_module,
+    )
+
+    values = dict(
+        SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=integrated,
+        SGLANG_NPU_HICACHE_HOST_TOKENS=host_tokens,
+        SGLANG_NPU_PREFILL_LAYER_SLOTS=2,
+        SGLANG_NPU_FSA_RESIDENT_CAPACITY=4096,
+        SGLANG_NPU_DECODE_HOST_KV_BYTES=1 << 34,
+        SGLANG_NPU_SHARED_HOST_KV=True,
+        SGLANG_NPU_LAYER_STAGING_BYTES=0,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.environ",
+        SimpleNamespace(
+            envs=SimpleNamespace(
+                **{
+                    key: SimpleNamespace(get=lambda value=value: value)
+                    for key, value in values.items()
+                }
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.model_config",
+        SimpleNamespace(
+            is_deepseek_dsa=lambda config: True,
+            dsa_layer_skips_topk=lambda *args: False,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_executor.pool_configurator",
+        SimpleNamespace(
+            _get_dsa_cache_layer_ids=lambda kvc, layers: list(range(layers))
+        ),
+    )
+    spec = SimpleNamespace(
+        speculative_num_steps=5,
+        speculative_num_draft_tokens=6,
+        speculative_eagle_topk=1,
+    )
+    graph = SimpleNamespace(backend="full", bs=[1, 2, 4, 8, 12, 16, 24], max_bs=24)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.runtime_context",
+        SimpleNamespace(
+            get_disagg=lambda: SimpleNamespace(
+                disaggregation_mode="null" if integrated else "decode"
+            ),
+            get_spec=lambda: spec,
+            get_exec=lambda: SimpleNamespace(
+                graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=graph))
+            ),
+        ),
+    )
+    config = SimpleNamespace(index_topk=2048, index_kpool=4)
+    model = SimpleNamespace(
+        hf_config=config,
+        hf_text_config=config,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        index_head_dim=128,
+        num_nextn_predict_layers=1,
+    )
+    kvc = SimpleNamespace(
+        device="npu",
+        use_mla_backend=True,
+        model_config=model,
+        kv_cache_dtype=torch.bfloat16,
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_none=lambda: False, name="EAGLE"),
+        spec_aux_config=SimpleNamespace(eagle_draft_num_layers=1),
+    )
+    actual = budget_module.budget_from_config(kvc, 11)
+    assert actual.layers == 12
+    assert actual.host_token_capacity == (host_tokens if integrated else 0)
+    assert actual.host_bytes_per_token == 12 * 512 * 2
+    assert actual.prefill_layer_slots == (3 if integrated else 0)
+    assert actual.graph_rows == 24 and actual.rows_per_request == 6
 
 
 def test_hicache_plan_binds_draft_before_attention_and_graph_initialization(runtime):
@@ -159,13 +252,15 @@ def test_startup_admits_fixed_width_nextn_hicache_and_keeps_prefix(decode_graph)
 
 
 @pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("host_tokens", [0, 131072])
 def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
-    monkeypatch, speculative
+    monkeypatch, speculative, host_tokens
 ):
     # This tests pool options after argument resolution, not startup admission.
     # Integrated HiCache requires radix and shared target/draft page ownership.
     values = dict(SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD=True,
                   SGLANG_NPU_DECODE_HOST_KV_BYTES=1 << 30,
+                  SGLANG_NPU_HICACHE_HOST_TOKENS=host_tokens,
                   SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=True,
                   SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION=True,
                   SGLANG_NPU_PREFILL_LAYER_SLOTS=2)
@@ -197,6 +292,8 @@ def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
         shared_host_group=group,
         integrated_offload=True,
     )
+    if host_tokens:
+        expected["decode_host_token_capacity"] = host_tokens
     assert options == expected
     # Admission still rejects layouts for which the bounded slots cannot be reused.
     schedule.enable_mixed_chunk = True

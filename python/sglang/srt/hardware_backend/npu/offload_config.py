@@ -161,7 +161,7 @@ def fsa_pool_options(kvc, layer_count):
         slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), layer_count)
         if slots <= 0:
             raise ValueError("integrated offload requires positive Prefill layer slots")
-        return {
+        options = {
             "prefill_layer_slots": slots,
             "decode_host_budget": host_budget,
             "shared_host_group": shared_host_group_from_runtime(
@@ -169,6 +169,10 @@ def fsa_pool_options(kvc, layer_count):
             ),
             "integrated_offload": True,
         }
+        host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
+        if host_tokens:
+            options["decode_host_token_capacity"] = host_tokens
+        return options
     if prefill:
         if role != "prefill" or host_budget:
             raise ValueError(

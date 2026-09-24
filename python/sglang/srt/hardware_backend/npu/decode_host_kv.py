@@ -19,11 +19,21 @@ class DecodeHostKvBacking:
         host_budget,
         shared_group=None,
         integrated=False,
+        host_token_capacity=0,
     ):
         if rope_dim < 0 or min(layers, pages, page_size, latent_dim) <= 0:
             raise ValueError(
                 "Host MLA backing dimensions must be positive, with optional RoPE"
             )
+        if (
+            type(host_token_capacity) is not int
+            or host_token_capacity < 0
+            or host_token_capacity % page_size
+        ):
+            raise ValueError("Host token capacity must be nonnegative and page aligned")
+        if host_token_capacity and not integrated:
+            raise ValueError("Independent Host capacity requires integrated offload")
+        pages = max(pages, host_token_capacity // page_size + 1)
         required = layers * pages * page_size * (latent_dim + rope_dim)
         required *= torch.empty((), dtype=dtype).element_size()
         if host_budget <= 0 or required > host_budget:
