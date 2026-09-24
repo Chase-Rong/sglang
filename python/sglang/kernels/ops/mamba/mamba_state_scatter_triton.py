@@ -495,8 +495,10 @@ def _fused_conv_window_scatter_multi_kernel(
 
     is1 = pid_req < n1
     is2 = pid_req >= n1
-    off1 = pid_req
-    off2 = pid_req - n1
+    # Ascend may lower a scalar masked load to an unconditional load followed
+    # by a select. Keep the inactive group's address in bounds as well.
+    off1 = tl.where(is1, pid_req, 0)
+    off2 = tl.where(is2, pid_req - n1, 0)
     s1 = tl.load(step1_ptr + off1, mask=is1, other=-1).to(tl.int64)
     s2 = tl.load(step2_ptr + off2, mask=is2, other=-1).to(tl.int64)
     step_idx = tl.where(is2, s2, s1)
@@ -517,11 +519,10 @@ def _fused_conv_window_scatter_multi_kernel(
 
     for t in tl.static_range(NUM_TYPES):
         block_start = tl.load(meta_ptr + t * META_COLS + 10)
-        block_end = tl.load(
-            meta_ptr + (t + 1) * META_COLS + 10,
-            mask=t + 1 < NUM_TYPES,
-            other=2147483647,
-        )
+        if t + 1 < NUM_TYPES:
+            block_end = tl.load(meta_ptr + (t + 1) * META_COLS + 10)
+        else:
+            block_end = 2147483647
         if (pid_block >= block_start) & (pid_block < block_end):
             src_ptr = tl.load(meta_ptr + t * META_COLS + 0).to(
                 tl.pointer_type(tl.bfloat16)
@@ -654,6 +655,10 @@ def fused_conv_window_scatter_multi(
         )
     else:
         idx2, st2 = idx1, st1
+
+    # A masked-off scalar load still needs valid backing storage on Ascend.
+    if n1 == 0:
+        idx1, st1 = idx2, st2
 
     dst0, src0 = pairs[0]
     grid = (n1 + n2, dst0.shape[0], total_blocks)

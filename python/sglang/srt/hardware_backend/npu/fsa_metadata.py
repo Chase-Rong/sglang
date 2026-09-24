@@ -39,7 +39,11 @@ def _external_metadata_kernel(
     request = tl.minimum(request, BATCH - 1)
     length = tl.load(Lengths + request)
     end = tl.load(Cumulative + request)
-    start = tl.load(Cumulative + request - 1, request > 0, other=0)
+    # Ascend can load before applying a scalar mask; request 0 needs a valid
+    # address even though its predecessor is discarded.
+    previous = tl.maximum(request - 1, 0)
+    start = tl.load(Cumulative + previous)
+    start = tl.where(request > 0, start, 0)
     slot = tl.load(Slots + request)
     valid_row = valid_row & (slot > 0) & (slot < NUM_SLOTS) & (length > 0)
     safe_slot = tl.minimum(tl.maximum(slot, 0), NUM_SLOTS - 1)
