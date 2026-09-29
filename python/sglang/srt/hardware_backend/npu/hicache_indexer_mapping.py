@@ -229,21 +229,31 @@ class IndexerPageMapping:
             self._owners.clear()
 
 
+def get_indexer_mapping(allocator):
+    """Resolve the mapping owned by integrated backing or resident KV pages."""
+    allocator = getattr(allocator, "full_attn_allocator", allocator)
+    backing = getattr(allocator, "offload_backing", None)
+    if backing is not None:
+        mapping = getattr(backing.page_binding, "indexer_mapping", None)
+        if mapping is None and getattr(backing.hicache_pool.device_pool, "_kpool_use_compress", False):
+            raise RuntimeError("Compressed HiCache requires binding.indexer_mapping")
+        return mapping
+    get_kvcache = getattr(allocator, "get_kvcache", None)
+    if get_kvcache is None:
+        return None
+    pool = get_kvcache()
+    pool = getattr(pool, "full_kv_pool", pool)
+    return getattr(pool, "hicache_indexer_mapping", None)
+
+
 def maybe_update_indexer_mapping(
     batch, req_pool_indices_cpu, seq_lens_cpu, *, start_lens_cpu=None
 ):
-    """Scheduler hook for the compressed integrated-offload pool only."""
+    """Register logical pages after scheduler writes, for either HiCache mode."""
     allocator = batch.tree_cache.token_to_kv_pool_allocator
-    allocator = getattr(allocator, "full_attn_allocator", allocator)
-    backing = getattr(allocator, "offload_backing", None)
-    if backing is None:
-        return
-    pool = backing.hicache_pool.device_pool
-    if not getattr(pool, "_kpool_use_compress", False):
-        return
-    mapping = getattr(backing.page_binding, "indexer_mapping", None)
+    mapping = get_indexer_mapping(allocator)
     if mapping is None:
-        raise RuntimeError("Compressed HiCache requires binding.indexer_mapping")
+        return
     mapping.update_requests(
         batch.req_to_token_pool.req_to_token,
         req_pool_indices_cpu,

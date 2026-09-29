@@ -104,7 +104,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        if self.mtp_draft_device_pools:
+        # Ascend split buffers use kernel_ascend, not CUDA pointer arrays.
+        if self.mtp_draft_device_pools and self.layout != "page_first_kv_split":
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
             self.packed_device_data_ptrs = torch.cat(
                 [pool.data_ptrs for pool in device_pools]

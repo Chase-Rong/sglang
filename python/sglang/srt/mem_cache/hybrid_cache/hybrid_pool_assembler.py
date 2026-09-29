@@ -140,6 +140,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    npu_resident_hicache: bool = False,
 ):
     if getattr(kv_pool, "integrated_offload", False):
         _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
@@ -163,6 +164,18 @@ def build_kv_host_pool(
         ):
             raise ValueError("Integrated HiCache backing cannot change KV dimensions")
         return host_pool
+    if npu_resident_hicache and use_mla and _has_npu_compressed_indexer(kv_pool):
+        from sglang.srt.hardware_backend.npu.hicache_resident_pool import NpuResidentHiCachePool
+
+        _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
+        if override_kv_cache_dim is not None:
+            raise ValueError("Resident NPU HiCache keeps the device KV dimensions")
+        return NpuResidentHiCachePool(
+            kv_pool, get_memory().hicache_ratio,
+            get_memory().hicache_size if host_size is None else host_size,
+            page_size, allocator_type=_get_allocator_type(),
+            mtp_draft_device_pools=mtp_draft_device_pools, pool_label=pool_label,
+        )
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -206,7 +219,7 @@ def _validate_npu_hicache_parallel(kv_pool: Any, draft_pools: tuple) -> None:
         or getattr(kv_pool, "layer_shard_enabled", False)
     ):
         raise NotImplementedError("NPU integrated/indexer HiCache CP is unsupported")
-    if draft_pools:
+    if draft_pools and getattr(kv_pool, "integrated_offload", False):
         backing = getattr(kv_pool, "decode_host_backing", None)
         host = getattr(backing, "hicache_pool", None)
         binding = getattr(backing, "page_binding", None)
@@ -849,19 +862,17 @@ def build_hybrid_mamba_stack(
         for pool in params.mtp_draft_device_pools
     )
     if (
-        getattr(kv_pool, "integrated_offload", False)
+        _has_npu_compressed_indexer(kv_pool)
         and getattr(params.req_to_token_pool, "mamba_ckpt_pool", None) is not None
     ):
         raise NotImplementedError(
             "NPU integrated HiCache cannot use INT8 Mamba checkpoint slots as "
             "active KDA state slots"
         )
-    has_npu_indexer = getattr(kv_pool, "integrated_offload", False) and (
-        _has_npu_compressed_indexer(kv_pool)
-    )
+    has_npu_indexer = _has_npu_compressed_indexer(kv_pool)
     if has_npu_indexer:
         _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
-        if get_memory().hicache_size > 0:
+        if getattr(kv_pool, "integrated_offload", False) and get_memory().hicache_size > 0:
             raise ValueError(
                 "NPU compressed-indexer HiCache does not support --hicache-size: "
                 "the existing KV backing, compressed indexer and Mamba have separate "
@@ -878,6 +889,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        npu_resident_hicache=has_npu_indexer,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -888,7 +900,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool_cls = MambaPoolHost
     mamba_layout = get_memory().hicache_mem_layout
-    if getattr(kv_pool, "integrated_offload", False):
+    if has_npu_indexer:
         from sglang.srt.hardware_backend.npu.hicache_mamba_pool import (
             NpuMambaPoolHost,
         )

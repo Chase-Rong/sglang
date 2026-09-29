@@ -1594,17 +1594,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _build_loadback_plan(self, kv_xfer: PoolTransfer):
         """Prepare compressed destinations from the real FULL ancestor chain."""
-        allocator = self.token_to_kv_pool_allocator
-        allocator = getattr(allocator, "full_attn_allocator", allocator)
-        backing = getattr(allocator, "offload_backing", None)
-        if backing is None or not kv_xfer.host_indices.numel():
+        from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import get_indexer_mapping
+
+        if not kv_xfer.host_indices.numel():
             return None
-        mapping = getattr(backing.page_binding, "indexer_mapping", None)
+        mapping = get_indexer_mapping(self.token_to_kv_pool_allocator)
         if mapping is None:
-            if getattr(backing.hicache_pool.device_pool, "_kpool_use_compress", False):
-                raise RuntimeError(
-                    "Compressed HiCache requires binding.indexer_mapping"
-                )
             return None
         if not kv_xfer.nodes_to_load:
             raise ValueError("Indexer restore requires the FULL radix load-back chain")

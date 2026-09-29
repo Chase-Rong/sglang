@@ -48,6 +48,12 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         backing = getattr(self, "offload_backing", None)
         if backing is not None and page_ids:
             backing.page_binding.release_device_pages(torch.cat(page_ids))
+        elif page_ids:
+            from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import get_indexer_mapping
+
+            mapping = get_indexer_mapping(self)
+            if mapping is not None:
+                mapping.release_device_pages(torch.cat(page_ids))
         return super()._release_page_ids(*page_ids)
 
     def alloc_for_host_restore(self, host_indices):
@@ -71,6 +77,12 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         backing = getattr(self, "offload_backing", None)
         if backing is not None:
             backing.hicache_pool.clear()
+        else:
+            from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import get_indexer_mapping
+
+            mapping = get_indexer_mapping(self)
+            if mapping is not None:
+                mapping.clear()
         super().clear()
 
     def evict_to_free_tokens(self, tree_cache, num_tokens):
