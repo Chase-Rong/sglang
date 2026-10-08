@@ -104,6 +104,7 @@ def test_mtp_iteration_clears_batch_state():
     batch = _batch(reuse=False, carried="stale")
 
     with IndexTopKShareState.mtp_iteration(batch) as state:
+        assert batch.draft_sparse_plan_cache is None
         assert state is not None
         assert batch.reuse_dsa_topk_indices
         assert batch.spec_info.dsa_topk_indices is None
@@ -111,6 +112,22 @@ def test_mtp_iteration_clears_batch_state():
 
     assert not batch.reuse_dsa_topk_indices
     assert batch.spec_info.dsa_topk_indices is None
+
+
+def test_seeded_plan_scope_restores_on_exception_and_starts_fresh():
+    batch = _batch(reuse=False, carried="seed")
+    previous = {"outer": object()}
+    batch.draft_sparse_plan_cache = previous
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True):
+            first = batch.draft_sparse_plan_cache
+            first["layer"] = object()
+            raise RuntimeError("interrupted")
+    assert batch.draft_sparse_plan_cache is previous
+    batch.spec_info.dsa_topk_indices = "new-seed"
+    with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True):
+        assert batch.draft_sparse_plan_cache == {}
+        assert batch.draft_sparse_plan_cache is not first
 
 
 def test_mtp_iteration_clears_batch_state_on_exception():
@@ -141,11 +158,13 @@ def test_mtp_iteration_preserves_draft_extend_seed():
     batch = _batch(reuse=False, carried="extend-seed")
 
     with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True) as state:
+        assert batch.draft_sparse_plan_cache == {}
         assert state is not None
         assert batch.spec_info.dsa_topk_indices == "extend-seed"
         assert state.topk_indices == "extend-seed"
 
     assert not batch.reuse_dsa_topk_indices
+    assert batch.draft_sparse_plan_cache is None
     assert batch.spec_info.dsa_topk_indices is None
 
 

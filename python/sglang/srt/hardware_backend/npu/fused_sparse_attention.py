@@ -586,6 +586,7 @@ class FusedSparseAttentionState:
         request_slots,
         scale,
         query_positions=None,
+        draft_plan_cache=None,
     ):
         if q_nope.dim() != 3 or q_rope.shape[:2] != q_nope.shape[:2]:
             raise ValueError("fused query must have matching [T,heads,dim] components")
@@ -698,6 +699,7 @@ class FusedSparseAttentionState:
         membership_region = None
         if self.external_planner:
             from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+                DraftSparsePlanReuse,
                 materialize_layer_plan,
             )
 
@@ -726,7 +728,16 @@ class FusedSparseAttentionState:
                 cacheable = (topk_indices[:, 0] >= 0) & (
                     topk_indices[:, 0] < stable_prefix[:, None]
                 )
-            if layer_id == anchor or self.plan_versions.get(anchor) != (
+            reuse_key = (self, layer_id)
+            draft_reuse = (
+                draft_plan_cache.get(reuse_key)
+                if draft_plan_cache is not None and not self.mapped_host_plan
+                else None
+            )
+            if draft_reuse is not None:
+                selection_plan = draft_reuse.materialize(membership, physical_keys.shape)
+                slots = selection_plan.slots
+            elif layer_id == anchor or self.plan_versions.get(anchor) != (
                 self.forward_serial,
                 token_count,
             ):
@@ -752,7 +763,7 @@ class FusedSparseAttentionState:
                     membership_region = None
                 else:
                     membership = membership_region.tensor[:token_count]
-            else:
+            elif selection_plan is None:
                 selection_plan = materialize_layer_plan(
                     cache,
                     physical_keys,
@@ -760,6 +771,10 @@ class FusedSparseAttentionState:
                     membership,
                     cacheable_mask=cacheable,
                 )
+                if draft_plan_cache is not None:
+                    draft_reuse = DraftSparsePlanReuse(membership)
+                    draft_plan_cache[reuse_key] = draft_reuse
+                    selection_plan.draft_reuse = draft_reuse
         return FusedSparseAttentionInputs(
             query=(
                 q_nope if q_rope.shape[-1] == 0 else torch.cat((q_nope, q_rope), dim=-1)

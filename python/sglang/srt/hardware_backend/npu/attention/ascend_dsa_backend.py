@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolWritePlan,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils.nvtx_utils import profile_method, profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -383,18 +384,26 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
         return batch_size, 1
 
-    def _cache_seqlens(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        cache_seqlens = forward_batch.seq_lens[: forward_batch.batch_size].to(
-            torch.int32
-        )
+    def _cache_seqlens(
+        self, forward_batch: ForwardBatch, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+        offset = 0
         if forward_batch.forward_mode.is_target_verify():
-            cache_seqlens = cache_seqlens + self.speculative_num_draft_tokens
+            offset = self.speculative_num_draft_tokens
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            cache_seqlens = cache_seqlens + self.speculative_step_id + 1
-        return cache_seqlens
+            offset = self.speculative_step_id + 1
+        if out is not None:
+            if offset:
+                torch.add(seq_lens, offset, out=out)
+            else:
+                out.copy_(seq_lens)
+            return out
+        cache_seqlens = seq_lens.to(torch.int32)
+        return cache_seqlens + offset if offset else cache_seqlens
 
     def _cache_seqlens_cpu_max(self, forward_batch: ForwardBatch) -> int:
         """Return the effective maximum KV length from the existing CPU mirror."""
@@ -426,11 +435,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # do not change the row semantics here.
         max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[: forward_batch.batch_size],
-            :max_seq_len_k,
-        ]
+            :, : max_seq_len_k : self.page_size
+        ][forward_batch.req_pool_indices[: forward_batch.batch_size]]
         real_page_table_computed = (
-            (page_table_1[:, :: self.page_size] // self.page_size)
+            (page_table_1 // self.page_size)
             .to(torch.int32)
             .contiguous()
         )
@@ -587,6 +595,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             effective_n_per_batch=effective_n_per_batch,
         )
 
+    @profile_method("npu.dsa.replay_metadata")
     def _replay_dsa_metadata(self, forward_batch: ForwardBatch) -> None:
         """Update DSA metadata tensors in-place during graph replay."""
         metadata = self.forward_metadata
@@ -595,16 +604,18 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         bs = forward_batch.batch_size
 
         # 1. cache_seqlens_int32 — in-place copy
-        cache_seqlens = self._cache_seqlens(forward_batch)
+        expected_cache_shape = (bs,)
         if metadata.cache_seqlens_int32 is None or (
-            metadata.cache_seqlens_int32.shape != cache_seqlens.shape
+            metadata.cache_seqlens_int32.shape != expected_cache_shape
         ):
             raise RuntimeError(
                 "DSA graph replay cache_seqlens shape differs from capture: "
                 f"captured={getattr(metadata.cache_seqlens_int32, 'shape', None)}, "
-                f"replay={cache_seqlens.shape}, batch_size={bs}."
+                f"replay={expected_cache_shape}, batch_size={bs}."
             )
-        metadata.cache_seqlens_int32.copy_(cache_seqlens)
+        cache_seqlens = self._cache_seqlens(
+            forward_batch, out=metadata.cache_seqlens_int32
+        )
 
         # Query lengths are mode-dependent. In particular, regular draft decode
         # intentionally leaves ForwardBatch.extend_seq_lens unset and has one
@@ -614,10 +625,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # 2. real_page_table — recompute and in-place copy
         max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[:bs], :max_seq_len_k
-        ]
+            :, : max_seq_len_k : self.page_size
+        ][forward_batch.req_pool_indices[:bs]]
         new_real_page_table = (
-            (page_table_1[:, :: self.page_size] // self.page_size)
+            (page_table_1 // self.page_size)
             .to(torch.int32)
             .contiguous()
         )
@@ -640,10 +651,11 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             )
 
             backing = get_offload_backing(self.token_to_kv_pool)
-            metadata.host_page_table.zero_()
-            metadata.host_page_table[:n_rows, :n_cols].copy_(
-                backing.page_binding.host_table(new_real_page_table)
-            )
+            with profile_range("npu.dsa.host_page_table"):
+                metadata.host_page_table.zero_()
+                metadata.host_page_table[:n_rows, :n_cols].copy_(
+                    backing.page_binding.host_table(new_real_page_table)
+                )
 
         # 3. dsa_seqlens_expanded — update causal lengths for each query token
         needs_causal_expansion = (
@@ -722,18 +734,19 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                         effective_n_per_batch = effective_n_per_batch[
                             : forward_batch.batch_size
                         ]
-                update_kpool_write_plan_npu(
-                    metadata,
-                    write_start=write_start,
-                    req_pool_indices=forward_batch.req_pool_indices[:bs],
-                    real_page_table=metadata.real_page_table,
-                    pool_size=self.dsa_index_kpool,
-                    real_page_size=self.page_size,
-                    num_draft_tokens=num_draft_tokens,
-                    forward_mode=forward_mode,
-                    slots_per_page=self.page_size,
-                    effective_n_per_batch=effective_n_per_batch,
-                )
+                with profile_range("npu.dsa.kpool_write_plan"):
+                    update_kpool_write_plan_npu(
+                        metadata,
+                        write_start=write_start,
+                        req_pool_indices=forward_batch.req_pool_indices[:bs],
+                        real_page_table=metadata.real_page_table,
+                        pool_size=self.dsa_index_kpool,
+                        real_page_size=self.page_size,
+                        num_draft_tokens=num_draft_tokens,
+                        forward_mode=forward_mode,
+                        slots_per_page=self.page_size,
+                        effective_n_per_batch=effective_n_per_batch,
+                    )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         if self.fused_sparse_state is not None:

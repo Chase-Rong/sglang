@@ -13,6 +13,50 @@ class SparseSelectionPlan:
     slots: torch.Tensor
     miss_mask: torch.Tensor
     cacheable_mask: torch.Tensor | None = None
+    draft_reuse: "DraftSparsePlanReuse | None" = None
+    committed: bool = False
+
+
+class DraftSparsePlanReuse:
+    """Post-attention validity within one seeded Draft chain.
+
+    The caller guarantees fixed rows, selected page mappings and slot ownership.
+    Each graph replay must execute the first planner and publication again.
+    Initial mutable-tail entries stay misses for the entire chain.
+    """
+
+    def __init__(self, membership, control_offset=16384):
+        self.membership = membership
+        self.control_offset = control_offset
+        self.plan = None
+        self.template = None
+
+    def publish(self, plan):
+        if self.plan is not None:
+            raise RuntimeError("Draft plan was already published")
+        rows, topk = plan.slots.shape
+        valid = plan.physical_keys >= 0
+        stable = valid if plan.cacheable_mask is None else valid & plan.cacheable_mask
+        encoded = torch.where(stable, plan.slots + 1, -(plan.slots + 1))
+        encoded = encoded.masked_fill(~valid, 0).to(torch.int16)
+        self.template = torch.cat(
+            (encoded, self.membership[:rows, self.control_offset : self.control_offset + 8]),
+            dim=1,
+        )
+        self.plan = SparseSelectionPlan(
+            plan.physical_keys, plan.slots, valid & ~stable, stable, committed=True
+        )
+
+    def materialize(self, membership, shape):
+        if self.plan is None:
+            raise RuntimeError("Draft plan cannot be reused before attention commits")
+        if self.plan.slots.shape != shape:
+            raise ValueError("Draft plan row geometry changed inside shared chain")
+        rows, topk = shape
+        membership[:rows, self.control_offset - topk : self.control_offset + 8].copy_(
+            self.template
+        )
+        return self.plan
 
 
 class NativeSparsePlanner:
@@ -267,6 +311,8 @@ def commit_layer_plan(cache, plan):
     if isinstance(plan, MappedSelectionPlan):
         plan.commit()
         return
+    if plan.committed:
+        return
     rows = plan.slots.shape[0]
     applied = cache.applied_keys[:rows]
     valid = plan.physical_keys >= 0
@@ -275,6 +321,8 @@ def commit_layer_plan(cache, plan):
     if plan.cacheable_mask is not None:
         reusable_keys = reusable_keys.masked_fill(~plan.cacheable_mask, -1)
     cache.applied_keys_with_padding[:rows].scatter_(1, destinations, reusable_keys)
+    if plan.draft_reuse is not None:
+        plan.draft_reuse.publish(plan)
 
 
 def gather_selection_misses(inputs):

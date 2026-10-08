@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.nvtx_utils import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -510,6 +511,7 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
+    @profile_method("overlap.resolve_seq_lens_cpu")
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that

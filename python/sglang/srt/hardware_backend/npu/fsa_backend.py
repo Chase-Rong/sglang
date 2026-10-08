@@ -42,6 +42,11 @@ def initialize_fsa_backend(backend, model_runner):
     if backend.fused_sparse_mode not in ("fused", "reference"):
         raise ValueError("FSA mode must be fused or reference")
     config = model_runner.model_config.hf_text_config
+    backend.fused_sparse_draft_reuse = (
+        getattr(model_runner, "is_draft_worker", False)
+        and getattr(config, "model_type", "") in ("glm5_next", "glm5_next_text")
+        and getattr(config, "index_share_for_mtp_iteration", False)
+    )
     backend.fused_sparse_topk = (
         int(config.index_topk) + int(getattr(config, "index_kpool", 1)) - 1
     )
@@ -141,6 +146,15 @@ def forward_fsa(
         request_slots=forward_batch.req_pool_indices[: counts.numel()],
         scale=layer.scaling,
         query_positions=getattr(forward_batch, "positions", None),
+        draft_plan_cache=(
+            getattr(forward_batch, "draft_sparse_plan_cache", None)
+            if getattr(backend, "fused_sparse_draft_reuse", False)
+            and getattr(forward_batch, "reuse_dsa_topk_indices", False)
+            and forward_batch.forward_mode.is_decode()
+            and backing is not None
+            and backing.integrated
+            else None
+        ),
     )
     if backing is not None:
         latent_region, rope_region = backing.regions[local_layer]
