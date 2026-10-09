@@ -36,6 +36,7 @@ from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.utils.nvtx_utils import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -379,6 +380,7 @@ class CudaGraphBufferRegistry:
 
     # ---- per-iter ----------------------------------------------------------
 
+    @profile_method("graph.fill_input_buffers")
     def fill_from(
         self,
         forward_batch: ForwardBatch,

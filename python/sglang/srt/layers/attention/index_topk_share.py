@@ -75,6 +75,10 @@ class IndexTopKShareState:
             yield None
             return
         spec_info = forward_batch.spec_info
+        previous_plans = getattr(forward_batch, "draft_sparse_plan_cache", None)
+        forward_batch.draft_sparse_plan_cache = (
+            {} if keep_carry_seed and spec_info.dsa_topk_indices is not None else None
+        )
         forward_batch.reuse_dsa_topk_indices = True
         # Keep the draft-extend seed so step 0 reuses it; else recompute it.
         if not (keep_carry_seed and spec_info.dsa_topk_indices is not None):
@@ -82,5 +86,6 @@ class IndexTopKShareState:
         try:
             yield cls.from_mtp_carry(forward_batch)
         finally:
+            forward_batch.draft_sparse_plan_cache = previous_plans
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False

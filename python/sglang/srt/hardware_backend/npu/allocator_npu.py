@@ -31,6 +31,8 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.offload_backing.bind_hicache(getattr(kvcache, "full_kv_pool", kvcache))
 
     def _reserve_host_pages(self, pages):
+        if pages.numel() == 0:
+            return True
         backing = getattr(self, "offload_backing", None)
         return backing is None or backing.page_binding.ensure_pages(pages)
 
@@ -196,16 +198,18 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if not self._reserve_host_pages(self.free_pages[:num_new_pages]):
             return None
 
-        need_new_pages = (seq_lens % self.page_size == 1).int()
-        end_new_pages = torch.cumsum(need_new_pages, 0)
-        start_new_pages = end_new_pages - need_new_pages
         if num_new_pages == 0:
             out_indices = last_loc + 1
-        else:
-            start_new_pages = start_new_pages.clamp(max=num_new_pages - 1)
-            out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
-                start_new_pages
-            ] * self.page_size * need_new_pages
+            if self.debug_mode:
+                assert len(torch.unique(out_indices)) == len(out_indices)
+            return out_indices.int()
+
+        need_new_pages = (seq_lens % self.page_size == 1).int()
+        end_new_pages = torch.cumsum(need_new_pages, 0)
+        start_new_pages = (end_new_pages - need_new_pages).clamp(max=num_new_pages - 1)
+        out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
+            start_new_pages
+        ] * self.page_size * need_new_pages
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

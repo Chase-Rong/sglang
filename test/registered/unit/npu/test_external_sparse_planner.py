@@ -126,3 +126,33 @@ def test_mutable_tail_overrides_a_previously_cached_hit():
     mutable = torch.zeros_like(keys, dtype=torch.bool)
     assert PLANNER.materialize_layer_plan(cache, keys, slots, membership,
                                          cacheable_mask=mutable).miss_mask.all()
+
+
+def test_draft_reuse_publishes_after_commit_and_keeps_tail_misses():
+    cache, membership = layer_state()
+    keys = torch.tensor([[8, 9, 10, -1], [18, 19, 20, -1]])
+    slots = torch.tensor([[2, 4, 6, -1], [1, 3, 5, -1]])
+    stable = torch.tensor([[True, True, False, False]] * 2)
+    first = PLANNER.materialize_layer_plan(
+        cache, keys, slots, membership, cacheable_mask=stable
+    )
+    reuse = PLANNER.DraftSparsePlanReuse(membership)
+    first.draft_reuse = reuse
+    with pytest.raises(RuntimeError, match="before attention commits"):
+        reuse.materialize(membership, keys.shape)
+    PLANNER.commit_layer_plan(cache, first)
+    expected = PLANNER.materialize_layer_plan(
+        cache, keys, slots, membership, cacheable_mask=stable
+    )
+    expected_membership = membership.clone()
+    membership.fill_(-1)
+    repeated = reuse.materialize(membership, keys.shape)
+    torch.testing.assert_close(repeated.miss_mask, expected.miss_mask)
+    torch.testing.assert_close(membership[:, 16380:16392], expected_membership[:, 16380:16392])
+    assert repeated.committed
+    assert repeated.miss_mask.tolist() == [[False, False, True, False]] * 2
+    assert (cache.applied_keys.gather(1, slots.clamp(min=0))[:, 2] == -1).all()
+    with pytest.raises(ValueError, match="geometry"):
+        reuse.materialize(membership, (1, 4))
+    with pytest.raises(RuntimeError, match="already published"):
+        reuse.publish(first)
