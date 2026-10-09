@@ -1786,6 +1786,19 @@ class IndexerKPool(MultiPlatformOp):
 
         # Decode default path
         if (
+            envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
+            and not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import select_offloaded_topk
+
+            result = select_offloaded_topk(
+                get_attn_backend(), self, forward_batch, layer_id, query,
+                self._get_logits_head_gate_npu(x), metadata,
+            )
+            if result is None:
+                raise RuntimeError("LIM CopySFA is selected but the active attention backend is not initialized")
+            return result
+        if (
             forward_batch.forward_mode.is_decode_or_idle()
             and not use_triton
             and not use_native

@@ -21,8 +21,18 @@ class DecodeKvMemoryBudget:
     rows_per_request: int = 1
     prefill_layer_slots: int = 0
     host_token_capacity: int = 0
+    backend: str = "external_plan"
+    lim_source_tokens: int = 0
+    lim_runtime_instances: int = 1
 
     def __post_init__(self):
+        if self.backend not in ("external_plan", "lim_copy_sfa"):
+            raise ValueError("Unknown DSA offload backend")
+        if self.backend == "lim_copy_sfa" and (
+            self.lim_source_tokens <= 0 or self.rows_per_request > 6 or self.lim_runtime_instances <= 0
+            or self.rope_dim != 0 or self.topk != 2051
+        ):
+            raise ValueError("LIM budgeting requires NoPE2051, source capacity and <=6 routes")
         if (
             min(
                 self.layers,
@@ -83,6 +93,8 @@ class DecodeKvMemoryBudget:
         return max(requests, self.graph_rows) * self.rows_per_request
 
     def fixed_bytes(self, request_rows, page_size):
+        if self.backend == "lim_copy_sfa":
+            return self._lim_fixed_bytes(request_rows, page_size)
         rows = self.row_capacity(request_rows)
         if not 0 < rows <= 32767:
             raise ValueError("Decode request rows must fit the fused plan ABI")
@@ -105,6 +117,30 @@ class DecodeKvMemoryBudget:
         host = self.planner_groups * (rows * planner_host + scratch)
         staging = self.staging_bytes + 9 if self.staging_bytes else 0
         return host, device + self.shared_fence_bytes + staging
+
+    def _lim_fixed_bytes(self, request_rows, page_size):
+        if page_size != 128 or request_rows <= 0:
+            raise ValueError("LIM requires page128 and positive request capacity")
+        batch = max(request_rows, self.graph_rows)
+        owners = request_rows + 1
+        rows = batch * self.rows_per_request
+        capacity = max(self.selection_capacity(page_size),
+                       (self.rows_per_request * 2051 + 127) // 128 * 128)
+        if capacity > 12416:
+            raise ValueError("A5 LIM supports at most 12416 resident tokens")
+        source = (self.lim_source_tokens + 511) // 512 * 512
+        pools = source // 4
+        union_width = 1 << (self.rows_per_request * 2051 - 1).bit_length()
+        per_layer = (
+            owners * (source * 4 + capacity * (12 + 512 * 2) + 128)
+            + rows * (2051 * 8 + 16400 * 2 + 32 * 4)
+            + batch * union_width * 16
+        )
+        shared = (rows * (12 + 512 * 4 + 2051 * 4 + pools * 12 + pools // 128 * 4)
+                  + 8 * 4 * pools * 4 + 64 * 3 * 128 * 576 * 2 + owners * 8)
+        staging = self.staging_bytes + 9 if self.staging_bytes else 0
+        return 0, (self.layers * per_layer + self.lim_runtime_instances * shared
+                   + self.shared_fence_bytes + staging)
 
     def required_bytes(self, tokens, request_rows, page_size):
         if page_size <= 0 or tokens < 0 or tokens % page_size:
@@ -308,4 +344,8 @@ def budget_from_config(kvc, layers):
             if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
             else 0
         ),
+        backend=envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get(),
+        lim_source_tokens=(model.context_len + 128
+                           if envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa" else 0),
+        lim_runtime_instances=1 + int(draft_layers > 0),
     )

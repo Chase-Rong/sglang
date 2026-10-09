@@ -33,9 +33,21 @@ def initialize_fsa_backend(backend, model_runner):
     from sglang.srt.runtime_context import get_exec, get_spec
 
     backend.fused_sparse_state = None
+    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import (
+        resolve_dsa_offload_backend,
+    )
+
+    offload_backend = resolve_dsa_offload_backend(
+        envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get()
+    )
     if not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
+        if offload_backend != "external_plan":
+            raise ValueError(
+                "lim_copy_sfa requires fused sparse attention to be enabled"
+            )
         return
-    native_ops()
+    if offload_backend == "external_plan":
+        native_ops()
     if backend.kv_lora_rank != 512 or backend.qk_rope_head_dim not in (0, 64):
         raise ValueError("FSA requires absorbed MLA latent=512 and RoPE=0 or 64")
     backend.fused_sparse_mode = envs.SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE.get()
@@ -76,20 +88,59 @@ def initialize_fsa_backend(backend, model_runner):
         ) * sparse_mtp_rows(
             model_runner.spec_algorithm, get_spec(), model_runner.model_config
         )
-        state = FusedSparseAttentionState(
-            backend.device,
-            backend.req_to_token_pool,
-            external_planner=True,
-            resident_capacity=capacity,
-            layer_anchors=anchors,
-            row_capacity=row_capacity,
-            mutable_tail_tokens=sparse_mtp_tail(
+        if offload_backend == "lim_copy_sfa":
+            from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import (
+                LimCopySfaState,
+            )
+
+            routes = sparse_mtp_rows(
                 model_runner.spec_algorithm, get_spec(), model_runner.model_config
-            ),
-        )
+            )
+            if (
+                not envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+                or backend.qk_rope_head_dim != 0
+                or backend.page_size != 128
+                or int(getattr(config, "index_kpool", 1)) != 4
+                or backend.fused_sparse_mode != "fused"
+            ):
+                raise ValueError(
+                    "lim_copy_sfa requires GLM5Next NoPE KPool4 integrated offload"
+                )
+            source_tokens = (
+                (model_runner.model_config.context_len + 128 + 511) // 512 * 512
+            )
+            capacity = max(capacity, (routes * 2051 + 127) // 128 * 128)
+            state = LimCopySfaState(
+                backend.device,
+                backend.req_to_token_pool,
+                source_tokens=source_tokens,
+                routes=routes,
+                capacity=capacity,
+                batch_capacity=max(backend.req_to_token_pool.size, graph_requests),
+                layer_anchors=anchors,
+                mutable_tail=sparse_mtp_tail(
+                    model_runner.spec_algorithm, get_spec(), model_runner.model_config
+                ),
+            )
+            for layer_id in layer_ids:
+                state.layer(layer_id)
+        else:
+            state = FusedSparseAttentionState(
+                backend.device,
+                backend.req_to_token_pool,
+                external_planner=True,
+                resident_capacity=capacity,
+                layer_anchors=anchors,
+                row_capacity=row_capacity,
+                mutable_tail_tokens=sparse_mtp_tail(
+                    model_runner.spec_algorithm, get_spec(), model_runner.model_config
+                ),
+            )
         owner.fsa_runtime_state = state
     elif state.pool is not backend.req_to_token_pool:
         raise ValueError("FSA state belongs to a different request pool")
+    if getattr(state, "backend_name", "external_plan") != offload_backend:
+        raise ValueError("DSA offload backend cannot change after state allocation")
     backend.fused_sparse_state = state
 
 
@@ -133,6 +184,18 @@ def forward_fsa(
         full_table = metadata.host_page_table
         if full_table is None:
             raise RuntimeError("Integrated FSA requires the HiCache Host page table")
+    if getattr(backend.fused_sparse_state, "backend_name", None) == "lim_copy_sfa":
+        if backing is None or not backing.integrated:
+            raise RuntimeError("LIM CopySFA requires integrated Host KV backing")
+        return backend.fused_sparse_state.forward(
+            backend,
+            q,
+            layer,
+            forward_batch,
+            topk_indices,
+            full_kv,
+            backing.regions[local_layer][0],
+        )
     inputs = backend.fused_sparse_state.build_inputs(
         layer_id=layer.layer_id,
         q_nope=q,
