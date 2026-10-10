@@ -391,16 +391,30 @@ def _commit(
     ROUTES: tl.constexpr,
     MUTABLE: tl.constexpr,
     BLOCK: tl.constexpr,
+    counts=None,
 ):
     request = tl.program_id(0)
     owner = tl.load(requests + request)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid_count = UNION
+    if counts is not None:
+        valid_count = tl.load(
+            counts + owner * 16 + 3, mask=(owner > 0) & (owner < REQUEST_CAP), other=0
+        )
     selected = tl.load(
-        slots + request * UNION + offsets, mask=offsets < UNION, other=-1
+        slots + request * UNION + offsets,
+        mask=(offsets < UNION) & (offsets < valid_count),
+        other=-1,
     )
-    value = tl.load(keys + request * UNION + offsets, mask=offsets < UNION, other=-1)
+    value = tl.load(
+        keys + request * UNION + offsets,
+        mask=(offsets < UNION) & (offsets < valid_count),
+        other=-1,
+    )
     source = tl.load(
-        logical + request * UNION + offsets, mask=offsets < UNION, other=-1
+        logical + request * UNION + offsets,
+        mask=(offsets < UNION) & (offsets < valid_count),
+        other=-1,
     )
     start = tl.load(ends + request - 1, mask=request > 0, other=0)
     end = tl.load(ends + request)

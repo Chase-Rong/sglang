@@ -28,6 +28,7 @@
 #include "../common/buffers_policy.h"
 #include "../common/buffer_manager.h"
 #include "../common/buffer.h"
+#include "../../lim_schedule.h"
 
 using namespace AscendC;
 using namespace FaVectorApi;
@@ -93,8 +94,15 @@ public:
     using mm2ResPos = Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>;
     __aicore__ inline void ProcessVec2(mm2ResPos &bmm2ResBuf, RunInfo &runInfo,
         ConstInfo &constInfo);
+    __aicore__ inline void CompleteMissPrefetch();
+    __aicore__ inline void SubmitMissPrefetch(const RunInfo &runInfo, ConstInfo &constInfo);
 
 private:
+    __aicore__ inline void PrepareMissOwners(uint32_t batch, uint32_t query);
+    __aicore__ inline bool OwnsMissSlot(uint32_t slot)
+    {
+        return (earlierMissSlots[slot / 32] & (1U << (slot % 32))) == 0;
+    }
     __aicore__ inline void ProcessSparseKv(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
         Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
         const RunInfo &runInfo, ConstInfo &constInfo, int32_t startPos);
@@ -171,6 +179,7 @@ private:
     TBuf<> commonTBuf; // Shared reusable space
     TBuf<> selectionPlanTBuf;
     TBuf<> rowMetadataTBuf;
+    TBuf<> missPrefetchTBuf;
     TQue<QuePosition::VECOUT, 1> stage1OutQue[2]; // Two entries allow ping-pong buffering
     TBuf<> stage0OutBuf[2];
     TBuf<> stage2OutBuf;
@@ -191,6 +200,8 @@ private:
     TEventID vToSInvalid;
     TEventID sToVInvalid;
     TEventID mte3ToMte2[2];
+    TEventID prefetchReadEvent;
+    TEventID prefetchWriteEvent;
 
     bool isSinks = false;
     T negativeFloatScalar;
@@ -210,6 +221,13 @@ private:
     uint32_t gatherRows = 16;
     bool selectionOrderActive = false;
     int64_t selectionChunkStart = 0;
+    uint32_t prefetchedUntil = 0;
+    uint32_t pendingPrefetchRows = 0;
+    uint32_t pendingPrefetchColumns[4];
+    int64_t pendingPrefetchDestinations[4];
+    uint32_t earlierMissSlots[388] = {};
+    int32_t ownerBatch = -1;
+    int32_t ownerQuery = -1;
 
     static constexpr int16_t SELECTION_EXTERNAL_PLAN_READY_MARKER = 0x5A45;
     static constexpr int16_t SELECTION_DIRECT_LAYOUT_MARKER = 0x5A44;
@@ -384,16 +402,16 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::PrepareExternalSelectionPlan(
         selectionDataRow = control.GetValue(4);
         selectionDirectRowStride = control.GetValue(6);
         selectionBodyMisses = static_cast<uint16_t>(control.GetValue(10));
+        prefetchedUntil = 0;
         cachedSelectionRow = logicalSelectionRow;
+        PrepareMissOwners(runInfo.boIdx, logicalSelectionRow);
         selectionKvActualSeqGm.SetValue(logicalSelectionRow, 2051);
     }
     int64_t sourceStart = runInfo.s2LoopCount * 128;
     bool reordered = runInfo.s2LoopLimit >= 16 && selectionBodyMisses > 0 && selectionBodyMisses < 2048;
     selectionOrderActive = reordered && runInfo.s2LoopCount < 16;
     if (selectionOrderActive) {
-        int64_t phase = (runInfo.boIdx + logicalSelectionRow) % 3;
-        int64_t group = (7 - phase - runInfo.s2LoopCount / 4) % 4;
-        sourceStart = (group * 4 + runInfo.s2LoopCount % 4) * 128;
+        sourceStart = SglLimSchedule::GatherIndex(runInfo.boIdx, sourceStart);
         DataCopyPad(order.template ReinterpretCast<int16_t>(), selectionMembershipMapGm[membershipBase + 4096 + sourceStart],
             DataCopyExtParams{1, static_cast<uint32_t>(runInfo.s2RealSize * 2), 0, 0, 0},
             DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
@@ -499,11 +517,24 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::CopyOutSelectionMisses(
         }
         int32_t destinationSlot = -static_cast<int32_t>(planValue) - 1;
         int64_t selectionTokenOffset = GetSelectionTokenOffset(selectionRow, destinationSlot);
-        if (selectionTokenOffset < 0) {
+        if (selectionTokenOffset < 0 || !OwnsMissSlot(destinationSlot)) {
             continue;
+        }
+        kvParams.blockCount = 1;
+        kvParams.srcStride = 0;
+        kvParams.dstStride = 0;
+        if (row + 1 < dealRow) {
+            int16_t nextPlan = compactPlanLocal.GetValue(row + 1);
+            int32_t nextSlot = -static_cast<int32_t>(nextPlan) - 1;
+            if (nextPlan < 0 && nextSlot > destinationSlot && OwnsMissSlot(nextSlot)) {
+                kvParams.blockCount = 2;
+                kvParams.srcStride = (576 - constInfo.dSizeNope) * sizeof(KV_T) / 32;
+                kvParams.dstStride = (nextSlot - destinationSlot - 1) * constInfo.dSizeNope * sizeof(KV_T);
+            }
         }
         DataCopyPad(selectionKvCacheGm[selectionTokenOffset * constInfo.dSizeNope],
             kvInUb[row * 576], kvParams);
+        row += kvParams.blockCount - 1;
     }
 }
 
@@ -658,6 +689,7 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
     Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
     const RunInfo &runInfo, ConstInfo &constInfo, int32_t startPos)
 {
+    CompleteMissPrefetch();
     auto plan = selectionPlanTBuf.template Get<int16_t>()[SELECTION_PLAN_LOCAL_OFFSET];
     int64_t logicalRow = -1;
     PrepareExternalSelectionPlan(runInfo, constInfo, plan, logicalRow);
@@ -828,6 +860,83 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::CopyPlannedKvWindow(
     }
     selectionWindowHasMiss = hasMiss;
     return true;
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void
+CopySparseAttentionVectorService<TEMPLATE_ARGS>::PrepareMissOwners(uint32_t batch, uint32_t query)
+{
+    int32_t begin = batch == 0 ? 0 : cuSeqlensQGm.GetValue(batch - 1);
+    if (ownerBatch != batch || ownerQuery < begin || ownerQuery > query) {
+        for (uint32_t word = 0; word < 388; ++word) earlierMissSlots[word] = 0;
+        ownerQuery = begin;
+    }
+    for (int32_t previous = ownerQuery; previous < query; ++previous) {
+        uint64_t base = static_cast<uint64_t>(previous) * selectionMembershipStride + 14333;
+        for (uint32_t column = 0; column < 2051; ++column) {
+            int16_t plan = selectionMembershipMapGm.GetValue(base + column);
+            if (plan >= 0) continue;
+            uint32_t slot = -static_cast<int32_t>(plan) - 1;
+            if (slot < selectionDirectRowStride) earlierMissSlots[slot / 32] |= 1U << (slot % 32);
+        }
+    }
+    ownerBatch = batch;
+    ownerQuery = query;
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void
+CopySparseAttentionVectorService<TEMPLATE_ARGS>::SubmitMissPrefetch(const RunInfo &runInfo, ConstInfo &constInfo)
+{
+    if (!externalSelectionPlanActive || selectionBodyMisses == 0 || selectionBodyMisses > 512 ||
+        runInfo.s2LoopCount / 4 >= 3 - runInfo.boIdx % 3) return;
+    auto rowIds = rowMetadataTBuf.template Get<int32_t>();
+    auto rowPlan = rowIds[ROW_METADATA_ELEMENTS].template ReinterpretCast<int16_t>();
+    auto order = missPrefetchTBuf.template Get<int16_t>();
+    uint32_t count = selectionBodyMisses - prefetchedUntil;
+    if (count == 0) return;
+    if (count > 128) count = 128;
+    DataCopyPad(order, selectionMembershipMapGm[cachedSelectionRow * selectionMembershipStride + 4096 + prefetchedUntil],
+        DataCopyExtParams{1, count * 2, 0, 0, 0}, DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+    SetFlag<HardEvent::MTE2_S>(mte2ToSPlan);
+    WaitFlag<HardEvent::MTE2_S>(mte2ToSPlan);
+    int32_t columns[4];
+    uint32_t scan = 0;
+    while (scan < count && pendingPrefetchRows < 4) {
+        uint32_t index = prefetchedUntil + scan;
+        uint32_t column = static_cast<uint16_t>(order.GetValue(scan++));
+        if ((index % 128) / 64 != constInfo.subBlockIdx || rowPlan.GetValue(column) >= 0) continue;
+        if (!OwnsMissSlot(-static_cast<int32_t>(rowPlan.GetValue(column)) - 1)) continue;
+        columns[pendingPrefetchRows++] = column;
+    }
+    prefetchedUntil += scan;
+    auto incoming = missPrefetchTBuf.template Get<KV_T>();
+    for (uint32_t index = 0; index < pendingPrefetchRows; ++index) {
+        uint32_t column = columns[index];
+        int32_t source = rowIds.GetValue(column);
+        int32_t slot = -static_cast<int32_t>(rowPlan.GetValue(column)) - 1;
+        pendingPrefetchColumns[index] = column;
+        pendingPrefetchDestinations[index] = GetSelectionTokenOffset(selectionDataRow, slot) * 512;
+        int64_t address = GetkeyOffset(source, runInfo, constInfo);
+        DataCopy(incoming[index * 512], keyGm[address * 512], 512);
+    }
+    if (pendingPrefetchRows) SetFlag<HardEvent::MTE2_MTE3>(prefetchReadEvent);
+}
+
+TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void
+CopySparseAttentionVectorService<TEMPLATE_ARGS>::CompleteMissPrefetch()
+{
+    if (pendingPrefetchRows == 0) return;
+    WaitFlag<HardEvent::MTE2_MTE3>(prefetchReadEvent);
+    auto incoming = missPrefetchTBuf.template Get<KV_T>();
+    for (uint32_t index = 0; index < pendingPrefetchRows; ++index)
+        DataCopy(selectionKvCacheGm[pendingPrefetchDestinations[index]], incoming[index * 512], 512);
+    SetFlag<HardEvent::MTE3_MTE2>(prefetchWriteEvent);
+    WaitFlag<HardEvent::MTE3_MTE2>(prefetchWriteEvent);
+    auto rowPlan = rowMetadataTBuf.template Get<int32_t>()[ROW_METADATA_ELEMENTS].template ReinterpretCast<int16_t>();
+    for (uint32_t index = 0; index < pendingPrefetchRows; ++index) {
+        uint32_t column = pendingPrefetchColumns[index];
+        rowPlan.SetValue(column, -rowPlan.GetValue(column));
+    }
+    pendingPrefetchRows = 0;
 }
 
 TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService<TEMPLATE_ARGS>::ProcessVec1(
@@ -1134,6 +1243,7 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pip
     tPipe->InitBuffer(commonTBuf, 512); // Allocate 512 bytes for commonTBuf
     tPipe->InitBuffer(selectionPlanTBuf, 1024);
     tPipe->InitBuffer(rowMetadataTBuf, ROW_METADATA_BYTES);
+    tPipe->InitBuffer(missPrefetchTBuf, 4 * 512 * sizeof(KV_T));
     tPipe->InitBuffer(lseBuf, 512); // Allocate 512 bytes for lseBuf
     lseUb = this->lseBuf.template Get<float>();
 
@@ -1161,6 +1271,8 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pip
     SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[1]);
     mte2ToMte3[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
     mte2ToMte3[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
+    prefetchReadEvent = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
+    prefetchWriteEvent = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
     vToMte2Invalid = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
     vToSInvalid = GetTPipePtr()->AllocEventID<HardEvent::V_S>();
     sToVInvalid = GetTPipePtr()->AllocEventID<HardEvent::S_V>();

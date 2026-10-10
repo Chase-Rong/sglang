@@ -41,8 +41,17 @@ ascendc_library(sgl_lim_copy_kernel STATIC op_kernel/lim_copy_sfa.cpp)
 ascendc_compile_options(sgl_lim_copy_kernel PRIVATE --cce-auto-sync=off
     "SHELL:-mllvm -cce-vf-remove-membar=false" "SHELL:-mllvm -cce-aicore-hoist-movemask=false")
 add_library(sgl_lim_copy_sfa SHARED registration.cpp manage_registration.cpp fused_registration.cpp copy_registration.cpp)
+set(LIM_CONFIGURED_DIR "${CMAKE_CURRENT_BINARY_DIR}/configured")
+add_custom_command(
+    OUTPUT "${LIM_CONFIGURED_DIR}/configured_indexer.cpp" "${LIM_CONFIGURED_DIR}/configured_indexer.h"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/prepare_configured_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}" "${LIM_CONFIGURED_DIR}"
+    DEPENDS sgl_lim_indexer_kernel "${CMAKE_CURRENT_SOURCE_DIR}/prepare_configured_launch.py"
+    VERBATIM)
+target_sources(sgl_lim_copy_sfa PRIVATE "${LIM_CONFIGURED_DIR}/configured_indexer.cpp")
 target_compile_definitions(sgl_lim_copy_sfa PRIVATE _GLIBCXX_USE_CXX11_ABI=${LIM_ABI})
 target_include_directories(sgl_lim_copy_sfa PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${LIM_CONFIGURED_DIR}"
     "${LIM_TORCH_NPU}/include" "${LIM_TORCH_NPU}/include/third_party/acl/inc"
     "${ASCEND_CANN_PACKAGE_PATH}/include" ${Python3_INCLUDE_DIRS})
 target_link_directories(sgl_lim_copy_sfa PRIVATE "${LIM_TORCH_NPU}/lib" "${ASCEND_CANN_PACKAGE_PATH}/lib64")

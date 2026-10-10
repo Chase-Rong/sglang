@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "lim_classify.h"
 
 namespace SglLim {
 using namespace AscendC;
@@ -67,37 +68,27 @@ public:
         uint32_t mutablePresence = 0;
         uint32_t bodyMisses = 0;
         uint32_t bodyHits = 0;
+        SetFlag<HardEvent::S_V>(EVENT_ID7);
+        WaitFlag<HardEvent::S_V>(EVENT_ID7);
+        asc_vf_call<ClassifyPooledSelection>(dim3(256),
+            (__ubuf__ const uint32_t *)pools.GetPhyAddr(), (__ubuf__ int32_t *)tokenLocal.GetPhyAddr(),
+            (__ubuf__ int32_t *)slotLocal.GetPhyAddr(), (__ubuf__ int16_t *)planLocal.GetPhyAddr(),
+            (__gm__ const int32_t *)tableGm.GetPhyAddr(), (__gm__ const int32_t *)mappingGm.GetPhyAddr(),
+            (__gm__ const int64_t *)physicalGm.GetPhyAddr(), static_cast<uint64_t>(request) * tableColumns,
+            static_cast<uint64_t>(active ? owner : 0) * sourceCount,
+            static_cast<uint64_t>(active ? owner : 0) * residentCount, hostSize, sourceCount,
+            residentCount, tableColumns, length, tailSize, active);
         SetFlag<HardEvent::V_S>(EVENT_ID7);
         WaitFlag<HardEvent::V_S>(EVENT_ID7);
         for (uint32_t column = 0; column < 2051; ++column) {
-            int32_t token = -1;
-            if (active) {
-                if (length <= 2048) token = column;
-                else if (column >= 2048) token = length / 4 * 4 + column - 2048;
-                else {
-                    int32_t pool = static_cast<int32_t>(pools.GetValue(column / 4));
-                    if (pool >= 0 && pool < length / 4) token = pool * 4 + column % 4;
-                }
-            }
-            int64_t address = -1;
-            if (token >= 0 && token < length && token < sourceCount && token / 128 < tableColumns) {
-                int32_t page = tableGm.GetValue(static_cast<uint64_t>(request) * tableColumns + token / 128);
-                if (page >= 0) address = static_cast<int64_t>(page) * 128 + token % 128;
-                if (address >= hostSize) address = -1;
-            }
-            int32_t slot = address >= 0 ? mappingGm.GetValue(owner * sourceCount + token) : -1;
-            bool valid = slot >= 0 && slot < residentCount;
-            if (address >= 0 && !valid) ready = false;
-            bool hit = valid && physicalGm.GetValue(owner * residentCount + slot) == address &&
-                token < length - static_cast<int32_t>(tailSize);
+            int32_t token = tokenLocal.GetValue(column);
+            int16_t plan = planLocal.GetValue(column);
+            if (token >= 0 && plan == 0) ready = false;
             int32_t tailOffset = token - length + static_cast<int32_t>(tailSize);
-            if (address >= 0 && tailOffset >= 0 && tailOffset < 32)
+            if (token >= 0 && tailOffset >= 0 && tailOffset < 32)
                 mutablePresence |= 1U << tailOffset;
-            tokenLocal.SetValue(column, address >= 0 ? token : -1);
-            slotLocal.SetValue(column, valid ? slot : -1);
-            planLocal.SetValue(column, valid ? (hit ? slot + 1 : -slot - 1) : 0);
-            if (valid && !hit) missLocal.SetValue(misses++, column);
-            if (column < 2048 && valid && !hit) ++bodyMisses;
+            if (plan < 0) missLocal.SetValue(misses++, column);
+            if (column < 2048 && plan < 0) ++bodyMisses;
         }
         if (bodyMisses > 0 && bodyMisses < 2048)
             for (uint32_t column = 0; column < 2048; ++column)
