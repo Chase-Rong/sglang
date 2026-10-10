@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "../lim_schedule.h"
 
 namespace SglCopy {
 using namespace AscendC;
@@ -15,7 +16,8 @@ __aicore__ inline uint32_t BatchWork(GM_ADDR requests, GM_ADDR state,
     for (uint32_t request = 0; request < batch; ++request) {
         int64_t owner = requestsGm.GetValue(request);
         if (owner <= 0 || owner >= requestCapacity) continue;
-        if (stateGm.GetValue(owner * 16 + 2) != 0) work |= 1;
+        if (stateGm.GetValue(owner * 16 + 2) != 0 ||
+            SglLimSchedule::NeedsUnionCopy(stateGm.GetValue(owner * 16 + 3))) work |= 1;
         if (stateGm.GetValue(owner * 16 + 3) > 0) work |= 2;
     }
     return work;
@@ -47,7 +49,7 @@ __aicore__ inline void Fill(GM_ADDR host, GM_ADDR resident, GM_ADDR requests,
         uint32_t flatBase = 0;
         for (uint32_t request = 0; request < batch; ++request) {
             int64_t owner = requestsGm.GetValue(request);
-            if (owner <= 0 || owner >= requestCapacity || stateGm.GetValue(owner * 16 + 2) == 0) continue;
+            if (owner <= 0 || owner >= requestCapacity) continue;
             int64_t count = stateGm.GetValue(owner * 16 + 3);
             if (count < 0 || count > unionWidth) continue;
             uint32_t first = (GetBlockIdx() + coreCount - flatBase % coreCount) % coreCount;
@@ -76,6 +78,7 @@ __aicore__ inline void Fill(GM_ADDR host, GM_ADDR resident, GM_ADDR requests,
                     int16_t value = planGm.GetValue(offset);
                     if (value < 0) planGm.SetValue(offset, -value);
                 }
+                planGm.SetValue(static_cast<uint64_t>(row) * 16400 + 16394, 0);
             }
         }
         if (pending) {

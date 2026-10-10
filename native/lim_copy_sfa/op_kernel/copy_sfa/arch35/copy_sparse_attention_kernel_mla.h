@@ -593,6 +593,7 @@ __aicore__ inline void CopySparseAttentionKernelMla<CubeBlockType, VecBlockType>
                     } else {
                         this->vecBlock.ProcessVec0(this->l1RightBuffers.Get(), v0ResGmBuffers.Get(),
                             runInfo1, this->constInfo, 0);
+                        this->vecBlock.SubmitMissPrefetch(runInfo1, this->constInfo);
                     }
                 } else {
                     if ASCEND_IS_AIV {
@@ -629,6 +630,7 @@ __aicore__ inline void CopySparseAttentionKernelMla<CubeBlockType, VecBlockType>
         gS1StartIdx = 0;
     }
     if ASCEND_IS_AIV {
+        this->vecBlock.CompleteMissPrefetch();
         if constexpr (IS_SPLIT_G) {
             for (int64_t loopCnt = 0; loopCnt < maxS2LoopCnt; loopCnt++) {
                 CrossCoreSetFlag<0, PIPE_MTE3>(15);

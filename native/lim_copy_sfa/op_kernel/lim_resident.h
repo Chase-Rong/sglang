@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "lim_schedule.h"
 
 namespace SglLim {
 using namespace AscendC;
@@ -48,12 +49,11 @@ public:
         pipe.InitBuffer(unionBuffer, unionSize * 4);
         pipe.InitBuffer(residentBuffer, capacity * 4);
         pipe.InitBuffer(heapBuffer, capacity * 4);
-        pipe.InitBuffer(priorityBuffer, capacity * 4);
         pipe.InitBuffer(rowBuffer, 2080 * 16);
         unionLocal = unionBuffer.Get<int32_t>();
         residentLocal = residentBuffer.Get<int32_t>();
         heapLocal = heapBuffer.Get<int32_t>();
-        priorityLocal = priorityBuffer.Get<float>();
+        victimLocal = residentLocal;
         rowIds = rowBuffer.Get<int32_t>();
         rowSlots = rowIds[2080];
         rowPlan = rowIds[4160].ReinterpretCast<int16_t>();
@@ -73,13 +73,9 @@ private:
         int64_t owner = requestsGm.GetValue(request);
         if (owner > 0 && owner < requestCount) stateGm.SetValue(owner * 16 + 3, unique);
         LocalTensor<int64_t> rowPhysical = rowPlan.ReinterpretCast<int64_t>();
-        for (uint32_t base = 0; base < unionSize; base += 1024) {
-            Duplicate(rowIds, static_cast<int32_t>(-1), 1024);
-            Duplicate(rowSlots, static_cast<int32_t>(-1), 1024);
-            Duplicate(rowPlan.ReinterpretCast<int32_t>(), static_cast<int32_t>(-1), 2048);
-            SetFlag<HardEvent::V_S>(EVENT_ID7);
-            WaitFlag<HardEvent::V_S>(EVENT_ID7);
-            for (uint32_t local = 0; local < 1024 && base + local < unique; ++local) {
+        for (uint32_t base = 0; base < unique; base += 1024) {
+            uint32_t count = unique - base < 1024 ? unique - base : 1024;
+            for (uint32_t local = 0; local < count; ++local) {
                 int32_t token = unionLocal.GetValue(base + local);
                 int32_t slot = mappingGm.GetValue(mapBase + token);
                 int32_t page = tableGm.GetValue(static_cast<uint64_t>(request) * tableColumns + token / 128);
@@ -90,11 +86,11 @@ private:
             SetFlag<HardEvent::S_MTE3>(EVENT_ID7);
             WaitFlag<HardEvent::S_MTE3>(EVENT_ID7);
             uint64_t offset = static_cast<uint64_t>(request) * unionSize + base;
-            DataCopyPad(unionSourcesGm[offset], rowIds, {1, 4096, 0, 0});
-            DataCopyPad(unionSlotsGm[offset], rowSlots, {1, 4096, 0, 0});
-            DataCopyPad(unionPhysicalGm[offset], rowPhysical, {1, 8192, 0, 0});
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID7);
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID7);
+            DataCopyPad(unionSourcesGm[offset], rowIds, DataCopyExtParams{1, count * 4, 0, 0, 0});
+            DataCopyPad(unionSlotsGm[offset], rowSlots, DataCopyExtParams{1, count * 4, 0, 0, 0});
+            DataCopyPad(unionPhysicalGm[offset], rowPhysical, DataCopyExtParams{1, count * 8, 0, 0, 0});
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID7);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID7);
         }
     }
 
@@ -212,104 +208,6 @@ private:
         return unique;
     }
 
-    __aicore__ inline bool Less(uint32_t left, uint32_t right)
-    {
-        float leftScore = priorityLocal.GetValue(left);
-        float rightScore = priorityLocal.GetValue(right);
-        return leftScore < rightScore || (leftScore == rightScore && left < right);
-    }
-
-    __aicore__ inline void SiftVictim(uint32_t root, uint32_t count)
-    {
-        int32_t slot = heapLocal.GetValue(root);
-        for (uint32_t child = root * 2 + 1; child < count; child = root * 2 + 1) {
-            if (child + 1 < count && Less(heapLocal.GetValue(child + 1), heapLocal.GetValue(child))) ++child;
-            int32_t next = heapLocal.GetValue(child);
-            if (!Less(next, slot)) break;
-            heapLocal.SetValue(root, next);
-            root = child;
-        }
-        heapLocal.SetValue(root, slot);
-    }
-
-    __aicore__ inline bool SortVictims(uint32_t count)
-    {
-        auto keys = rowIds.ReinterpretCast<float>();
-        auto indices = rowIds[1024].ReinterpretCast<uint32_t>();
-        auto pairs = rowIds[2048].ReinterpretCast<float>();
-        auto scratch = rowIds[4096].ReinterpretCast<float>();
-        union FloatBits { uint32_t bits; float value; } negativeInfinity;
-        negativeInfinity.bits = 0xFF800000U;
-        for (uint32_t index = 0; index < count; ++index) {
-            float score = priorityLocal.GetValue(heapLocal.GetValue(index));
-            if (score != negativeInfinity.value && !(score > -1.0e30F && score < 1.0e30F)) return false;
-        }
-        for (uint32_t base = 0; base < count; base += 1024) {
-            uint32_t valid = count - base < 1024 ? count - base : 1024;
-            uint32_t padded = (valid + 31) / 32 * 32;
-            bool equal = true;
-            float first = priorityLocal.GetValue(heapLocal.GetValue(base));
-            for (uint32_t index = 0; index < padded; ++index) {
-                int32_t slot = index < valid ? heapLocal.GetValue(base + index) : -1;
-                float score = slot >= 0 ? priorityLocal.GetValue(slot) : 0;
-                if (slot >= 0 && score != first) equal = false;
-                keys.SetValue(index, slot < 0 ? -1.0e30F :
-                    (score == negativeInfinity.value ? 1.0e30F : -score));
-                indices.SetValue(index, static_cast<uint32_t>(slot));
-            }
-            if (equal) continue;
-            SetFlag<HardEvent::S_V>(EVENT_ID7);
-            WaitFlag<HardEvent::S_V>(EVENT_ID7);
-            Sort<float, true>(pairs, keys, indices, scratch, padded / 32);
-            SetFlag<HardEvent::V_S>(EVENT_ID7);
-            WaitFlag<HardEvent::V_S>(EVENT_ID7);
-            for (uint32_t index = 0; index < valid; ++index)
-                heapLocal.SetValue(base + index, pairs.ReinterpretCast<int32_t>().GetValue(index * 2 + 1));
-            for (uint32_t begin = 0; begin < valid;) {
-                float score = priorityLocal.GetValue(heapLocal.GetValue(base + begin));
-                uint32_t end = begin + 1;
-                while (end < valid && priorityLocal.GetValue(heapLocal.GetValue(base + end)) == score) ++end;
-                uint32_t tied = end - begin;
-                if (tied > 1) {
-                    uint32_t tiePadded = (tied + 31) / 32 * 32;
-                    for (uint32_t index = 0; index < tiePadded; ++index) {
-                        int32_t slot = index < tied ? heapLocal.GetValue(base + begin + index) : -1;
-                        keys.SetValue(index, slot >= 0 ? -static_cast<float>(slot) : -1.0e30F);
-                        indices.SetValue(index, static_cast<uint32_t>(slot));
-                    }
-                    SetFlag<HardEvent::S_V>(EVENT_ID7);
-                    WaitFlag<HardEvent::S_V>(EVENT_ID7);
-                    Sort<float, true>(pairs, keys, indices, scratch, tiePadded / 32);
-                    SetFlag<HardEvent::V_S>(EVENT_ID7);
-                    WaitFlag<HardEvent::V_S>(EVENT_ID7);
-                    for (uint32_t index = 0; index < tied; ++index)
-                        heapLocal.SetValue(base + begin + index, pairs.ReinterpretCast<int32_t>().GetValue(index * 2 + 1));
-                }
-                begin = end;
-            }
-        }
-        return true;
-    }
-
-    __aicore__ inline float Priority(int32_t token, uint32_t start, uint32_t end)
-    {
-        union FloatBits { uint32_t bits; float value; } score;
-        float total = 0;
-        bool valid = false;
-        if (token >= 0) {
-            for (uint32_t row = start; row < end; ++row) {
-                if (token / 4 >= lengthsGm.GetValue(row) / 4 || token / 4 >= scoreStride) continue;
-                uint32_t bits = scoresGm.GetValue(static_cast<uint64_t>(row) * scoreStride + token / 4);
-                score.bits = encoded ? ((bits & 0x80000000U) ? bits ^ 0x80000000U : ~bits) : bits;
-                if ((score.bits & 0x7F800000U) == 0x7F800000U) continue;
-                total += score.value;
-                valid = true;
-            }
-        }
-        score.bits = 0xFF800000U;
-        return valid ? total : score.value;
-    }
-
     __aicore__ inline void CopyRow(uint32_t row)
     {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID7);
@@ -345,105 +243,75 @@ private:
             maxLength = maxLength > length ? maxLength : length;
         }
         if (FinishPrepared(request, start, end, owner, maxLength)) return;
-        bool allMapped = active && stateGm.GetValue(owner * 16) == generationsGm.GetValue(owner) &&
-            maxLength >= stateGm.GetValue(owner * 16 + 1);
-        if (active) stateGm.SetValue(owner * 16 + 2, !allMapped &&
-            (stateGm.GetValue(owner * 16) != generationsGm.GetValue(owner) ||
-             maxLength < stateGm.GetValue(owner * 16 + 1)));
-        if (allMapped) {
-            for (uint32_t slot = 0; slot < capacity; ++slot) residentLocal.SetValue(slot, -1);
-        }
-        for (int32_t row = start; row < end; ++row) {
-            if (!active) continue;
-            for (uint32_t column = 0; column < 2051; ++column) {
-                int32_t token = Token(row, column);
-                if (Address(request, row, token) >= 0) {
-                    unionLocal.SetValue(total++, token);
-                    if (allMapped) {
-                        int32_t slot = mappingGm.GetValue(mapBase + token);
-                        if (slot >= 0 && slot < capacity) residentLocal.SetValue(slot, token);
-                        else allMapped = false;
-                    }
-                }
-            }
-        }
-        uint32_t unique = 0;
-        if (allMapped) {
-            for (uint32_t slot = 0; slot < capacity; ++slot) {
-                int32_t token = residentLocal.GetValue(slot);
-                if (token >= 0) unionLocal.SetValue(unique++, token);
-            }
-            stateGm.SetValue(owner * 16 + 1, maxLength);
-        } else {
-            unique = SortUnion(total);
-        }
-        if (unique > capacity) return;
-        if (active && !allMapped) {
-            int64_t generation = generationsGm.GetValue(owner);
-            bool reset = stateGm.GetValue(owner * 16) != generation || maxLength < stateGm.GetValue(owner * 16 + 1);
-            for (uint32_t slot = 0; slot < capacity; ++slot) {
-                int32_t token = sourcesGm.GetValue(residentBase + slot);
-                if (reset) {
-                    if (token >= 0 && token < sourceCount) mappingGm.SetValue(mapBase + token, -1);
+        bool reset = active && (stateGm.GetValue(owner * 16) != generationsGm.GetValue(owner) ||
+            maxLength < stateGm.GetValue(owner * 16 + 1));
+        if (active) {
+            stateGm.SetValue(owner * 16 + 2, reset);
+            if (reset) {
+                for (uint32_t slot = 0; slot < capacity; ++slot) {
+                    int32_t previous = sourcesGm.GetValue(residentBase + slot);
+                    if (previous >= 0 && previous < sourceCount) mappingGm.SetValue(mapBase + previous, -1);
                     sourcesGm.SetValue(residentBase + slot, -1);
                     physicalGm.SetValue(residentBase + slot, -1);
-                    token = -1;
                 }
-                residentLocal.SetValue(slot, token);
             }
-            uint32_t missing = 0;
-            for (uint32_t index = 0; index < unique; ++index) {
-                int32_t token = unionLocal.GetValue(index);
+        }
+        Duplicate(heapLocal, static_cast<int32_t>(0), capacity);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
+        for (int32_t row = start; row < end && active; ++row) {
+            for (uint32_t column = 0; column < 2051; ++column) {
+                int32_t token = Token(row, column);
+                int64_t address = Address(request, row, token);
+                if (address < 0) continue;
                 int32_t slot = mappingGm.GetValue(mapBase + token);
-                if (slot >= 0 && slot < capacity) residentLocal.SetValue(slot, -token - 2);
-                else ++missing;
+                bool mapped = slot >= 0 && slot < capacity;
+                if (mapped) heapLocal.SetValue(slot, 1);
+                bool hit = mapped && physicalGm.GetValue(residentBase + slot) == address &&
+                    token < lengthsGm.GetValue(row) - static_cast<int32_t>(tailSize);
+                if (!hit) unionLocal.SetValue(total++, token);
             }
-            uint32_t heapCount = 0;
-            if (missing > 0) {
-                for (uint32_t slot = 0; slot < capacity; ++slot) {
-                    int32_t token = residentLocal.GetValue(slot);
-                    if (token < -1) continue;
-                    heapLocal.SetValue(heapCount++, slot);
-                    priorityLocal.SetValue(slot, Priority(token, start, end));
-                }
-                bool sortedVictims = !reset && SortVictims(heapCount);
-                uint32_t victimChunks = (heapCount + 1023) / 1024;
-                uint32_t victimCursors[16] = {};
-                for (uint32_t chunk = 0; chunk < victimChunks; ++chunk) victimCursors[chunk] = chunk * 1024;
-                if (!reset && !sortedVictims)
-                    for (int32_t root = static_cast<int32_t>(heapCount / 2) - 1; root >= 0; --root) SiftVictim(root, heapCount);
-                uint32_t freeCursor = 0;
-                for (uint32_t index = 0; index < unique; ++index) {
-                    int32_t token = unionLocal.GetValue(index);
-                    int32_t slot = mappingGm.GetValue(mapBase + token);
-                    if (slot >= 0 && slot < capacity) continue;
-                    if (reset) slot = heapLocal.GetValue(freeCursor++);
-                    else if (sortedVictims) {
-                        int32_t selected = -1;
-                        for (uint32_t chunk = 0; chunk < victimChunks; ++chunk) {
-                            uint32_t cursor = victimCursors[chunk];
-                            if (cursor >= heapCount || cursor >= (chunk + 1) * 1024) continue;
-                            int32_t candidate = heapLocal.GetValue(cursor);
-                            if (selected < 0 || Less(candidate, slot)) {
-                                slot = candidate;
-                                selected = chunk;
-                            }
-                        }
-                        ++victimCursors[selected];
-                    }
-                    else {
-                        slot = heapLocal.GetValue(0);
-                        heapLocal.SetValue(0, heapLocal.GetValue(--heapCount));
-                        if (heapCount) SiftVictim(0, heapCount);
-                    }
-                    int32_t old = residentLocal.GetValue(slot);
-                    if (old >= 0) mappingGm.SetValue(mapBase + old, -1);
-                    mappingGm.SetValue(mapBase + token, slot);
-                    sourcesGm.SetValue(residentBase + slot, token);
-                    physicalGm.SetValue(residentBase + slot, -1);
-                }
+        }
+        uint32_t unique = SortUnion(total);
+        if (unique > capacity) return;
+        uint32_t missing = 0;
+        for (uint32_t index = 0; index < unique; ++index) {
+            int32_t slot = mappingGm.GetValue(mapBase + unionLocal.GetValue(index));
+            if (slot < 0 || slot >= capacity) ++missing;
+        }
+        uint32_t victims = 0;
+        for (uint32_t slot = 0; slot < capacity && victims < missing; ++slot) {
+            if (heapLocal.GetValue(slot) == 0 && sourcesGm.GetValue(residentBase + slot) < 0) {
+                victimLocal.SetValue(victims++, slot);
+                heapLocal.SetValue(slot, 1);
             }
-            stateGm.SetValue(owner * 16, generation);
+        }
+        uint32_t chunks = (capacity + 2047) / 2048;
+        uint32_t firstChunk = SglLimSchedule::HashVictimScanSeed(maxLength) % chunks;
+        for (uint32_t visit = 0; visit < chunks && victims < missing; ++visit) {
+            uint32_t chunk = (firstChunk + visit) % chunks;
+            uint32_t limit = (chunk + 1) * 2048 < capacity ? (chunk + 1) * 2048 : capacity;
+            for (uint32_t slot = chunk * 2048; slot < limit && victims < missing; ++slot) {
+                if (heapLocal.GetValue(slot) != 0) continue;
+                victimLocal.SetValue(victims++, slot);
+                heapLocal.SetValue(slot, 1);
+            }
+        }
+        if (victims != missing) return;
+        uint32_t cursor = 0;
+        for (uint32_t index = 0; index < unique; ++index) {
+            int32_t token = unionLocal.GetValue(index);
+            int32_t slot = mappingGm.GetValue(mapBase + token);
+            if (slot >= 0 && slot < capacity) continue;
+            slot = victimLocal.GetValue(cursor++);
+            int32_t previous = sourcesGm.GetValue(residentBase + slot);
+            if (previous >= 0) mappingGm.SetValue(mapBase + previous, -1);
+            mappingGm.SetValue(mapBase + token, slot);
+            sourcesGm.SetValue(residentBase + slot, token);
+            physicalGm.SetValue(residentBase + slot, -1);
+        }
+        if (active) {
+            stateGm.SetValue(owner * 16, generationsGm.GetValue(owner));
             stateGm.SetValue(owner * 16 + 1, maxLength);
         }
         PublishUnion(request, unique, mapBase);
@@ -491,10 +359,10 @@ private:
     GlobalTensor<uint32_t> scoresGm;
     GlobalTensor<int64_t> requestsGm, generationsGm, physicalGm, stateGm, unionPhysicalGm;
     GlobalTensor<int16_t> membershipGm;
-    TBuf<TPosition::VECCALC> unionBuffer, residentBuffer, heapBuffer, priorityBuffer, rowBuffer;
+    TBuf<TPosition::VECCALC> unionBuffer, residentBuffer, heapBuffer, rowBuffer;
     LocalTensor<int32_t> unionLocal, residentLocal, heapLocal, rowIds, rowSlots;
     LocalTensor<int16_t> rowPlan;
-    LocalTensor<float> priorityLocal;
+    LocalTensor<int32_t> victimLocal;
     uint32_t rowCount, batchCount, requestCount, sourceCount, capacity, tableColumns, unionSize, scoreStride, tailSize;
     uint64_t hostSize;
     bool pooled, encoded, prepared;

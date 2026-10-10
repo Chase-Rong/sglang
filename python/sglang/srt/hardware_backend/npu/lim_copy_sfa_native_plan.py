@@ -14,6 +14,8 @@ from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import (
 
 
 class NativeUnionPlanner:
+    replacement_policy = "protected_hash"
+
     def __init__(self, spec, request_capacity, batch_capacity, device):
         if (
             not (0 < batch_capacity and 1 < request_capacity <= 32767)
@@ -73,7 +75,7 @@ class NativeUnionPlanner:
         host_tokens,
         mutable_tail=12,
         pooled=False,
-        encoded=False
+        encoded=False,
     ):
         rows, batch = ids.shape[0], query_ends.numel()
         if not 0 < rows <= self.rows or not 0 < batch <= self.batch_capacity:
@@ -127,6 +129,7 @@ class NativeUnionPlanner:
             self.spec.max_query_routes,
             mutable_tail,
             256,
+            counts=self.state,
         )
 
 
@@ -150,7 +153,7 @@ class NativeIndexerManager(NativeUnionPlanner):
         generations,
         *,
         host_tokens,
-        mutable_tail=12
+        mutable_tail=12,
     ):
         rows, batch = query.shape[0], query_ends.numel()
         if not 0 < rows <= self.rows or not 0 < batch <= self.batch_capacity:

@@ -3,7 +3,7 @@
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
-#include "aclrtlaunch_sgl_lim_indexer_manage.h"
+#include "configured_indexer.h"
 #include "validation.h"
 
 namespace {
@@ -27,7 +27,7 @@ void IndexerManageOut(const at::Tensor &query, const at::Tensor &key, const at::
         tensor.record_stream(npuStream);
     const auto stream = npuStream.stream(false);
     auto launch = [=]() -> int {
-        return ACLRT_LAUNCH_KERNEL(sgl_lim_indexer_manage)(8, stream,
+        return sgl_lim_configured_indexer_manage(8, stream,
             query.data_ptr(), key.data_ptr(), weights.data_ptr(), indexEnds.data_ptr(), poolLengths.data_ptr(),
             indexTable.data_ptr(), indices.data_ptr(), scores.data_ptr(), workspace.data_ptr(),
             ends.data_ptr(), lengths.data_ptr(), table.data_ptr(), requests.data_ptr(), generations.data_ptr(),

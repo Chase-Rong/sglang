@@ -3,10 +3,11 @@
 This target provides two A5 native stages: fused Indexer/resident management,
 and fused miss-copy/sparse attention/residency publication. The Indexer prepares
 per-query pooled lengths, computes scores and TopK, expands tokens, protects
-the request union, applies score-driven eviction, and emits a signed-slot plan.
+the request union, applies protected length-hashed replacement, and emits a signed-slot plan.
 CopySFA consumes that plan and the deduplicated request union. On a new request
-generation or rollback it fills the union before attention; on steady requests
-it overlaps missing KV loads with the attention pipeline. Payload validity is
+generation or rollback, or when any request has more than 512 union misses, it
+fills the batch's miss unions before attention. Otherwise it overlaps missing
+KV loads and owned miss prefetch with the attention pipeline. Payload validity is
 published inside the same kernel after the copy consumers finish.
 
 CopySFA owns its kernel, Cube/Vector services, buffer utilities, vector functions
@@ -20,7 +21,7 @@ separately.
 
 CopySFA reserves workspace from the device Cube count and launches up to that
 count according to query rows, with eight groups for small cases. Only actual
-first-fill work runs the two-entry Host-to-UB-to-HBM queue and the leading global
+first-fill or above-threshold work runs the two-entry Host-to-UB-to-HBM queue and the leading global
 barrier. Steady all-hit skips that stage and the trailing commit barrier.
 Other steady cases publish validity in parallel from the planner's 32-bit
 mutable-tail presence masks instead of rescanning the full TopK for each miss.
@@ -29,7 +30,7 @@ For the 2048-token sparse body, LIM publishes an additional miss-prefix/hit-suff
 permutation without changing the public TopK/slot order. Within each segment,
 the original TopK order is retained; this is not A3's source-ID sort. Pure hit and pure miss
 use implicit identity order. CopySFA caches each row's IDs and signed plan, rotates
-512-token groups across requests/query rows, and preserves the final three tail
+512-token groups using the official request-based permutation, and preserves the final three tail
 positions. Attention remains tiled at 128 on A5; its read-ahead gather uses two UB
 banks and 32 rows for at most 32 local heads, or 16 rows for larger head counts.
 This retains UB headroom while issuing the next bank's reads before writing the
@@ -74,10 +75,11 @@ The owner publishes its union count in request state; native CopySFA bounds
 first-fill and validity publication by that count rather than reserved capacity.
 Generation changes, rollback and newly selected unmapped sources retain full
 management. Source unions use hardware-sorted 1024-entry runs and an exact
-ordered merge; empty-cache initialization assigns slots without victim sorting.
-Occupied-cache eviction uses hardware-sorted score runs and slot-sorted equal
-score groups, retaining deterministic ties. Nonfinite/very large score sums
-outside the finite sentinel range keep the exact scalar heap fallback.
+ordered merge. Every query's selected slots are protected before allocation.
+Allocation consumes empty slots first, then scans 2048-slot resident chunks
+from a length-hashed starting chunk, excluding every protected slot. It no
+longer sorts resident scores or uses the scalar score heap. Union suffix bytes
+are unspecified: every consumer must use the published request union count.
 Payload validity still requires physical mapping and mutable-tail checks.
 Outputs and workspace
 are supplied by the caller and remain alive through Graph destruction. Native
@@ -105,8 +107,8 @@ attention heads. Missing native support raises an error without silent fallback.
 The KPool read phase calls the fused Indexer/manager once. Attention consumes
 that plan after the existing current-token Host writeback. Shared-indexer layers
 and Draft seed reuse retain the supplied token set and invoke only native
-management followed by CopySFA. Without fresh logits this supplied-TopK mode
-uses equal eviction priorities and slot order as the deterministic tie-break;
+management followed by CopySFA. This supplied-TopK mode uses the same protected
+length-hashed replacement policy;
 it does not recompute a different selection from the current draft query.
 
 Each physical attention layer has independent residency/payload state. Scratch
@@ -118,7 +120,12 @@ request-shared union capacity, layer payloads, and native workspaces. HiCache
 pages, MemFabric allocation, PD transfer and Prefill offload remain shared with
 the existing backend; no second full Host KV payload is allocated.
 
-These changes adopt the A3 miss-only union and all-hit early-exit design, but
+The official A5 algorithm adaptation is detailed in `OFFICIAL_A5_MIGRATION.md`.
+The fused SIMT classifier uses a configured Host-argument launcher with 216 KiB
+dynamic UB and batch scheduling, reserving 32 KiB for DCache and 8 KiB for
+runtime/stack. Its embedded ELF and launch ABI come from the same SDK build.
+
+These changes adopt the miss-only union and all-hit early-exit design, but
 do not reproduce its complete scoring pipeline: A3 packs slot/source payloads
 while scoring tiles, whereas this A5 version consumes the SDK's completed
 pooled TopK and performs slot/address lookup afterward. The mixed-core score
