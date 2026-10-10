@@ -66,7 +66,9 @@ all residency work with Indexer matrix computation.
 The native extension schema is unchanged, but union suffix semantics changed.
 Use the matching Python adapter and rebuild the native extension in a fresh
 build directory. Mixing old count-ignoring commit helpers with the new binary
-is unsupported. The default serving backend remains `external_plan`.
+is unsupported. This branch defaults to `lim_copy_sfa` when fused offload is
+enabled. Set `SGLANG_NPU_DSA_OFFLOAD_BACKEND=external_plan` to select the original
+LRU planner and FSA. This default change does not constitute E2E qualification.
 
 ## Validation
 

@@ -41,7 +41,10 @@ def initialize_fsa_backend(backend, model_runner):
         envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get()
     )
     if not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
-        if offload_backend != "external_plan":
+        if (
+            envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.is_set()
+            and offload_backend != "external_plan"
+        ):
             raise ValueError(
                 "lim_copy_sfa requires fused sparse attention to be enabled"
             )

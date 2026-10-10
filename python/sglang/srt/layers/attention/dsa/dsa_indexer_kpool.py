@@ -1786,7 +1786,8 @@ class IndexerKPool(MultiPlatformOp):
 
         # Decode default path
         if (
-            envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
+            envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get()
+            and envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
             and not forward_batch.forward_mode.is_extend_without_speculative()
         ):
             from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import select_offloaded_topk
