@@ -996,11 +996,20 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
     } else {
         queryRow += runInfo.boIdx * constInfo.s1Size;
     }
-    int64_t indexBase = queryRow * constInfo.sparseBlockCount + runInfo.s2LoopCount * constInfo.s2BaseSize;
     int64_t tokenLimit = constInfo.sparseMode == 3 ?
         runInfo.actualS2Size - runInfo.actualS1Size + runInfo.s1oIdx + 1 : runInfo.actualS2Size;
+    // Vec0 may already have prepared the next task. Derive this task's mask
+    // order from its GM metadata rather than the mutable selectionOrderActive state.
+    int64_t membershipBase = queryRow * selectionMembershipStride;
+    uint32_t bodyMisses = static_cast<uint16_t>(selectionMembershipMapGm.GetValue(membershipBase + 16394));
+    bool maskReordered = runInfo.s2LoopLimit >= 16 && bodyMisses > 0 && bodyMisses < 2048 && runInfo.s2LoopCount < 16;
+    int64_t sourceStart = runInfo.s2LoopCount * constInfo.s2BaseSize;
+    int64_t orderedStart = SglLimSchedule::GatherIndex(runInfo.boIdx, sourceStart);
     for (int64_t column = 0; column < runInfo.s2RealSize; ++column) {
-        int32_t token = sparseIndicesGm.GetValue(indexBase + column);
+        int64_t sourceColumn = maskReordered ?
+            static_cast<uint16_t>(selectionMembershipMapGm.GetValue(membershipBase + 4096 + orderedStart + column)) :
+            sourceStart + column;
+        int32_t token = sparseIndicesGm.GetValue(queryRow * constInfo.sparseBlockCount + sourceColumn);
         if (token < 0 || token >= tokenLimit) {
             for (int64_t row = 0; row < runInfo.halfMRealSize; ++row) {
                 mmRes.SetValue(row * s2BaseSize + column, negativeFloatScalar);

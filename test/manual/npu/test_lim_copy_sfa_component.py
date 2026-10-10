@@ -32,6 +32,7 @@ def run_request_shared_attention(
     framework=False,
     inactive_last=False,
     reserved_context=16384,
+    kv_length=16384,
     three_way=False,
     attention_heads=8,
     changing_topk=False,
@@ -105,14 +106,14 @@ def run_request_shared_attention(
     ids = torch.full((rows, 2051), -1, dtype=torch.int32, device="npu")
     ids[:, :2048] = torch.arange(2048, device="npu")
     lengths = torch.tensor(
-        [16384 - routes + route + 1 for _ in range(batch) for route in range(routes)],
+        [kv_length - routes + route + 1 for _ in range(batch) for route in range(routes)],
         dtype=torch.int32,
         device="npu",
     )
     ids[:, 2048:2050] = lengths[:, None] - 2
     scores = torch.ones(rows, 4096, device="npu")
     query_ends = torch.arange(routes, rows + 1, routes, device="npu", dtype=torch.int32)
-    kv_lengths = torch.full((batch,), 16384, dtype=torch.int32, device="npu")
+    kv_lengths = torch.full((batch,), kv_length, dtype=torch.int32, device="npu")
     table = torch.arange(1, batch * 128 + 1, dtype=torch.int32, device="npu").view(
         batch, 128
     )
@@ -381,7 +382,7 @@ def run_request_shared_attention(
             )
         if native_copy:
             for request in range(batch):
-                finish = (request + 1) * 16384 + 128
+                finish = request * 16384 + 128 + kv_length
                 region.tensor[finish - 12 : finish].add_(0.03125)
             check(forward())
             table.copy_(table.flip(-1))

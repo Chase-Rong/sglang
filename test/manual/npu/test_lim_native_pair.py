@@ -47,6 +47,23 @@ def test_framework_graph_padding():
     )
 
 
+@pytest.mark.parametrize("kv_length", [24, 32, 128, 512, 2048])
+@pytest.mark.parametrize("batch,routes,framework", [(1, 1, False), (1, 6, False), (2, 6, True)])
+def test_short_context_reordered_mask(batch, routes, framework, kv_length):
+    """Mask the gathered KV order, including warm-cache reuse and MTP routes."""
+    from test_lim_copy_sfa_component import run_request_shared_attention
+
+    run_request_shared_attention(
+        batch,
+        routes,
+        include_indexer=True,
+        native_fused=True,
+        native_copy=True,
+        framework=framework,
+        kv_length=kv_length,
+    )
+
+
 def test_framework_short_prefix_in_larger_reservation():
     from test_lim_copy_sfa_component import run_request_shared_attention
 
