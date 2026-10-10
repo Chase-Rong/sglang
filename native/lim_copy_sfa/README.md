@@ -98,8 +98,10 @@ python -m pytest -q test/manual/npu/test_lim_native_plan.py test/manual/npu/test
 
 This library uses its own `sgl_lim_native` namespace. Building or testing it does
 not install a wheel or replace an OPP vendor. The serving selector is
-`SGLANG_NPU_DSA_OFFLOAD_BACKEND=external_plan|lim_copy_sfa`; `external_plan` stays
-the default. Selecting `lim_copy_sfa` requires the library path above,
+`SGLANG_NPU_DSA_OFFLOAD_BACKEND=external_plan|lim_copy_sfa`; `lim_copy_sfa` is
+the default on this branch. Set `external_plan` explicitly to use the original
+LRU planner and FSA. The default does not enable offload by itself.
+Selecting `lim_copy_sfa` requires the library path above,
 `SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION=1`, integrated HiCache offload,
 BF16 NoPE512, KPool4, page128, at most six query routes and at most64 local
 attention heads. Missing native support raises an error without silent fallback.

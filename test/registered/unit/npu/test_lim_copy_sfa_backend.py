@@ -202,3 +202,55 @@ def test_lim_budget_counts_device_map_and_request_shared_payload(monkeypatch):
     assert (
         budget.required_bytes(8192, 10, 128)[0] < old.required_bytes(8192, 10, 128)[0]
     )
+
+
+@pytest.mark.parametrize("configured", [None, "external_plan", "lim_copy_sfa"])
+def test_backend_default_and_explicit_override(monkeypatch, configured):
+    spec = importlib.util.spec_from_file_location(
+        "lim_test_environ", ROOT / "python/sglang/srt/environ.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    name = "SGLANG_NPU_DSA_OFFLOAD_BACKEND"
+    if configured is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, configured)
+    assert module.envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == (
+        configured or "lim_copy_sfa"
+    )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_disabled_fusion_accepts_implicit_default_only(fixture, monkeypatch, explicit):
+    _, adapter, _, _, _, _, _, _ = fixture
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.environ",
+        SimpleNamespace(
+            envs=SimpleNamespace(
+                SGLANG_NPU_DSA_OFFLOAD_BACKEND=SimpleNamespace(
+                    get=lambda: "lim_copy_sfa", is_set=lambda: explicit
+                ),
+                SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION=SimpleNamespace(
+                    get=lambda: False
+                ),
+            )
+        ),
+    )
+    for name, symbols in {
+        "sglang.srt.configs.model_config": ("dsa_layer_skips_topk",),
+        PREFIX + "fsa_native": ("native_ops",),
+        PREFIX + "speculative_sparse": ("sparse_mtp_rows", "sparse_mtp_tail"),
+        "sglang.srt.runtime_context": ("get_exec", "get_spec"),
+    }.items():
+        monkeypatch.setitem(
+            sys.modules, name, SimpleNamespace(**dict.fromkeys(symbols))
+        )
+    backend = SimpleNamespace()
+    if explicit:
+        with pytest.raises(ValueError, match="requires fused sparse attention"):
+            adapter.initialize_fsa_backend(backend, None)
+    else:
+        adapter.initialize_fsa_backend(backend, None)
+        assert backend.fused_sparse_state is None

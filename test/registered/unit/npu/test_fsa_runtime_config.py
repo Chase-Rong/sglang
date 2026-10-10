@@ -23,6 +23,7 @@ def runtime_config():
 
 @pytest.mark.parametrize("backend,expected_rows", [("full", 4), ("disabled", 0)])
 def test_budget_uses_published_graph_config_without_removed_server_fields(monkeypatch, backend, expected_rows):
+    monkeypatch.setenv("SGLANG_NPU_DSA_OFFLOAD_BACKEND", "external_plan")
     monkeypatch.setenv("SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD", "1")
     monkeypatch.setenv("SGLANG_NPU_DECODE_HOST_KV_BYTES", str(1 << 34))
     config = SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"],
@@ -44,6 +45,7 @@ def test_budget_uses_published_graph_config_without_removed_server_fields(monkey
 
 @pytest.mark.parametrize("requests,graph_max,expected", [(8, 4, 8), (2, 8, 8)])
 def test_fsa_reservation_covers_request_capacity_after_graph_lock(monkeypatch, requests, graph_max, expected):
+    monkeypatch.setenv("SGLANG_NPU_DSA_OFFLOAD_BACKEND", "external_plan")
     from sglang.srt.hardware_backend.npu import fsa_backend, fsa_native
 
     monkeypatch.setenv("SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION", "1")
