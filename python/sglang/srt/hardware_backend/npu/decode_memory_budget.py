@@ -137,7 +137,8 @@ class DecodeKvMemoryBudget:
             + batch * union_width * 16
         )
         shared = (rows * (12 + 512 * 4 + 2051 * 4 + pools * 12 + pools // 128 * 4)
-                  + 8 * 4 * pools * 4 + 64 * 3 * 128 * 576 * 2 + owners * 8)
+                  + 64 * 4 * pools * 4 + 64 * 3 * 128 * 576 * 2 + owners * 8
+                  + rows * 512 * 512 * 2 + 32)
         staging = self.staging_bytes + 9 if self.staging_bytes else 0
         return 0, (self.layers * per_layer + self.lim_runtime_instances * shared
                    + self.shared_fence_bytes + staging)

@@ -58,7 +58,10 @@ def test_copy_sfa_workspace_uses_device_core_capacity(monkeypatch):
     operator = module.NativeCopySparseAttention("npu:0", row_capacity=60)
     assert operator.core_count == 32
     assert calls == [
-        (32 * 3 * 128 * 576 * 2 + 60 * 4, dict(dtype=torch.uint8, device="npu:0"))
+        (
+            32 * 3 * 128 * 576 * 2 + 256 + 60 * 512 * 512 * 2,
+            dict(dtype=torch.uint8, device="npu:0"),
+        )
     ]
 
 

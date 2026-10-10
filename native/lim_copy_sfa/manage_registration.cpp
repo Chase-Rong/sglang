@@ -3,7 +3,7 @@
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
-#include "aclrtlaunch_sgl_lim_manage.h"
+#include "configured_indexer.h"
 #include "validation.h"
 
 namespace SglLimHost {
@@ -66,7 +66,7 @@ void ManageOut(const at::Tensor &ids, const at::Tensor &scores, const at::Tensor
     const auto stream = npuStream.stream(false);
     const uint32_t cores = std::min<int64_t>(8, ends.numel());
     auto launch = [=]() -> int {
-        return ACLRT_LAUNCH_KERNEL(sgl_lim_manage)(cores, stream,
+        return sgl_lim_configured_manage(cores, stream,
             ids.data_ptr(), scores.data_ptr(), ends.data_ptr(), lengths.data_ptr(), table.data_ptr(),
             requests.data_ptr(), generations.data_ptr(), mapping.data_ptr(), sources.data_ptr(), physical.data_ptr(),
             state.data_ptr(), outputIds.data_ptr(), outputSlots.data_ptr(), membership.data_ptr(),

@@ -254,6 +254,7 @@ struct RunInfo {
 struct ConstInfo {
     COMMON_CONST_INFO;
     INFER_CONST_INFO;
+    bool directKvL1;
 };
 
 /* only support b32 or b64 */

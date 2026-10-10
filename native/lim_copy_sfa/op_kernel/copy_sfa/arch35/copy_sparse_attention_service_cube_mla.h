@@ -133,12 +133,14 @@ __aicore__ inline void CopySparseAttentionMatmulService<TEMPLATE_ARGS>::InitCube
     const ConstInfo& constInfo)
 {
     if ASCEND_IS_AIC {
-        mte1ToMte2Id[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
-        mte1ToMte2Id[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
-        mte1ToMte2Id[2] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
-        mte2ToMte1Id[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
-        mte2ToMte1Id[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
-        mte2ToMte1Id[2] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
+        if (IS_SPLIT_G || !constInfo.directKvL1) {
+            mte1ToMte2Id[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
+            mte1ToMte2Id[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
+            mte1ToMte2Id[2] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE1>();
+            mte2ToMte1Id[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
+            mte2ToMte1Id[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
+            mte2ToMte1Id[2] = GetTPipePtr()->AllocEventID<HardEvent::MTE1_MTE2>();
+        }
         InitGmTensor(actualSeqLengthsQ, constInfo);
     }
 }
@@ -225,14 +227,16 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionMatmulService
     }
 
     inputRightBuf.WaitCrossCore();
-    SetFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
-    WaitFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
-    LocalTensor<Q_T> dst = inputRightBuf.GetTensor<Q_T>();
-    v0ResGm.WaitCrossCore();
-    GlobalTensor<Q_T> v0ResGmTensor = v0ResGm.template GetTensor<Q_T>();
-    CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, 512, 576);
-    SetFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
-    WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+    if (IS_SPLIT_G || !constInfo.directKvL1) {
+        SetFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
+        WaitFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
+        LocalTensor<Q_T> dst = inputRightBuf.GetTensor<Q_T>();
+        v0ResGm.WaitCrossCore();
+        GlobalTensor<Q_T> v0ResGmTensor = v0ResGm.template GetTensor<Q_T>();
+        CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, 512, 576);
+        SetFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+        WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+    }
 
     inputLeftBuf.Wait<HardEvent::MTE2_MTE1>(); // Wait for L1A
     Buffer<BufferType::L0C> mm1ResL0C = mmL0CBuffers.Get();

@@ -174,6 +174,7 @@ template <typename CubeBlockType, typename VecBlockType>
         }
     }
     this->ComputeConstexpr();
+    constInfo.directKvL1 = tiling->baseParams.directKvL1 != 0;
     this->InitGlobalBuffer(query, key, value, queryRope, keyRope, sparseIndices, \
         blockTable, actualSeqLengthsQ, actualSeqLengths, selectionKRope, selectionKvCache, \
         selectionKvBlockTable, selectionKvBlockStatus, selectionMembershipMap, selectionKvActualSeq, \

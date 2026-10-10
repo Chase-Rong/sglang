@@ -3,34 +3,37 @@
 #include <acl/acl_rt.h>
 #include <map>
 #include <mutex>
+#include <string>
 
 namespace SglLimHost {
 inline aclError LaunchConfiguredIndexer(const void *binary, size_t binarySize,
-    uint32_t blocks, void *stream, const void *arguments, uint32_t size)
+    uint32_t blocks, void *stream, const void *arguments, uint32_t size,
+    const char *functionName = "sgl_lim_indexer_manage_2")
 {
     struct Entry {
         aclrtBinHandle binary;
         aclrtFuncHandle function;
     };
     static std::mutex mutex;
-    static std::map<aclrtContext, Entry> entries;
+    static std::map<std::pair<aclrtContext, std::string>, Entry> entries;
     aclrtContext context = nullptr;
     aclError status = aclrtGetCurrentContext(&context);
     if (status != ACL_SUCCESS) return status;
     aclrtFuncHandle function = nullptr;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        auto found = entries.find(context);
+        auto key = std::make_pair(context, std::string(functionName));
+        auto found = entries.find(key);
         if (found == entries.end()) {
             Entry entry{};
             status = aclrtBinaryLoadFromData(binary, binarySize, nullptr, &entry.binary);
             if (status != ACL_SUCCESS) return status;
-            status = aclrtBinaryGetFunction(entry.binary, "sgl_lim_indexer_manage_2", &entry.function);
+            status = aclrtBinaryGetFunction(entry.binary, functionName, &entry.function);
             if (status != ACL_SUCCESS) {
                 aclrtBinaryUnLoad(entry.binary);
                 return status;
             }
-            found = entries.emplace(context, entry).first;
+            found = entries.emplace(key, entry).first;
         }
         function = found->second.function;
     }

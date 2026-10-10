@@ -34,6 +34,7 @@ def run_request_shared_attention(
     reserved_context=16384,
     three_way=False,
     attention_heads=8,
+    changing_topk=False,
 ):
     import torch_npu  # noqa: F401
 
@@ -91,7 +92,7 @@ def run_request_shared_attention(
             NativeCopySparseAttention,
         )
 
-        copy_attention = NativeCopySparseAttention("npu:0")
+        copy_attention = NativeCopySparseAttention("npu:0", row_capacity=batch * routes)
     rows = batch * routes
     query = (
         torch.randn(
@@ -158,6 +159,29 @@ def run_request_shared_attention(
         ids = component.planner.topk if native_fused else indexer.topk
         baseline_ids = torch.empty_like(ids)
         baseline_pool_lengths = torch.empty_like(lengths)
+
+    def change_selection(step):
+        index_query.zero_()
+        index_query[:, 0, 0] = 1
+        index_weights.zero_()
+        index_weights[:, 0] = 1
+        key_cpu = torch.zeros(index_keys.shape, dtype=torch.bfloat16)
+        values = (
+            1
+            + torch.randperm(
+                512, generator=torch.Generator().manual_seed(1700 + step)
+            ).float()
+            / 512
+        )
+        for request in range(batch):
+            begin = 128 + request * 4096 + step * 103
+            key_cpu.view(-1, 128)[begin : begin + 512, 0] = values.bfloat16()
+        index_keys.copy_(key_cpu)
+
+    if changing_topk:
+        if not three_way:
+            raise ValueError("Changing TopK requires the complete three-way chain")
+        change_selection(0)
     graph = None
     baseline_graph = None
     third_graph = None
@@ -380,7 +404,9 @@ def run_request_shared_attention(
             generations.add_(1)
             graph.replay()
             check(output)
-        if directory := os.environ.get("SGLANG_LIM_COMPONENT_BENCHMARK"):
+        if (
+            directory := os.environ.get("SGLANG_LIM_COMPONENT_BENCHMARK")
+        ) and not inactive_last:
             from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
                 FusedSparseAttentionState,
                 paged_kv_view,
@@ -511,22 +537,42 @@ def run_request_shared_attention(
                     third_component.planner.topk.cpu(), ids.cpu()
                 )
             samples = []
-            for cycle in range(6):
+            dynamic_misses = []
+            for cycle in range(24 if changing_topk else 6):
+                if changing_topk:
+                    change_selection(cycle + 1)
                 offset = cycle % len(captured_paths) if three_way else 0
                 order = captured_paths[offset:] + captured_paths[:offset]
-                for label, captured in order + list(reversed(order)):
+                for label, captured in (
+                    order if changing_topk else order + list(reversed(order))
+                ):
                     torch.npu.synchronize()
                     start = time.perf_counter_ns()
-                    for _ in range(10):
+                    replay_count = 1 if changing_topk else 10
+                    for _ in range(replay_count):
                         captured.replay()
                     torch.npu.synchronize()
                     samples.append(
                         dict(
                             cycle=cycle,
                             variant=label,
-                            us=(time.perf_counter_ns() - start) / 1000 / 10,
+                            us=(time.perf_counter_ns() - start) / 1000 / replay_count,
                         )
                     )
+                if changing_topk:
+                    check(output)
+                    torch.testing.assert_close(
+                        baseline_output.cpu(), output.cpu(), atol=0.002, rtol=0.025
+                    )
+                    torch.testing.assert_close(
+                        third_output.cpu(), output.cpu(), atol=0.002, rtol=0.025
+                    )
+                    torch.testing.assert_close(
+                        ids.cpu().sort(-1).values, baseline_ids.cpu().sort(-1).values
+                    )
+                    counts = component.planner.state[1 : batch + 1, 3].cpu().tolist()
+                    assert all(412 <= count <= 412 + routes * 12 for count in counts)
+                    dynamic_misses.append(counts)
             report = dict(
                 scope=(
                     "Native LIM + native CopySFA including residency publication vs installed Indexer + expansion + Host planner + FSA; warm fixed-input Graph; not E2E or TPOT"
@@ -584,6 +630,16 @@ def run_request_shared_attention(
                     ),
                 )
             path = Path(directory)
+            if changing_topk:
+                report.update(
+                    scope="Changing-indexer-input complete chains; one Graph replay per timed step; excludes input updates and correctness checks; not serving TPOT",
+                    warmup_replays=10,
+                    replays_per_sample=1,
+                    schedule="24 steps, rotate ABC, identical new pooled scores for all paths each step",
+                    retained_body_tokens=1636,
+                    new_body_tokens=412,
+                    union_misses_per_request=dynamic_misses,
+                )
             if (
                 native_copy
                 and native_fused
@@ -733,7 +789,7 @@ def run_request_shared_attention(
             path.mkdir(parents=True, exist_ok=True)
             prefix = "indexed_component" if include_indexer else "component"
             if three_way:
-                prefix = "three_way"
+                prefix = "changing_three_way" if changing_topk else "three_way"
             (path / f"{prefix}_b{batch}_q{routes}.json").write_text(
                 json.dumps(report, indent=2)
             )

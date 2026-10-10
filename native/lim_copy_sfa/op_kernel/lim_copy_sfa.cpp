@@ -44,6 +44,7 @@ extern "C" __global__ __aicore__ void sgl_lim_copy_sfa(
     tiling.baseParams.sparseBlockSize = 1;
     tiling.baseParams.sparseBlockCount = 2051;
     tiling.baseParams.selectionMembershipStride = 16400;
+    tiling.baseParams.directKvL1 = (work & 3) == 2;
     tiling.singleCoreParams.usedCoreNum = GetBlockNum();
     using Cube = typename std::conditional<g_coreType == AIC,
         CopySfaBase::CopySparseAttentionMatmulService<bfloat16_t, bfloat16_t, float, bfloat16_t,

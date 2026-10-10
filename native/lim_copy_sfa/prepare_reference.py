@@ -35,6 +35,13 @@ def stage_reference(source_root, destination):
         if relative == "arch35/lightning_indexer_kernel.h":
             source = replace_once(
                 source,
+                "    usedCoreNum = tilingData->usedCoreNum;",
+                """    usedCoreNum = tilingData->usedCoreNum;
+    groupedQueries = tilingData->groupedQueries;
+    totalRows = tilingData->totalRows;""",
+            )
+            source = replace_once(
+                source,
                 "    constInfo.attenMaskFlag = (tilingData->sparseMode == 3);",
                 "    constInfo.attenMaskFlag = (tilingData->sparseMode == 3);\n    constInfo.isLDOpen = true;",
             )
@@ -49,6 +56,8 @@ def stage_reference(source_root, destination):
                 source,
                 "    __aicore__ inline void Process();",
                 """    __aicore__ inline void Process();
+    bool groupedQueries = false;
+    uint32_t totalRows = 0;
     template <typename RowPlan>
     __aicore__ inline void FinishTopK(GM_ADDR scores, RowPlan &rowPlan)
     {
@@ -57,7 +66,7 @@ def stage_reference(source_root, destination):
             rowPlan.BindScratch(vectorService.ResidentScratch());
             vectorService.BeginRowTopK();
             {
-                for (uint32_t row = GetBlockIdx(); row < constInfo.batchSize; row += GetBlockNum() * 2) {
+                for (uint32_t row = GetBlockIdx(); row < totalRows; row += GetBlockNum() * 2) {
                     GlobalTensor<SCORE_T> rowScores;
                     rowScores.SetGlobalBuffer((__gm__ SCORE_T *)scores + row * constInfo.kSeqSize);
                     vectorService.InitVecWorkspaceTensor(rowScores);
@@ -66,13 +75,49 @@ def stage_reference(source_root, destination):
                     info.actS2Size = actualSeqLengthsGmKv.GetValue(row);
                     info.actS2SizeOrig = info.actS2Size;
                     info.indiceOutOffset = row * constInfo.sparseCount;
+                    vectorService.slotPayload.BeginRow(row, vectorService.ResidentScratch(),
+                        2 * ((constInfo.mBaseSize + 1) / 2) * constInfo.s2BaseSize);
                     vectorService.ProcessTopK(info);
-                    rowPlan(row, vectorService.ResidentIndices());
+                    rowPlan(row, vectorService.ResidentIndices(), vectorService.slotPayload.SelectedSlots());
                 }
             }
             vectorService.FreeEventID();
         }
     }""",
+            )
+            source = replace_once(
+                source,
+                "actualSeqLengthsGmKv.SetGlobalBuffer((__gm__ uint32_t *)actualSeqLengthsK, constInfo.actualLenDims);",
+                "actualSeqLengthsGmKv.SetGlobalBuffer((__gm__ uint32_t *)actualSeqLengthsK, totalRows);",
+            )
+            source = replace_once(
+                source,
+                "    actS2SizeOrig =\n        GetActualSeqLen(bIdx, constInfo.actualLenDims,",
+                """    if (groupedQueries) {
+        uint32_t firstRow = bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
+        actS2Size = 0;
+        for (uint32_t row = firstRow; row < firstRow + actS1Size; ++row) {
+            uint32_t pooledLength = actualSeqLengthsGmKv.GetValue(row);
+            actS2Size = actS2Size > pooledLength ? actS2Size : pooledLength;
+        }
+        actS2SizeOrig = actS2Size;
+        return;
+    }
+    actS2SizeOrig =
+        GetActualSeqLen(bIdx, constInfo.actualLenDims,""",
+            )
+            source = replace_once(
+                source,
+                "    runInfo.valueOutOffset = valueOutCoreOffset;",
+                """    runInfo.valueOutOffset = valueOutCoreOffset;
+    if (groupedQueries) {
+        runInfo.bIdx = tempLoopInfo.bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(tempLoopInfo.bIdx - 1);
+    }""",
+            )
+            source = replace_once(
+                source,
+                "            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;",
+                "            totalRows * constInfo.kHeadNum * constInfo.sparseCount;",
             )
         if relative == "arch35/lightning_indexer_service_vector.h":
             source = replace_once(
@@ -85,7 +130,8 @@ def stage_reference(source_root, destination):
         exportedScores.SetGlobalBuffer((__gm__ SCORE_T *)output);
     }
     __aicore__ inline LocalTensor<uint32_t> ResidentIndices() { return indicesOutLocal_; }
-    __aicore__ inline void BeginRowTopK() { blockId_ = 0; }
+    SglLim::PooledSlotPayload slotPayload;
+    __aicore__ inline void BeginRowTopK() { blockId_ = 0; topkOp_.SetSlotPayload(&slotPayload); }
     __aicore__ inline LocalTensor<int32_t> ResidentScratch() { return resMm1UB_.template ReinterpretCast<int32_t>(); }""",
             )
             anchor = """    DataCopyPad(scoreGm[vec1OutGmOffset],
@@ -99,6 +145,29 @@ def stage_reference(source_root, destination):
     DataCopyPad(exportedScores[exportRow * kSeqSizeAlign + curS2Idx],
                 vec1OutUB_[pingpong * CeilDiv(s1BaseSize_, 2) * s2BaseSize_],
                 copyOutParams);""",
+            )
+        if relative == "arch35/vf/lightning_indexer_topk.h":
+            source = replace_once(
+                source,
+                "class LITopk<uint32_t> {\npublic:",
+                """class LITopk<uint32_t> {
+public:
+    __aicore__ inline void SetSlotPayload(SglLim::PooledSlotPayload *payload) { slotPayload = payload; }""",
+            )
+            source = replace_once(
+                source,
+                "        if (s2LoopNum == 1) {",
+                """        if (slotPayload != nullptr) slotPayload->Prefetch(loopIdx, trunkLen);
+        if (s2LoopNum == 1) {""",
+            )
+            source = replace_once(
+                source,
+                "    }\nprivate:\n",
+                """        if (slotPayload != nullptr) slotPayload->Finish(tmpIndexLocal, loopIdx);
+    }
+private:
+    SglLim::PooledSlotPayload *slotPayload = nullptr;
+""",
             )
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)

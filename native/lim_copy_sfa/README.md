@@ -7,7 +7,7 @@ the request union, applies protected length-hashed replacement, and emits a sign
 CopySFA consumes that plan and the deduplicated request union. On a new request
 generation or rollback, or when any request has more than 512 union misses, it
 fills the batch's miss unions before attention. Otherwise it overlaps missing
-KV loads and owned miss prefetch with the attention pipeline. Payload validity is
+KV loads and per-query miss prefetch with the attention pipeline. Payload validity is
 published inside the same kernel after the copy consumers finish.
 
 CopySFA owns its kernel, Cube/Vector services, buffer utilities, vector functions
@@ -23,6 +23,10 @@ CopySFA reserves workspace from the device Cube count and launches up to that
 count according to query rows, with eight groups for small cases. Only actual
 first-fill or above-threshold work runs the two-entry Host-to-UB-to-HBM queue and the leading global
 barrier. Steady all-hit skips that stage and the trailing commit barrier.
+Pure-hit rows skip owner scans. Mixed rows scan earlier queries' compact miss
+prefixes and the three tail positions. Each query may prefetch its own copy of
+a repeated miss into private workspace, while only the earliest query persists
+it to resident KV. This avoids reading another AIV's unfinished write.
 Other steady cases publish validity in parallel from the planner's 32-bit
 mutable-tail presence masks instead of rescanning the full TopK for each miss.
 
@@ -35,6 +39,13 @@ positions. Attention remains tiled at 128 on A5; its read-ahead gather uses two 
 banks and 32 rows for at most 32 local heads, or 16 rows for larger head counts.
 This retains UB headroom while issuing the next bank's reads before writing the
 pending bank. A specialized hit-only gather avoids the mixed-source branch.
+When attention still gathers Host misses, a BF16 bit-copy vector function
+converts each gathered bank into padded NZ scratch and writes directly to L1.
+The odd scratch pitch avoids UB bank conflicts. Input-ready events are recorded
+before the next bank's H2D, so conversion does not wait for future reads.
+When every payload is already resident, including after a batch union fill,
+the kernel retains the faster GM-to-L1 layout conversion path. This decision
+uses device miss/reset state on every replay, not batch/query specialization.
 
 The membership ABI remains `(rows, 16400)` int16. Signed plans occupy
 14333:16384; the optional mixed-body permutation occupies 4096:6144; control
@@ -57,15 +68,18 @@ the schedule and score storage are adapted. The installed SDK is not modified.
 Scores use the SDK's sortable uint32 bit encoding in int32 storage. Only the
 visible pooled prefix is valid; callers must mask the remainder, including
 zero-length rows. Treating these bits as FP32 logits directly is incorrect.
-Query cumulative ends must describe one query per index row. Pooled page tables
+The standalone Indexer takes one query per index row. The fused manager takes
+request cumulative ends and constructs independent per-row pooled lengths.
+Pooled page tables
 are distinct from HiCache attention Host page tables. Runtime inputs must keep
 lengths within the reserved score columns and physical page IDs within the
 pooled key tensor, as required by the original Indexer.
 
 The current bring-up wrapper supports BF16 query/key/weights, head dimension128,
-32 or64 heads, page128, Top512 and one to eight AIC groups. The fused manager
-uses eight AIC groups and all sixteen AIVs for the final per-row TopK and
-request-owner management. Its current UB layout supports at most12416 resident
+32 or64 heads, page128, Top512 and up to the device's Cube-core count (at most64).
+The wrapper reserves workspace using hardware capacity; each launch limits its
+groups to the available row/sequence tasks. Per-query TopK and request-owner
+management use the corresponding AIV groups. The UB layout supports at most12416 resident
 tokens and six query routes. After scoring finishes, row-plan publication reuses
 the dead matrix-result UB without changing the SDK TopK buffer layout. Each row
 publishes signed slots and a compact list of payload misses. If every selected
@@ -74,13 +88,36 @@ union for all-hit, without scanning or sorting the complete resident set.
 The owner publishes its union count in request state; native CopySFA bounds
 first-fill and validity publication by that count rather than reserved capacity.
 Generation changes, rollback and newly selected unmapped sources retain full
-management. Source unions use hardware-sorted 1024-entry runs and an exact
-ordered merge. Every query's selected slots are protected before allocation.
+management. Source unions use hardware-sorted 1024-entry runs and parallel
+SIMT deduplication/rank merging. Every query's selected slots are protected before allocation.
 Allocation consumes empty slots first, then scans 2048-slot resident chunks
 from a length-hashed starting chunk, excluding every protected slot. It no
 longer sorts resident scores or uses the scalar score heap. Union suffix bytes
 are unspecified: every consumer must use the published request union count.
 Payload validity still requires physical mapping and mutable-tail checks.
+SIMT performs reset, stable miss compaction, victim selection and mapping
+updates. One request-wide VF repairs up to six query rows; outputs remain
+staged in aligned UB and published by DMA. Scratch storage is reused across
+phases, keeping the largest manager allocation at 198144 bytes.
+
+The BF16 histogram TopK now overlaps slot-map DMA with each histogram pass.
+Its survivor sidecar carries four independent int32 slots per pooled candidate;
+source IDs are not truncated and four adjacent tokens need not own adjacent
+resident slots. The sidecar reuses dead matrix-result UB and the final classifier
+still verifies Host physical mappings and mutable tails. Per-query pooled causal
+lengths remain independent; the official C8 grouped-query clipping is not copied.
+
+Queries in the same request share K loads in the BF16 score tiles when their
+pooled page tables match. The kernel checks table equality on device during
+each replay and falls back to independent rows if they differ. Grouped scoring
+covers the maximum visible pooled length of the request; each row's Top512 is
+still bounded by its own floor(length / 4). Variable route counts, empty
+requests and changes between shared and independent tables retain that contract.
+
+CopySFA prefetch workspace reserves 512 BF16 NoPE512 rows per query, shared by
+layers within each runtime instance (0.5 MiB per query, 30 MiB for B10Q6).
+The joint memory budget includes this workspace and the larger Indexer core
+capacity; no additional full Host KV copy is allocated.
 Outputs and workspace
 are supplied by the caller and remain alive through Graph destruction. Native
 launches use the Torch NPU queue and current stream without a Host callback.
@@ -123,16 +160,15 @@ pages, MemFabric allocation, PD transfer and Prefill offload remain shared with
 the existing backend; no second full Host KV payload is allocated.
 
 The official A5 algorithm adaptation is detailed in `OFFICIAL_A5_MIGRATION.md`.
-The fused SIMT classifier uses a configured Host-argument launcher with 216 KiB
+The fused and supplied-TopK SIMT kernels use configured Host-argument launchers with 216 KiB
 dynamic UB and batch scheduling, reserving 32 KiB for DCache and 8 KiB for
 runtime/stack. Its embedded ELF and launch ABI come from the same SDK build.
 
-These changes adopt the miss-only union and all-hit early-exit design, but
-do not reproduce its complete scoring pipeline: A3 packs slot/source payloads
-while scoring tiles, whereas this A5 version consumes the SDK's completed
-pooled TopK and performs slot/address lookup afterward. The mixed-core score
-join remains necessary for the current sequence partition. Supplied-TopK
-management, ordered run merges, and slot/address lookup still contain scalar loops.
+The mixed-core score join remains necessary for the current sequence partition.
+The slot sidecar overlaps histogram computation, not the entire matrix/manager
+pipeline. Candidate physical-address checks, per-request control decisions and
+DMA publication remain explicit; metadata validity is not inferred from TopK
+membership alone.
 
 The device-management component currently limits the mutable tail to32 tokens
 per query. It computes per-query tail membership and joins that information

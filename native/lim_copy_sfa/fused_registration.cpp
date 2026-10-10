@@ -15,7 +15,8 @@ void IndexerManageOut(const at::Tensor &query, const at::Tensor &key, const at::
     at::Tensor outputIds, at::Tensor outputSlots, at::Tensor membership, at::Tensor unionSources,
     at::Tensor unionSlots, at::Tensor unionPhysical, int64_t hostTokens, int64_t mutableTail)
 {
-    SglLimHost::ValidateIndexer(query, key, weights, indexEnds, poolLengths, indexTable, indices, scores, workspace, 8);
+    const int64_t cores = SglLimHost::SelectIndexerCores(query, scores, workspace);
+    SglLimHost::ValidateIndexer(query, key, weights, indexEnds, poolLengths, indexTable, indices, scores, workspace, cores);
     SglLimHost::ValidateManager(indices, scores, ends, lengths, table, requests, generations, mapping,
         sources, physical, state, outputIds, outputSlots, membership, unionSources, unionSlots,
         unionPhysical, hostTokens, mutableTail, true, true);
@@ -27,7 +28,7 @@ void IndexerManageOut(const at::Tensor &query, const at::Tensor &key, const at::
         tensor.record_stream(npuStream);
     const auto stream = npuStream.stream(false);
     auto launch = [=]() -> int {
-        return sgl_lim_configured_indexer_manage(8, stream,
+        return sgl_lim_configured_indexer_manage(static_cast<uint32_t>(cores), stream,
             query.data_ptr(), key.data_ptr(), weights.data_ptr(), indexEnds.data_ptr(), poolLengths.data_ptr(),
             indexTable.data_ptr(), indices.data_ptr(), scores.data_ptr(), workspace.data_ptr(),
             ends.data_ptr(), lengths.data_ptr(), table.data_ptr(), requests.data_ptr(), generations.data_ptr(),

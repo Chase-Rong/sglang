@@ -37,13 +37,15 @@ Changing those contracts would change model semantics.
   it computes. The decision is based on runtime union counts, not batch shape.
 - Four 512-token groups use the official request-based permutation. The three
   KPool tail positions remain outside that permutation.
-- During hit groups, each AIV submits up to four owned miss rows, overlaps
-  those reads with attention computation, and completes their HBM persistence
-  before reusing the prefetch UB or consuming the prefetched slots.
+- During hit groups, each AIV submits up to four miss rows assigned to its
+  gather slice, overlaps those reads with computation, and publishes them to
+  query-private prefetch workspace. Only the earliest query owning persistence
+  writes the resident slot. Repeated misses in later queries are still prefetched.
 - Earlier-query miss ownership suppresses duplicate MTP writebacks. A query
   that does not own persistence still reads Host data; it never assumes another
-  AIV has completed the HBM write. Positive local plans are published only for
-  this AIV's completed prefetch, while global validity waits for all consumers.
+  AIV has completed the HBM write. Completed workspace reads suppress redundant
+  writebacks locally, while global validity waits for all consumers. Pure hit
+  queries skip owner scans; mixed queries scan miss prefixes and causal tails.
 - Adjacent UB writeback rows are paired only when their destination byte gap
   is representable, without reordering payloads. BF16512 uses a 1024-byte
   payload and a 1152-byte gather row, replacing the official 656/672 sizes.
@@ -58,10 +60,27 @@ remain part of the resident contract. One target's successful copy cannot make
 another layer's payload valid.
 
 The BF16 score/TopK math and multi-core sequence partition remain based on the
-pinned CANN BF16 Indexer. The C8 PR's score-tile packed source/slot payload is
-not directly applicable to KPool4. Candidate classification occurs after the
-BF16 TopK join; this migration must not be described as complete overlap of
-all residency work with Indexer matrix computation.
+pinned CANN BF16 Indexer. Slot-map DMA overlaps the histogram TopK pass; a
+sidecar preserves four independent slots per selected pool through successive
+TopK trunks. The original C8 18-bit-source/14-bit-slot packed payload is not used.
+Candidate physical-validity classification and request management still follow
+the score join. This is not complete overlap of residency work with matrix
+computation. Runtime core selection scales with hardware and row/sequence task
+capacity rather than a fixed eight-core launch.
+
+Within a request, BF16 score tiles group queries and reuse K loads when their
+pooled page tables match. Device-side equality checks run on every replay;
+different per-query tables select independent scoring. Grouped scoring uses
+the request's maximum pooled length, then independent Top512 applies each
+query's floor(length / 4) boundary. This preserves KPool4 causality rather than
+copying the official C8 route clipping. Variable and empty request groups are
+supported without changing the native extension schema.
+
+Stable compaction, resident reset, victim selection, mapping updates and union
+publication use SIMT. Sorted union runs are deduplicated and rank-merged in
+parallel. After allocation, one request-wide VF repairs up to six query rows
+against the immutable union; aligned UB staging preserves DMA publication.
+The protected-hash replacement order remains unchanged.
 
 The native extension schema is unchanged, but union suffix semantics changed.
 Use the matching Python adapter and rebuild the native extension in a fresh
@@ -85,7 +104,7 @@ random resident sources, adds 410 misses and independently shuffles each query's
 Run correctness before collecting warm Graph samples. Shared-card component
 latency is not E2E TPOT acceptance.
 
-### Qualification on 2026-10-10
+### Initial migration qualification on 2026-10-10 (build-v6)
 
 - Local CPU/contract tests: 59 passed, one skipped because the Windows host has
   no C++ compiler. The skipped schedule-header test passed remotely.
@@ -101,10 +120,10 @@ latency is not E2E TPOT acceptance.
   SHA256 `b826a20b4b63ec4c6034a15dba86d3ca9762756863f7d4263b2283308fc87149`.
 - Previous extension: `/home/j00628475/lim_copy_sfa_ut_20261008/native-build-copysfa-v6/libsgl_lim_copy_sfa.so`,
   SHA256 `e8c447dc30ba356e3af5630e95dd2efd58d2dd1fbae88e03d36f7022cba1523d`.
-- Matching source/adapters and final tests reside under
-  `/home/j00628475/lim_official_pr_20261010/source`. The compiled v6 and final
-  source differ only by Python formatting; that formatting does not change
-  the generated launch ABI or kernel algorithms.
+- At this checkpoint, matching source/adapters and tests resided under
+  `/home/j00628475/lim_official_pr_20261010/source`. That working directory is
+  updated by later performance stages; use their saved source archives to
+  identify the exact code for each binary.
 - Logs, samples and the comparison harness are retained in the workspace's
   `results/official_pr_20261010/`, excluded from production changes.
 - Final ABBA passed 18 cases per round. Compared within the new rounds,
@@ -122,3 +141,27 @@ preserves the generated argument layout and embeds the matching mixed-core ELF;
 UB and batch scheduling. Device-only argument launch is not interchangeable
 with this Host argument buffer. The six-route manager reuses dead sorting UB
 for victims rather than exceeding the 216 KiB partition.
+
+### Performance follow-up qualification (build-perf-group1)
+
+The follow-up adds compact owner scans, independent query prefetch with one
+persistence owner, BF16 SIMD NZ conversion/direct L1 for remaining Host misses,
+SIMT resident postprocessing, runtime core selection, histogram slot-map payload
+prefetch and grouped-query K reuse. Fully resident attention retains GM-to-L1.
+No batch/query-specific compile option or additional backend selector is used.
+Copy prefetch reserves 0.5 MiB/query; the memory solver includes that scratch.
+
+- Local CPU/contract gate: 100 passed, one host-compiler skip.
+- Remote Host schedule/launcher gate: eight passed, including the C++ test.
+- Final candidate NPU gate: 82 passed, including 32/64 Indexer heads, variable
+  query counts within the six-route reservation, empty request groups,
+  zero/short pooled prefixes, different-table fallback and restoration,
+  128K/1M high IDs, remaps, rollback, generation, transfer and attention checks.
+- The short-prefix oracle selects every visible pool mathematically. The
+  installed Indexer leaves its output uninitialized for all-zero-length input;
+  the prior candidate reproduces that oracle mismatch too.
+- Binary: `build-perf-group1/libsgl_lim_copy_sfa.so`, SHA256
+  `6257b9c227cb87bf8c9a030d8b63e89179b03105e45d90b453b80050ad92ed2c`.
+- Shared-card ABBA measurements and exact source/evidence references are
+  recorded in `results/official_pr_20261010/PERFORMANCE_COMPLETION.md`.
+  Functional qualification does not imply model-step or serving TPOT gains.

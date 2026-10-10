@@ -31,9 +31,24 @@ extern "C" __global__ __aicore__ void sgl_lim_indexer_manage(
             }
             AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
                 AscendC::DcciDst::CACHELINE_OUT>(poolLengthsGm);
+            if (rows > batch) {
+                asc_vf_call<SglLim::CheckSharedPoolPages>(dim3(256),
+                    (__gm__ const int32_t *)indexTable, (__gm__ const int32_t *)ends,
+                    (__gm__ int32_t *)workspace, batch, indexColumns);
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            }
         }
     }
     AscendC::SyncAll<false>();
+    bool groupedQueries = false;
+    if (rows > batch) {
+        AscendC::GlobalTensor<int32_t> groupedGm;
+        groupedGm.SetGlobalBuffer((__gm__ int32_t *)workspace);
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+            AscendC::DcciDst::CACHELINE_OUT>(groupedGm);
+        groupedQueries = groupedGm.GetValue(0) != 0;
+    }
     SglLim::ResidentRowPlan rowPlan;
     if ASCEND_IS_AIV {
         rowPlan.Init(ends, lengths, table, requests, generations, mapping, physical, state,
@@ -41,7 +56,8 @@ extern "C" __global__ __aicore__ void sgl_lim_indexer_manage(
             capacity, columns, hostTokens, mutableTail);
     }
     RunSglIndexer(query, key, weights, indexEnds, poolLengths, indexTable, indices,
-        scores, workspace, rows, heads, pools, indexColumns, pipe, rowPlan);
+        scores, workspace, rows, heads, pools, indexColumns, pipe, rowPlan,
+        ends, lengths, requests, mapping, batch, requestCapacity, sourceCapacity, groupedQueries);
     AscendC::SyncAll<false>();
     pipe.Reset();
     if ASCEND_IS_AIV {

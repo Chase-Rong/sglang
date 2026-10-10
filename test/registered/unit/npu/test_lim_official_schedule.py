@@ -112,7 +112,10 @@ def test_configured_launcher_preserves_generated_abi(tmp_path):
         "    KernelHandleGradUnregister::GetInstance();\n"
         "    return __ascendc_ret;\n}\n"
     )
-    (stub_directory / "host_stub.cpp").write_text(stub, encoding="utf-8")
+    manager_stub = stub.replace("indexer_manage", "manage").replace(
+        "(2, numBlocks", "(1, numBlocks"
+    )
+    (stub_directory / "host_stub.cpp").write_text(stub + manager_stub, encoding="utf-8")
     binary_directory = tmp_path / "sgl_lim_indexer_kernel_merge_obj_dir"
     binary_directory.mkdir()
     binary = binary_directory / "device.o"
@@ -125,6 +128,8 @@ def test_configured_launcher_preserves_generated_abi(tmp_path):
     assert "SglLimLaunchConfigured(numBlocks, stream, &__ascendc_args" in generated
     assert "launch_and_profiling" not in generated
     assert "KernelHandleGradUnregister" not in generated
+    assert "sgl_lim_configured_manage" in generated
+    assert '"sgl_lim_manage_1"' in generated
     assert "127,69,76,70,0,1" in generated
     binary.write_bytes(b"not an ELF")
     with pytest.raises(ValueError, match="mixed-core ELF"):

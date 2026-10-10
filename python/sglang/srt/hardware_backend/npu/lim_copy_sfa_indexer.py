@@ -79,7 +79,10 @@ class NativePooledIndexer:
         self.ops = native_indexer_ops()
         self.rows = row_capacity
         self.raw_columns = (spec.source_capacity // 4 + 127) // 128 * 128
-        self.cores = 8
+        hardware_cores = torch.npu.get_device_properties(device).cube_core_num
+        if not 0 < hardware_cores <= 64:
+            raise ValueError("LIM requires an A5 device with 1..64 Cube cores")
+        self.cores = min(hardware_cores, row_capacity * (self.raw_columns // 128))
         self.ends = torch.arange(1, row_capacity + 1, device=device, dtype=torch.int32)
         self.lengths = torch.empty_like(self.ends)
         self.indices = torch.empty(
@@ -123,7 +126,7 @@ class NativePooledIndexer:
             self.indices[:rows],
             self.raw_scores[:rows],
             self.workspace,
-            self.cores,
+            min(self.cores, rows * (self.raw_columns // 128)),
         )
         _decode_scores[(rows, triton.cdiv(self.scores.shape[1], 256))](
             self.raw_scores,
