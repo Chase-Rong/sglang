@@ -105,6 +105,8 @@ def test_fused_native_indexer_and_manager(batch, routes):
                 lengths.copy_(lengths_cpu)
             if iteration == 6:
                 generations.add_(1)
+            if iteration == 7 and routes > 1:
+                index_table[1::routes].copy_(index_table[1::routes].flip(1))
             graph.replay()
             torch.npu.synchronize()
             baseline, _ = torch_npu.npu_lightning_indexer(

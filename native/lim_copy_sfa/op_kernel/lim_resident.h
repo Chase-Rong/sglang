@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "lim_classify.h"
 #include "lim_schedule.h"
 
 namespace SglLim {
@@ -47,7 +48,7 @@ public:
         encoded = encodedScores;
         prepared = preparedRows;
         pipe.InitBuffer(unionBuffer, unionSize * 4);
-        pipe.InitBuffer(residentBuffer, capacity * 4);
+        pipe.InitBuffer(residentBuffer, (capacity < 5120 ? 5120 : capacity) * 4);
         pipe.InitBuffer(heapBuffer, capacity * 4);
         pipe.InitBuffer(rowBuffer, 2080 * 16);
         unionLocal = unionBuffer.Get<int32_t>();
@@ -72,26 +73,16 @@ private:
     {
         int64_t owner = requestsGm.GetValue(request);
         if (owner > 0 && owner < requestCount) stateGm.SetValue(owner * 16 + 3, unique);
-        LocalTensor<int64_t> rowPhysical = rowPlan.ReinterpretCast<int64_t>();
-        for (uint32_t base = 0; base < unique; base += 1024) {
-            uint32_t count = unique - base < 1024 ? unique - base : 1024;
-            for (uint32_t local = 0; local < count; ++local) {
-                int32_t token = unionLocal.GetValue(base + local);
-                int32_t slot = mappingGm.GetValue(mapBase + token);
-                int32_t page = tableGm.GetValue(static_cast<uint64_t>(request) * tableColumns + token / 128);
-                rowIds.SetValue(local, token);
-                rowSlots.SetValue(local, slot);
-                rowPhysical.SetValue(local, static_cast<int64_t>(page) * 128 + token % 128);
-            }
-            SetFlag<HardEvent::S_MTE3>(EVENT_ID7);
-            WaitFlag<HardEvent::S_MTE3>(EVENT_ID7);
-            uint64_t offset = static_cast<uint64_t>(request) * unionSize + base;
-            DataCopyPad(unionSourcesGm[offset], rowIds, DataCopyExtParams{1, count * 4, 0, 0, 0});
-            DataCopyPad(unionSlotsGm[offset], rowSlots, DataCopyExtParams{1, count * 4, 0, 0, 0});
-            DataCopyPad(unionPhysicalGm[offset], rowPhysical, DataCopyExtParams{1, count * 8, 0, 0, 0});
-            SetFlag<HardEvent::MTE3_S>(EVENT_ID7);
-            WaitFlag<HardEvent::MTE3_S>(EVENT_ID7);
-        }
+        if (unique == 0) return;
+        SetFlag<HardEvent::S_V>(EVENT_ID7);
+        WaitFlag<HardEvent::S_V>(EVENT_ID7);
+        asc_vf_call<PublishMissUnion>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+            (__gm__ const int32_t *)mappingGm.GetPhyAddr(), (__gm__ const int32_t *)tableGm.GetPhyAddr(),
+            (__gm__ int32_t *)unionSourcesGm.GetPhyAddr(), (__gm__ int32_t *)unionSlotsGm.GetPhyAddr(),
+            (__gm__ int64_t *)unionPhysicalGm.GetPhyAddr(), mapBase,
+            static_cast<uint64_t>(request) * tableColumns, static_cast<uint64_t>(request) * unionSize, unique);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
     }
 
     __aicore__ inline bool FinishPrepared(uint32_t request, int32_t start, int32_t end,
@@ -108,121 +99,104 @@ private:
         stateGm.SetValue(owner * 16 + 2, 0);
         uint32_t unique = 0;
         if (totalMisses > 0) {
-            Duplicate(residentLocal, static_cast<int32_t>(0), capacity);
+            asc_vf_call<CollectPreparedUnion>(dim3(256),
+                (__gm__ const int16_t *)membershipGm.GetPhyAddr(), (__gm__ const int32_t *)outputIdsGm.GetPhyAddr(),
+                (__gm__ const int32_t *)outputSlotsGm.GetPhyAddr(), (__ubuf__ uint32_t *)residentLocal.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ uint32_t *)rowIds.GetPhyAddr(),
+                static_cast<uint32_t>(start), static_cast<uint32_t>(end), totalMisses, capacity);
             SetFlag<HardEvent::V_S>(EVENT_ID7);
             WaitFlag<HardEvent::V_S>(EVENT_ID7);
-            for (int32_t row = start; row < end; ++row) {
-                uint64_t rowBase = static_cast<uint64_t>(row) * 16400;
-                int32_t count = membershipGm.GetValue(rowBase + 16391);
-                for (int32_t index = 0; index < count; ++index) {
-                    int32_t column = membershipGm.GetValue(rowBase + index);
-                    int32_t slot = outputSlotsGm.GetValue(static_cast<uint64_t>(row) * 2051 + column);
-                    if (residentLocal.GetValue(slot) == 0) {
-                        residentLocal.SetValue(slot, 1);
-                        unionLocal.SetValue(unique++, outputIdsGm.GetValue(static_cast<uint64_t>(row) * 2051 + column));
-                    }
-                }
-            }
+            unique = rowIds.GetValue(255);
         }
         PublishUnion(request, unique, owner * sourceCount);
         return true;
     }
 
-    __aicore__ inline int32_t Token(uint32_t row, uint32_t column)
+    __aicore__ inline void ClassifyRow(uint32_t request, uint32_t row, int64_t owner,
+        uint32_t unique, bool repair)
     {
-        int32_t length = lengthsGm.GetValue(row);
-        if (!pooled) {
-            return idsGm.GetValue(static_cast<uint64_t>(row) * 2051 + column);
-        }
-        if (length <= 2048) {
-            return static_cast<int32_t>(column) < length ? column : -1;
-        }
-        if (column >= 2048) {
-            int32_t token = length / 4 * 4 + column - 2048;
-            return token < length ? token : -1;
-        }
-        int32_t pool = idsGm.GetValue(static_cast<uint64_t>(row) * 512 + column / 4);
-        return pool >= 0 && pool < length / 4 ? pool * 4 + column % 4 : -1;
-    }
-
-    __aicore__ inline int64_t Address(uint32_t request, uint32_t row, int32_t token)
-    {
-        if (token < 0 || token >= sourceCount || token >= lengthsGm.GetValue(row) || token / 128 >= tableColumns) {
-            return -1;
-        }
-        int32_t page = tableGm.GetValue(static_cast<uint64_t>(request) * tableColumns + token / 128);
-        int64_t address = static_cast<int64_t>(page) * 128 + token % 128;
-        return page >= 0 && address < hostSize ? address : -1;
+        bool active = owner > 0 && owner < requestCount;
+        SetFlag<HardEvent::S_V>(EVENT_ID7);
+        WaitFlag<HardEvent::S_V>(EVENT_ID7);
+        asc_vf_call<ClassifyManagedRows>(dim3(256), (__gm__ const int32_t *)idsGm.GetPhyAddr(),
+            (__gm__ const int32_t *)tableGm.GetPhyAddr(), (__gm__ const int32_t *)mappingGm.GetPhyAddr(),
+            (__gm__ const int64_t *)physicalGm.GetPhyAddr(), (__gm__ const int32_t *)lengthsGm.GetPhyAddr(),
+            (__ubuf__ int32_t *)rowIds.GetPhyAddr(),
+            (__ubuf__ int32_t *)rowSlots.GetPhyAddr(), (__ubuf__ int16_t *)rowPlan.GetPhyAddr(),
+            (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ const int32_t *)heapLocal.GetPhyAddr(),
+            static_cast<uint64_t>(request) * tableColumns, static_cast<uint64_t>(active ? owner : 0) * sourceCount,
+            static_cast<uint64_t>(active ? owner : 0) * capacity, hostSize, sourceCount, capacity, tableColumns,
+            row, row + 1, tailSize, unique, pooled, active, repair);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
     }
 
     __aicore__ inline uint32_t SortUnion(uint32_t count)
     {
+        if (count == 0) return 0;
         auto keys = rowIds.ReinterpretCast<float>();
         auto indices = rowIds[1024].ReinterpretCast<uint32_t>();
         auto pairs = rowIds[2048].ReinterpretCast<float>();
         auto scratch = rowIds[4096].ReinterpretCast<float>();
         uint32_t chunks = (count + 1023) / 1024;
-        uint32_t cursors[16] = {};
-        uint32_t limits[16] = {};
         for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
             uint32_t base = chunk * 1024;
             uint32_t valid = count - base < 1024 ? count - base : 1024;
             uint32_t padded = (valid + 31) / 32 * 32;
-            cursors[chunk] = base;
-            limits[chunk] = base + valid;
-            for (uint32_t index = 0; index < padded; ++index) {
-                int32_t token = index < valid ? unionLocal.GetValue(base + index) : -1;
-                keys.SetValue(index, token >= 0 ? -static_cast<float>(token) : -1.0e20F);
-                indices.SetValue(index, static_cast<uint32_t>(token));
-            }
             SetFlag<HardEvent::S_V>(EVENT_ID7);
             WaitFlag<HardEvent::S_V>(EVENT_ID7);
+            asc_vf_call<PrepareUnionSort>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+                (__ubuf__ float *)keys.GetPhyAddr(), (__ubuf__ uint32_t *)indices.GetPhyAddr(), base, valid, padded);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
             Sort<float, true>(pairs, keys, indices, scratch, padded / 32);
             SetFlag<HardEvent::V_S>(EVENT_ID7);
             WaitFlag<HardEvent::V_S>(EVENT_ID7);
-            for (uint32_t index = 0; index < valid; ++index)
-                unionLocal.SetValue(base + index, pairs.ReinterpretCast<int32_t>().GetValue(index * 2 + 1));
+            asc_vf_call<UnpackUnionSort>(dim3(256), (__ubuf__ const int32_t *)pairs.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), base, valid);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
         }
+        auto prefixes = rowIds.ReinterpretCast<uint16_t>();
+        auto counts = rowIds[8192 - 256].ReinterpretCast<uint32_t>();
+        asc_vf_call<BuildUnionPrefixes>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+            (__ubuf__ uint16_t *)prefixes.GetPhyAddr(), (__ubuf__ uint32_t *)counts.GetPhyAddr(), count);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
         uint32_t unique = 0;
-        int32_t previous = -1;
-        for (uint32_t index = 0; index < count; ++index) {
-            int32_t smallest = 0x7FFFFFFF;
-            uint32_t selected = 0;
-            for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-                if (cursors[chunk] == limits[chunk]) continue;
-                int32_t token = unionLocal.GetValue(cursors[chunk]);
-                if (token < smallest) {
-                    smallest = token;
-                    selected = chunk;
-                }
-            }
-            ++cursors[selected];
-            if (smallest != previous) {
-                if (unique == capacity) return capacity + 1;
-                residentLocal.SetValue(unique++, smallest);
-                previous = smallest;
-            }
+        for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+            uint32_t limit = (chunk + 1) * 1024 < count ? (chunk + 1) * 1024 : count;
+            unique += prefixes.GetValue(limit - 1);
         }
-        for (uint32_t index = 0; index < unique; ++index)
-            unionLocal.SetValue(index, residentLocal.GetValue(index));
+        if (unique > capacity) return capacity + 1;
+        asc_vf_call<MergeUniqueUnion>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+            (__ubuf__ const uint16_t *)prefixes.GetPhyAddr(), (__ubuf__ int32_t *)residentLocal.GetPhyAddr(),
+            count, capacity);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
+        asc_vf_call<CopyUnion>(dim3(256), (__ubuf__ const int32_t *)residentLocal.GetPhyAddr(),
+            (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), unique);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
         return unique;
     }
 
-    __aicore__ inline void CopyRow(uint32_t row)
+    __aicore__ inline void CopyRow(uint32_t row, LocalTensor<int32_t> ids, LocalTensor<int32_t> slots,
+        LocalTensor<int16_t> plans, LocalTensor<int16_t> misses, LocalTensor<int16_t> hits)
     {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID7);
         WaitFlag<HardEvent::S_MTE3>(EVENT_ID7);
-        DataCopyPad(outputIdsGm[static_cast<uint64_t>(row) * 2051], rowIds, {1, 2051 * 4, 0, 0});
-        DataCopyPad(outputSlotsGm[static_cast<uint64_t>(row) * 2051], rowSlots, {1, 2051 * 4, 0, 0});
-        DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 16384 - 2051], rowPlan, {1, 2051 * 2, 0, 0});
-        DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 16384], rowPlan[2064], {1, 22, 0, 0});
-        uint32_t misses = static_cast<uint16_t>(rowPlan.GetValue(2074));
-        if (misses > 0 && misses < 2048)
+        DataCopyPad(outputIdsGm[static_cast<uint64_t>(row) * 2051], ids, {1, 2051 * 4, 0, 0});
+        DataCopyPad(outputSlotsGm[static_cast<uint64_t>(row) * 2051], slots, {1, 2051 * 4, 0, 0});
+        DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 16384 - 2051], plans, {1, 2051 * 2, 0, 0});
+        DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 16384], plans[2064], {1, 22, 0, 0});
+        uint32_t count = static_cast<uint16_t>(plans.GetValue(2074));
+        if (count > 0 && count < 2048)
             DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 4096],
-                rowIds[6240].ReinterpretCast<int16_t>(), DataCopyExtParams{1, misses * 2, 0, 0, 0});
-        if (misses > 0 && misses < 2048)
-            DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 4096 + misses],
-                rowIds[7280].ReinterpretCast<int16_t>(), DataCopyExtParams{1, (2048 - misses) * 2, 0, 0, 0});
+                misses, DataCopyExtParams{1, count * 2, 0, 0, 0});
+        if (count > 0 && count < 2048)
+            DataCopyPad(membershipGm[static_cast<uint64_t>(row) * 16400 + 4096 + count],
+                hits, DataCopyExtParams{1, (2048 - count) * 2, 0, 0, 0});
         SetFlag<HardEvent::MTE3_S>(EVENT_ID7);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID7);
     }
@@ -248,109 +222,96 @@ private:
         if (active) {
             stateGm.SetValue(owner * 16 + 2, reset);
             if (reset) {
-                for (uint32_t slot = 0; slot < capacity; ++slot) {
-                    int32_t previous = sourcesGm.GetValue(residentBase + slot);
-                    if (previous >= 0 && previous < sourceCount) mappingGm.SetValue(mapBase + previous, -1);
-                    sourcesGm.SetValue(residentBase + slot, -1);
-                    physicalGm.SetValue(residentBase + slot, -1);
-                }
+                asc_vf_call<ResetResident>(dim3(256), (__gm__ int32_t *)mappingGm.GetPhyAddr(),
+                    (__gm__ int32_t *)sourcesGm.GetPhyAddr(), (__gm__ int64_t *)physicalGm.GetPhyAddr(),
+                    mapBase, residentBase, sourceCount, capacity);
+                SetFlag<HardEvent::V_S>(EVENT_ID7);
+                WaitFlag<HardEvent::V_S>(EVENT_ID7);
             }
         }
-        Duplicate(heapLocal, static_cast<int32_t>(0), capacity);
+        Duplicate(heapLocal, static_cast<int32_t>(1), capacity);
         SetFlag<HardEvent::V_S>(EVENT_ID7);
         WaitFlag<HardEvent::V_S>(EVENT_ID7);
         for (int32_t row = start; row < end && active; ++row) {
-            for (uint32_t column = 0; column < 2051; ++column) {
-                int32_t token = Token(row, column);
-                int64_t address = Address(request, row, token);
-                if (address < 0) continue;
-                int32_t slot = mappingGm.GetValue(mapBase + token);
-                bool mapped = slot >= 0 && slot < capacity;
-                if (mapped) heapLocal.SetValue(slot, 1);
-                bool hit = mapped && physicalGm.GetValue(residentBase + slot) == address &&
-                    token < lengthsGm.GetValue(row) - static_cast<int32_t>(tailSize);
-                if (!hit) unionLocal.SetValue(total++, token);
-            }
+            ClassifyRow(request, row, owner, 0, false);
+            asc_vf_call<CollectRowMisses>(dim3(256), (__ubuf__ const int32_t *)rowIds.GetPhyAddr(),
+                (__ubuf__ const int32_t *)rowSlots.GetPhyAddr(), (__ubuf__ const int16_t *)rowPlan.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ uint32_t *)heapLocal.GetPhyAddr(),
+                (__ubuf__ uint32_t *)rowPlan[2080].GetPhyAddr(), total);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
+            total += rowPlan[2080].ReinterpretCast<uint32_t>().GetValue(255);
         }
         uint32_t unique = SortUnion(total);
         if (unique > capacity) return;
-        uint32_t missing = 0;
-        for (uint32_t index = 0; index < unique; ++index) {
-            int32_t slot = mappingGm.GetValue(mapBase + unionLocal.GetValue(index));
-            if (slot < 0 || slot >= capacity) ++missing;
-        }
-        uint32_t victims = 0;
-        for (uint32_t slot = 0; slot < capacity && victims < missing; ++slot) {
-            if (heapLocal.GetValue(slot) == 0 && sourcesGm.GetValue(residentBase + slot) < 0) {
-                victimLocal.SetValue(victims++, slot);
-                heapLocal.SetValue(slot, 1);
+        if (unique > 0) {
+            auto ranks = rowIds.ReinterpretCast<uint16_t>();
+            auto counts = rowIds[8192 - 256].ReinterpretCast<uint32_t>();
+            asc_vf_call<RankNewSlots>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+                (__ubuf__ uint16_t *)ranks.GetPhyAddr(), (__ubuf__ uint32_t *)counts.GetPhyAddr(),
+                (__gm__ const int32_t *)mappingGm.GetPhyAddr(), mapBase, unique, capacity);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
+            uint32_t missing = counts.GetValue(255);
+            if (missing > 0) {
+                uint32_t chunks = (capacity + 2047) / 2048;
+                uint32_t firstChunk = SglLimSchedule::HashVictimScanSeed(maxLength) % chunks;
+                asc_vf_call<SelectVictims>(dim3(256), (__ubuf__ const int32_t *)heapLocal.GetPhyAddr(),
+                    (__ubuf__ int32_t *)victimLocal.GetPhyAddr(), (__ubuf__ uint32_t *)counts.GetPhyAddr(),
+                    (__gm__ const int32_t *)sourcesGm.GetPhyAddr(), residentBase, capacity, missing, firstChunk * 2048);
+                SetFlag<HardEvent::V_S>(EVENT_ID7);
+                WaitFlag<HardEvent::V_S>(EVENT_ID7);
+                if (counts.GetValue(255) < missing) return;
             }
-        }
-        uint32_t chunks = (capacity + 2047) / 2048;
-        uint32_t firstChunk = SglLimSchedule::HashVictimScanSeed(maxLength) % chunks;
-        for (uint32_t visit = 0; visit < chunks && victims < missing; ++visit) {
-            uint32_t chunk = (firstChunk + visit) % chunks;
-            uint32_t limit = (chunk + 1) * 2048 < capacity ? (chunk + 1) * 2048 : capacity;
-            for (uint32_t slot = chunk * 2048; slot < limit && victims < missing; ++slot) {
-                if (heapLocal.GetValue(slot) != 0) continue;
-                victimLocal.SetValue(victims++, slot);
-                heapLocal.SetValue(slot, 1);
-            }
-        }
-        if (victims != missing) return;
-        uint32_t cursor = 0;
-        for (uint32_t index = 0; index < unique; ++index) {
-            int32_t token = unionLocal.GetValue(index);
-            int32_t slot = mappingGm.GetValue(mapBase + token);
-            if (slot >= 0 && slot < capacity) continue;
-            slot = victimLocal.GetValue(cursor++);
-            int32_t previous = sourcesGm.GetValue(residentBase + slot);
-            if (previous >= 0) mappingGm.SetValue(mapBase + previous, -1);
-            mappingGm.SetValue(mapBase + token, slot);
-            sourcesGm.SetValue(residentBase + slot, token);
-            physicalGm.SetValue(residentBase + slot, -1);
+            asc_vf_call<ApplyResidentUpdates>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+                (__ubuf__ const uint16_t *)ranks.GetPhyAddr(), (__ubuf__ const int32_t *)victimLocal.GetPhyAddr(),
+                (__ubuf__ int32_t *)heapLocal.GetPhyAddr(), (__gm__ int32_t *)mappingGm.GetPhyAddr(),
+                (__gm__ int32_t *)sourcesGm.GetPhyAddr(), (__gm__ int64_t *)physicalGm.GetPhyAddr(),
+                mapBase, residentBase, unique, sourceCount);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
         }
         if (active) {
             stateGm.SetValue(owner * 16, generationsGm.GetValue(owner));
             stateGm.SetValue(owner * 16 + 1, maxLength);
         }
         PublishUnion(request, unique, mapBase);
+        if (unique > 0) {
+            asc_vf_call<CopyUnion>(dim3(256), (__ubuf__ const int32_t *)unionLocal.GetPhyAddr(),
+                (__ubuf__ int32_t *)residentLocal.GetPhyAddr(), unique);
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
+        }
+        asc_vf_call<ClassifyManagedRows>(dim3(256), (__gm__ const int32_t *)idsGm.GetPhyAddr(),
+            (__gm__ const int32_t *)tableGm.GetPhyAddr(), (__gm__ const int32_t *)mappingGm.GetPhyAddr(),
+            (__gm__ const int64_t *)physicalGm.GetPhyAddr(), (__gm__ const int32_t *)lengthsGm.GetPhyAddr(),
+            (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ int32_t *)nullptr,
+            (__ubuf__ int16_t *)rowIds.GetPhyAddr(), (__ubuf__ const int32_t *)residentLocal.GetPhyAddr(),
+            (__ubuf__ const int32_t *)heapLocal.GetPhyAddr(), static_cast<uint64_t>(request) * tableColumns,
+            mapBase, residentBase, hostSize, sourceCount, capacity, tableColumns,
+            static_cast<uint32_t>(start), static_cast<uint32_t>(end), tailSize, unique, pooled, active, true);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
         for (int32_t row = start; row < end; ++row) {
-            uint32_t mutablePresence = 0;
-            uint32_t bodyMisses = 0;
-            uint32_t bodyHits = 0;
-            auto missOrder = rowIds[6240].ReinterpretCast<int16_t>();
-            auto hitOrder = rowIds[7280].ReinterpretCast<int16_t>();
-            for (uint32_t column = 0; column < 2051; ++column) {
-                int32_t token = active ? Token(row, column) : -1;
-                int64_t address = Address(request, row, token);
-                int32_t slot = address >= 0 ? mappingGm.GetValue(mapBase + token) : -1;
-                bool valid = slot >= 0 && slot < capacity;
-                bool hit = valid && physicalGm.GetValue(residentBase + slot) == address &&
-                    token < lengthsGm.GetValue(row) - static_cast<int32_t>(tailSize);
-                int32_t tailOffset = token - lengthsGm.GetValue(row) + static_cast<int32_t>(tailSize);
-                if (valid && tailOffset >= 0 && tailOffset < 32)
-                    mutablePresence |= 1U << tailOffset;
-                rowIds.SetValue(column, valid ? token : -1);
-                rowSlots.SetValue(column, valid ? slot : -1);
-                rowPlan.SetValue(column, valid ? (hit ? slot + 1 : -slot - 1) : 0);
-                if (column < 2048 && valid && !hit) missOrder.SetValue(bodyMisses++, column);
-            }
-            if (bodyMisses > 0 && bodyMisses < 2048)
-                for (uint32_t column = 0; column < 2048; ++column)
-                    if (rowPlan.GetValue(column) >= 0) hitOrder.SetValue(bodyHits++, column);
-            rowPlan.SetValue(2064, 0x5A4D);
-            rowPlan.SetValue(2065, 0x5A45);
-            rowPlan.SetValue(2066, 2051);
-            rowPlan.SetValue(2067, 16384 - 2051);
-            rowPlan.SetValue(2068, active ? owner : 0);
-            rowPlan.SetValue(2069, 0x5A44);
-            rowPlan.SetValue(2070, capacity);
-            rowPlan.SetValue(2071, 0);
-            rowPlan.SetValue(2072, static_cast<int16_t>(mutablePresence & 0xFFFFU));
-            rowPlan.SetValue(2073, static_cast<int16_t>(mutablePresence >> 16));
-            rowPlan.SetValue(2074, bodyMisses);
-            CopyRow(row);
+            auto tokens = unionLocal[(row - start) * 2080];
+            auto plans = rowIds.ReinterpretCast<int16_t>()[(row - start) * 2080];
+            auto missOrder = residentLocal[2080].ReinterpretCast<int16_t>();
+            auto hitOrder = residentLocal[3120].ReinterpretCast<int16_t>();
+            asc_vf_call<CompactRowPlan>(dim3(256), (__ubuf__ const int32_t *)tokens.GetPhyAddr(),
+                (__ubuf__ int16_t *)plans.GetPhyAddr(), (__ubuf__ int16_t *)missOrder.GetPhyAddr(),
+                (__ubuf__ int16_t *)hitOrder.GetPhyAddr(), (__ubuf__ uint32_t *)residentLocal[4160].GetPhyAddr(),
+                lengthsGm.GetValue(row), tailSize, false, (__ubuf__ int32_t *)residentLocal.GetPhyAddr());
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
+            plans.SetValue(2064, 0x5A4D);
+            plans.SetValue(2065, 0x5A45);
+            plans.SetValue(2066, 2051);
+            plans.SetValue(2067, 16384 - 2051);
+            plans.SetValue(2068, active ? owner : 0);
+            plans.SetValue(2069, 0x5A44);
+            plans.SetValue(2070, capacity);
+            plans.SetValue(2071, 0);
+            CopyRow(row, tokens, residentLocal, plans, missOrder, hitOrder);
         }
     }
 

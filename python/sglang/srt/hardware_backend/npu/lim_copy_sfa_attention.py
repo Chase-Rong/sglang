@@ -10,7 +10,9 @@ class NativeCopySparseAttention:
         self.ops = native_indexer_ops()
         self.core_count = torch.npu.get_device_properties(device).cube_core_num
         self.workspace = torch.empty(
-            self.core_count * 3 * 128 * 576 * 2 + row_capacity * 4,
+            self.core_count * 3 * 128 * 576 * 2
+            + (row_capacity * 4 + 31) // 32 * 32
+            + row_capacity * 512 * 512 * 2,
             dtype=torch.uint8,
             device=device,
         )

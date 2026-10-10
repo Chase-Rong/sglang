@@ -50,7 +50,8 @@ void CopyOut(const at::Tensor &query, const at::Tensor &host, at::Tensor residen
         "Invalid CopySFA union");
     TORCH_CHECK(cores > 0 && cores <= 64, "CopySFA core count exceeds the qualified A5 range");
     TORCH_CHECK(workspace.device() == query.device() && workspace.scalar_type() == at::kByte &&
-        workspace.is_contiguous() && workspace.numel() >= cores * 3 * 128 * 576 * 2 + query.size(0) * 4,
+        workspace.is_contiguous() && workspace.numel() >= cores * 3 * 128 * 576 * 2 +
+            (query.size(0) * 4 + 31) / 32 * 32 + query.size(0) * 512 * 512 * 2,
         "CopySFA workspace is too small");
     TORCH_CHECK(mutableTail >= 0 && mutableTail <= 32 && std::isfinite(scale), "Invalid CopySFA attributes");
     c10::DeviceGuard guard(query.device());

@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <algorithm>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -7,6 +8,20 @@
 #include "validation.h"
 
 namespace SglLimHost {
+
+int64_t SelectIndexerCores(const at::Tensor &query, const at::Tensor &scores, const at::Tensor &workspace)
+{
+    TORCH_CHECK(query.dim() == 3 && query.size(0) > 0 && scores.dim() == 2 && scores.size(1) > 0,
+        "Invalid LIM dimensions for runtime tiling");
+    const int64_t bytesPerCore = 4 * scores.size(1) * 4;
+    TORCH_CHECK(workspace.dim() == 1 && workspace.numel() % bytesPerCore == 0,
+        "LIM workspace must reserve an integral number of cores");
+    const int64_t capacity = workspace.numel() / bytesPerCore;
+    TORCH_CHECK(capacity >= 1 && capacity <= 64,
+        "LIM workspace core capacity exceeds the supported A5 range");
+    const int64_t tasks = query.size(0) * ((scores.size(1) + 127) / 128);
+    return std::min(capacity, tasks);
+}
 
 void Validate(const at::Tensor &tensor, const at::Tensor &query, at::ScalarType dtype, const char *name)
 {
@@ -46,7 +61,8 @@ void ValidateIndexer(const at::Tensor &query, const at::Tensor &key, const at::T
     TORCH_CHECK(scores.dim() == 2 && scores.size(0) == rows && scores.size(1) >= 128 &&
         scores.size(1) <= (1 << 19) && scores.size(1) % 128 == 0 && table.size(1) * 128 >= scores.size(1),
         "Scores must cover the page-aligned pooled source capacity");
-    TORCH_CHECK(cores >= 1 && cores <= 8, "Invalid LIM core count");
+    TORCH_CHECK(cores >= 1 && cores <= SelectIndexerCores(query, scores, workspace),
+        "LIM core count exceeds reserved workspace or available tasks");
     TORCH_CHECK(workspace.numel() >= cores * 4 * scores.size(1) * 4, "LIM workspace is too small");
 }
 

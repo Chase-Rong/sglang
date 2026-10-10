@@ -8,7 +8,7 @@ using namespace AscendC;
 
 struct EmptyRowPlan {
     __aicore__ inline void BindScratch(LocalTensor<int32_t>) {}
-    __aicore__ inline void operator()(uint32_t, LocalTensor<uint32_t>) {}
+    __aicore__ inline void operator()(uint32_t, LocalTensor<uint32_t>, __ubuf__ const int32_t *) {}
 };
 
 class ResidentRowPlan {
@@ -48,7 +48,8 @@ public:
         hitLocal = tokenLocal[8320].ReinterpretCast<int16_t>();
     }
 
-    __aicore__ inline void operator()(uint32_t row, LocalTensor<uint32_t> pools)
+    __aicore__ inline void operator()(uint32_t row, LocalTensor<uint32_t> pools,
+        __ubuf__ const int32_t *prefetchedSlots)
     {
         uint32_t request = 0;
         while (request < batchCount && endsGm.GetValue(request) <= row) ++request;
@@ -65,7 +66,6 @@ public:
         bool ready = active && stateGm.GetValue(owner * 16) == generationsGm.GetValue(owner) &&
             maxLength >= stateGm.GetValue(owner * 16 + 1);
         int32_t misses = 0;
-        uint32_t mutablePresence = 0;
         uint32_t bodyMisses = 0;
         uint32_t bodyHits = 0;
         SetFlag<HardEvent::S_V>(EVENT_ID7);
@@ -77,22 +77,20 @@ public:
             (__gm__ const int64_t *)physicalGm.GetPhyAddr(), static_cast<uint64_t>(request) * tableColumns,
             static_cast<uint64_t>(active ? owner : 0) * sourceCount,
             static_cast<uint64_t>(active ? owner : 0) * residentCount, hostSize, sourceCount,
-            residentCount, tableColumns, length, tailSize, active);
+            residentCount, tableColumns, length, tailSize, active, prefetchedSlots);
         SetFlag<HardEvent::V_S>(EVENT_ID7);
         WaitFlag<HardEvent::V_S>(EVENT_ID7);
-        for (uint32_t column = 0; column < 2051; ++column) {
-            int32_t token = tokenLocal.GetValue(column);
-            int16_t plan = planLocal.GetValue(column);
-            if (token >= 0 && plan == 0) ready = false;
-            int32_t tailOffset = token - length + static_cast<int32_t>(tailSize);
-            if (token >= 0 && tailOffset >= 0 && tailOffset < 32)
-                mutablePresence |= 1U << tailOffset;
-            if (plan < 0) missLocal.SetValue(misses++, column);
-            if (column < 2048 && plan < 0) ++bodyMisses;
-        }
-        if (bodyMisses > 0 && bodyMisses < 2048)
-            for (uint32_t column = 0; column < 2048; ++column)
-                if (planLocal.GetValue(column) >= 0) hitLocal.SetValue(bodyHits++, column);
+        asc_vf_call<CompactRowPlan>(dim3(256),
+            (__ubuf__ const int32_t *)tokenLocal.GetPhyAddr(), (__ubuf__ int16_t *)planLocal.GetPhyAddr(),
+            (__ubuf__ int16_t *)missLocal.GetPhyAddr(), (__ubuf__ int16_t *)hitLocal.GetPhyAddr(),
+            (__ubuf__ uint32_t *)planLocal[2080].GetPhyAddr(), length, tailSize, ready,
+            (__ubuf__ int32_t *)nullptr);
+        SetFlag<HardEvent::V_S>(EVENT_ID7);
+        WaitFlag<HardEvent::V_S>(EVENT_ID7);
+        misses = planLocal.GetValue(2071);
+        ready = misses >= 0;
+        bodyMisses = static_cast<uint16_t>(planLocal.GetValue(2074));
+        bodyHits = bodyMisses > 0 && bodyMisses < 2048 ? 2048 - bodyMisses : 0;
         planLocal.SetValue(2064, 0x5A4D);
         planLocal.SetValue(2065, 0x5A45);
         planLocal.SetValue(2066, 2051);
@@ -100,10 +98,6 @@ public:
         planLocal.SetValue(2068, active ? owner : 0);
         planLocal.SetValue(2069, 0x5A44);
         planLocal.SetValue(2070, residentCount);
-        planLocal.SetValue(2071, ready ? misses : -1);
-        planLocal.SetValue(2072, static_cast<int16_t>(mutablePresence & 0xFFFFU));
-        planLocal.SetValue(2073, static_cast<int16_t>(mutablePresence >> 16));
-        planLocal.SetValue(2074, bodyMisses);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID7);
         WaitFlag<HardEvent::S_MTE3>(EVENT_ID7);
         DataCopyPad(outputIdsGm[static_cast<uint64_t>(row) * 2051], tokenLocal, {1, 2051 * 4, 0, 0});

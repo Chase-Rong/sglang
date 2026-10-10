@@ -25,6 +25,7 @@ struct CopySparseAttentionBaseParamsMla {
     uint32_t selectionMembershipStride;
     uint32_t isActualLenDimsNull;
     uint32_t isActualLenDimsKVNull;
+    uint32_t directKvL1;
 };
 
 struct CopySparseAttentionSingleCoreParamsMla {

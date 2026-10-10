@@ -29,6 +29,7 @@
 #include "../common/buffer_manager.h"
 #include "../common/buffer.h"
 #include "../../lim_schedule.h"
+#include "copy_sparse_attention_layout.h"
 
 using namespace AscendC;
 using namespace FaVectorApi;
@@ -180,6 +181,7 @@ private:
     TBuf<> selectionPlanTBuf;
     TBuf<> rowMetadataTBuf;
     TBuf<> missPrefetchTBuf;
+    TBuf<> layoutTBuf;
     TQue<QuePosition::VECOUT, 1> stage1OutQue[2]; // Two entries allow ping-pong buffering
     TBuf<> stage0OutBuf[2];
     TBuf<> stage2OutBuf;
@@ -202,6 +204,7 @@ private:
     TEventID mte3ToMte2[2];
     TEventID prefetchReadEvent;
     TEventID prefetchWriteEvent;
+    TEventID layoutReadEvent[2];
 
     bool isSinks = false;
     T negativeFloatScalar;
@@ -219,12 +222,15 @@ private:
     int64_t cachedSelectionRow = -1;
     uint32_t selectionBodyMisses = 0;
     uint32_t gatherRows = 16;
+    uint32_t layoutRows = 16;
+    bool directKvL1 = false;
     bool selectionOrderActive = false;
     int64_t selectionChunkStart = 0;
     uint32_t prefetchedUntil = 0;
     uint32_t pendingPrefetchRows = 0;
-    uint32_t pendingPrefetchColumns[4];
     int64_t pendingPrefetchDestinations[4];
+    uint32_t pendingPrefetchIndices[4];
+    GlobalTensor<KV_T> prefetchedKvGm;
     uint32_t earlierMissSlots[388] = {};
     int32_t ownerBatch = -1;
     int32_t ownerQuery = -1;
@@ -404,7 +410,10 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::PrepareExternalSelectionPlan(
         selectionBodyMisses = static_cast<uint16_t>(control.GetValue(10));
         prefetchedUntil = 0;
         cachedSelectionRow = logicalSelectionRow;
-        PrepareMissOwners(runInfo.boIdx, logicalSelectionRow);
+        bool needsOwners = selectionBodyMisses > 0;
+        for (uint32_t column = 2048; column < 2051; ++column)
+            needsOwners |= rowPlan.GetValue(column) < 0;
+        if (needsOwners) PrepareMissOwners(runInfo.boIdx, logicalSelectionRow);
         selectionKvActualSeqGm.SetValue(logicalSelectionRow, 2051);
     }
     int64_t sourceStart = runInfo.s2LoopCount * 128;
@@ -681,7 +690,7 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::SignalKvReady(
         CrossCoreWaitFlag<0, PIPE_MTE3>(15);
     }
     outputL1.SetCrossCore();
-    v0ResGm.SetCrossCore();
+    if (IS_SPLIT_G || !directKvL1) v0ResGm.SetCrossCore();
 }
 
 TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService<TEMPLATE_ARGS>::ProcessSparseKv(
@@ -712,7 +721,13 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
             auto data = stage0OutBuf[pendingBank].template Get<Q_T>();
             auto pendingPlan = selectionPlanTBuf.template Get<int16_t>()[SELECTION_COMPACT_PLAN_LOCAL_OFFSET + pendingBank * 32];
             WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pendingBank]);
-            CopyOutKvUb2Gm(v0ResGm, data, pendingRows, pendingStart, runInfo, constInfo);
+            if (IS_SPLIT_G || !directKvL1)
+                CopyOutKvUb2Gm(v0ResGm, data, pendingRows, pendingStart, runInfo, constInfo);
+            else {
+                WaitFlag<HardEvent::MTE2_V>(layoutReadEvent[pendingBank]);
+                CopyBf16Nope512UbToL1(outputL1.template GetTensor<Q_T>(), data,
+                    layoutTBuf.template Get<Q_T>(), pendingRows, pendingStart, runInfo.s2RealSize, layoutRows);
+            }
             selectionWindowHasMiss = pendingMiss;
             CopyOutSelectionMisses(data, pendingPlan, pendingRows, selectionDataRow, constInfo);
             SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pendingBank]);
@@ -726,7 +741,13 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
     auto data = stage0OutBuf[pendingBank].template Get<Q_T>();
     auto pendingPlan = selectionPlanTBuf.template Get<int16_t>()[SELECTION_COMPACT_PLAN_LOCAL_OFFSET + pendingBank * 32];
     WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pendingBank]);
-    CopyOutKvUb2Gm(v0ResGm, data, pendingRows, pendingStart, runInfo, constInfo);
+    if (IS_SPLIT_G || !directKvL1)
+        CopyOutKvUb2Gm(v0ResGm, data, pendingRows, pendingStart, runInfo, constInfo);
+    else {
+        WaitFlag<HardEvent::MTE2_V>(layoutReadEvent[pendingBank]);
+        CopyBf16Nope512UbToL1(outputL1.template GetTensor<Q_T>(), data,
+            layoutTBuf.template Get<Q_T>(), pendingRows, pendingStart, runInfo.s2RealSize, layoutRows);
+    }
     if constexpr (!IS_SPLIT_G) SignalKvReady(outputL1, v0ResGm);
     selectionWindowHasMiss = pendingMiss;
     CopyOutSelectionMisses(data, pendingPlan, pendingRows, selectionDataRow, constInfo);
@@ -773,6 +794,7 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::CopySparseKvBatch(
         }
     }
     SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
+    if (!IS_SPLIT_G && directKvL1) SetFlag<HardEvent::MTE2_V>(layoutReadEvent[pingPong]);
     return dealRow;
 }
 
@@ -799,6 +821,15 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::CopyPlannedKvWindow(
     bool hasMiss = false;
     for (int64_t row = 0; row < count;) {
         bool fromSelection = HIT_ONLY || plans[row] > 0;
+        uint32_t orderedIndex = selectionChunkStart + start + row;
+        if (!fromSelection && selectionOrderActive && orderedIndex < prefetchedUntil &&
+            (orderedIndex % 128) / 64 == constInfo.subBlockIdx) {
+            DataCopy(destination[row * 576],
+                prefetchedKvGm[(cachedSelectionRow * 512 + orderedIndex) * 512], 512);
+            compactPlanLocal.SetValue(row, -plans[row]);
+            ++row;
+            continue;
+        }
         int64_t runLength = 1;
         int64_t offset0;
         int64_t offset1 = -1;
@@ -871,9 +902,13 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::PrepareMissOwners(uint32_t batc
         ownerQuery = begin;
     }
     for (int32_t previous = ownerQuery; previous < query; ++previous) {
-        uint64_t base = static_cast<uint64_t>(previous) * selectionMembershipStride + 14333;
-        for (uint32_t column = 0; column < 2051; ++column) {
-            int16_t plan = selectionMembershipMapGm.GetValue(base + column);
+        uint64_t base = static_cast<uint64_t>(previous) * selectionMembershipStride;
+        uint32_t misses = static_cast<uint16_t>(selectionMembershipMapGm.GetValue(base + 16394));
+        for (uint32_t index = 0; index < misses + 3; ++index) {
+            uint32_t column = index < misses ?
+                (misses == 2048 ? index : static_cast<uint16_t>(selectionMembershipMapGm.GetValue(base + 4096 + index))) :
+                2048 + index - misses;
+            int16_t plan = selectionMembershipMapGm.GetValue(base + 14333 + column);
             if (plan >= 0) continue;
             uint32_t slot = -static_cast<int32_t>(plan) - 1;
             if (slot < selectionDirectRowStride) earlierMissSlots[slot / 32] |= 1U << (slot % 32);
@@ -904,7 +939,7 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::SubmitMissPrefetch(const RunInf
         uint32_t index = prefetchedUntil + scan;
         uint32_t column = static_cast<uint16_t>(order.GetValue(scan++));
         if ((index % 128) / 64 != constInfo.subBlockIdx || rowPlan.GetValue(column) >= 0) continue;
-        if (!OwnsMissSlot(-static_cast<int32_t>(rowPlan.GetValue(column)) - 1)) continue;
+        pendingPrefetchIndices[pendingPrefetchRows] = index;
         columns[pendingPrefetchRows++] = column;
     }
     prefetchedUntil += scan;
@@ -913,8 +948,8 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::SubmitMissPrefetch(const RunInf
         uint32_t column = columns[index];
         int32_t source = rowIds.GetValue(column);
         int32_t slot = -static_cast<int32_t>(rowPlan.GetValue(column)) - 1;
-        pendingPrefetchColumns[index] = column;
-        pendingPrefetchDestinations[index] = GetSelectionTokenOffset(selectionDataRow, slot) * 512;
+        pendingPrefetchDestinations[index] = OwnsMissSlot(slot) ?
+            GetSelectionTokenOffset(selectionDataRow, slot) * 512 : -1;
         int64_t address = GetkeyOffset(source, runInfo, constInfo);
         DataCopy(incoming[index * 512], keyGm[address * 512], 512);
     }
@@ -927,15 +962,14 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::CompleteMissPrefetch()
     if (pendingPrefetchRows == 0) return;
     WaitFlag<HardEvent::MTE2_MTE3>(prefetchReadEvent);
     auto incoming = missPrefetchTBuf.template Get<KV_T>();
-    for (uint32_t index = 0; index < pendingPrefetchRows; ++index)
-        DataCopy(selectionKvCacheGm[pendingPrefetchDestinations[index]], incoming[index * 512], 512);
+    for (uint32_t index = 0; index < pendingPrefetchRows; ++index) {
+        DataCopy(prefetchedKvGm[(cachedSelectionRow * 512 + pendingPrefetchIndices[index]) * 512],
+            incoming[index * 512], 512);
+        if (pendingPrefetchDestinations[index] >= 0)
+            DataCopy(selectionKvCacheGm[pendingPrefetchDestinations[index]], incoming[index * 512], 512);
+    }
     SetFlag<HardEvent::MTE3_MTE2>(prefetchWriteEvent);
     WaitFlag<HardEvent::MTE3_MTE2>(prefetchWriteEvent);
-    auto rowPlan = rowMetadataTBuf.template Get<int32_t>()[ROW_METADATA_ELEMENTS].template ReinterpretCast<int16_t>();
-    for (uint32_t index = 0; index < pendingPrefetchRows; ++index) {
-        uint32_t column = pendingPrefetchColumns[index];
-        rowPlan.SetValue(column, -rowPlan.GetValue(column));
-    }
     pendingPrefetchRows = 0;
 }
 
@@ -1187,9 +1221,12 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitGlobalBuffer(__gm__ ui
     selectionKvBlockStatusGm.SetGlobalBuffer((__gm__ int32_t *)selectionKvBlockStatus);
     selectionMembershipMapGm.SetGlobalBuffer((__gm__ int16_t *)selectionMembershipMap);
     selectionKvActualSeqGm.SetGlobalBuffer((__gm__ int32_t *)selectionKvActualSeq);
+    prefetchedKvGm.SetGlobalBuffer((__gm__ KV_T *)(selectionKvActualSeq +
+        (static_cast<uint64_t>(tilingData->baseParams.qSeqSize) * 4 + 31) / 32 * 32));
     selectionKvBlockSize = tilingData->baseParams.blockSize;
     selectionMaxBlockNum = tilingData->baseParams.selectionBlockTableStride;
     selectionMembershipStride = tilingData->baseParams.selectionMembershipStride;
+    directKvL1 = tilingData->baseParams.directKvL1 != 0;
 }
 
 TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService<TEMPLATE_ARGS>::SoftmaxInitBuffer()
@@ -1244,6 +1281,8 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pip
     tPipe->InitBuffer(selectionPlanTBuf, 1024);
     tPipe->InitBuffer(rowMetadataTBuf, ROW_METADATA_BYTES);
     tPipe->InitBuffer(missPrefetchTBuf, 4 * 512 * sizeof(KV_T));
+    layoutRows = constInfo.gSize <= 16 ? 32 : 16;
+    if (!IS_SPLIT_G && directKvL1) tPipe->InitBuffer(layoutTBuf, (layoutRows + 1) * 512 * sizeof(Q_T));
     tPipe->InitBuffer(lseBuf, 512); // Allocate 512 bytes for lseBuf
     lseUb = this->lseBuf.template Get<float>();
 
@@ -1273,6 +1312,10 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pip
     mte2ToMte3[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
     prefetchReadEvent = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
     prefetchWriteEvent = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+    if (!IS_SPLIT_G && directKvL1) {
+        layoutReadEvent[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+        layoutReadEvent[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+    }
     vToMte2Invalid = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
     vToSInvalid = GetTPipePtr()->AllocEventID<HardEvent::V_S>();
     sToVInvalid = GetTPipePtr()->AllocEventID<HardEvent::S_V>();
