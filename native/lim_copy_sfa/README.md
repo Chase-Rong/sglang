@@ -145,10 +145,27 @@ attention heads. Missing native support raises an error without silent fallback.
 
 The KPool read phase calls the fused Indexer/manager once. Attention consumes
 that plan after the existing current-token Host writeback. Shared-indexer layers
-and Draft seed reuse retain the supplied token set and invoke only native
-management followed by CopySFA. This supplied-TopK mode uses the same protected
+retain the supplied token set and invoke native management followed by CopySFA.
+Seeded Draft chains run management on the first step, then publish a post-copy
+plan for the remaining steps of that same iteration. Initial mutable-tail
+misses remain misses until the chain ends. This supplied-TopK mode uses the same protected
 length-hashed replacement policy;
 it does not recompute a different selection from the current draft query.
+
+Within a seeded one-query-per-request Draft chain, prefix-preserving rollback
+invalidates speculative suffix payloads while retaining the immutable prefix.
+Generation changes still reset the request; mapping, layer, request identity and
+seed changes invalidate the reuse template. Ordinary supplied-TopK callers keep
+the original full-reset behavior. Rebuild the native library with the Python
+changes: `manage_out` and `copy_sfa_out` have new optional attributes.
+
+Host page mappings are written directly into capture buffers. Draft preparation
+shares the buffer only within one fixed-batch preparation and covers the last
+draft position; every replay refreshes it. CopySFA keeps three task-local mask
+banks, so Vec1 never consumes the next Vec0 task's mutable order state. Reordered
+chunk plans and Fill-plan sign updates use vector operations. LIM reuses its
+prepared classification only while the request generation and sequence remain
+valid, preserving independent physical validity per attention layer.
 
 Each physical attention layer has independent residency/payload state. Scratch
 is shared within a worker; target and draft pools retain separate runtime state.
@@ -183,3 +200,7 @@ The test-only `LegacyFsaComparator` and its Triton post-copy commit remain UT
 comparators and are not used by the new serving backend. Run
 `test/manual/npu/test_lim_native_pair.py` for the actual native pair and serving
 adapter checks; full-model E2E and performance acceptance require their own runs.
+`test_lim_production_geometry.py` adds 128K/32-head B1/B8/B16 fixed and changing
+selection plus miss-union boundaries. `test_lim_draft_reuse.py` compares the
+six-query extend and four-step draft management/attention chain; it does not
+include the model projections, Indexer, FFN or serving TPOT.

@@ -108,6 +108,76 @@ def retain_prefix(bound):
     return cached
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_host_table_out_preserves_address_and_clears_padding(bound, dtype):
+    binding = bound.binding
+    assert binding.ensure_pages(torch.tensor([1, 2]))
+    source = torch.tensor([[1, -1, 2], [0, 999, 1]], dtype=dtype)
+    storage = torch.full((4, 10), 777, dtype=dtype)
+    output = storage[:, ::2]
+    pointer = output.data_ptr()
+    binding.fill_host_table(source, output)
+    expected = torch.zeros_like(output)
+    expected[:2, :3] = binding.host_table(source)
+    torch.testing.assert_close(output, expected)
+    assert output.data_ptr() == pointer
+    assert torch.all(storage[:, 1::2] == 777)
+    binding._update(torch.tensor([1]), torch.tensor([2]))
+    binding.fill_host_table(source[:1, :1], output)
+    expected.zero_()
+    expected[0, 0] = 2
+    torch.testing.assert_close(output, expected)
+
+
+def test_host_table_out_rejects_truncation_without_writing(bound):
+    output = torch.full((1, 1), 123, dtype=torch.int32)
+    with pytest.raises(ValueError, match="cover the input"):
+        bound.binding.fill_host_table(torch.ones(2, 2, dtype=torch.int32), output)
+    assert output.item() == 123
+
+
+def test_draft_host_table_scope_shares_capture_but_refreshes_replay(bound, monkeypatch):
+    module = sys.modules[type(bound.binding).__module__]
+    scope = module.DraftHostTableScope(3)
+    binding = bound.binding
+    assert binding.ensure_pages(torch.tensor([1, 2]))
+    source = torch.tensor([[1, 2, 0]], dtype=torch.int32)
+    calls = []
+    fill = binding.fill_host_table
+
+    def record(source, output):
+        calls.append(output.data_ptr())
+        return fill(source, output)
+
+    monkeypatch.setattr(binding, "fill_host_table", record)
+    tables = [scope.host_table(binding, source) for _ in range(4)]
+    assert len(calls) == 1
+    assert all(table is tables[0] for table in tables)
+    binding._update(torch.tensor([1]), torch.tensor([2]))
+    replay = module.DraftHostTableScope(3)
+    for table in tables:
+        replay.host_table(binding, source, table)
+    assert len(calls) == 2
+    torch.testing.assert_close(tables[0], binding.host_table(source))
+    independent_capture = torch.empty_like(source)
+    replay.host_table(binding, source, independent_capture)
+    assert len(calls) == 3
+    torch.testing.assert_close(independent_capture, tables[0])
+
+
+def test_draft_host_mapping_scope_does_not_reuse_after_remap(bound):
+    module = sys.modules[type(bound.binding).__module__]
+    binding = bound.binding
+    assert binding.ensure_pages(torch.tensor([1]))
+    source = torch.tensor([[1]], dtype=torch.int32)
+    scope = module.DraftHostTableScope(3)
+    output = scope.host_table(binding, source)
+    previous = output.item()
+    binding._update(torch.tensor([1]), torch.tensor([previous + 1]))
+    assert scope.host_table(binding, source, output) is output
+    assert output.item() == previous + 1
+
+
 @pytest.mark.parametrize("cache_first", [True, False])
 def test_device_and_cache_references_retire_only_after_both_release(bound, cache_first):
     pool, binding = bound.pool, bound.binding

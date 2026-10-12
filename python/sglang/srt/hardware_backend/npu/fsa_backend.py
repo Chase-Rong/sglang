@@ -172,10 +172,6 @@ def forward_fsa(
     full_kv, full_rope = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
     metadata = backend.forward_metadata
     lengths = metadata.cache_seqlens_int32
-    counts = backend._query_lens_device(forward_batch)
-    query_lengths = counts.cumsum(0).to(dtype=lengths.dtype)
-    if q_rope is None:
-        q_rope = q.new_empty((*q.shape[:-1], 0))
     if topk_indices is None:
         raise ValueError("FSA requires the baseline Indexer's expanded token IDs")
     if topk_indices.shape[-1] != backend.fused_sparse_topk:
@@ -199,6 +195,10 @@ def forward_fsa(
             full_kv,
             backing.regions[local_layer][0],
         )
+    counts = backend._query_lens_device(forward_batch)
+    query_lengths = counts.cumsum(0).to(dtype=lengths.dtype)
+    if q_rope is None:
+        q_rope = q.new_empty((*q.shape[:-1], 0))
     inputs = backend.fused_sparse_state.build_inputs(
         layer_id=layer.layer_id,
         q_nope=q,

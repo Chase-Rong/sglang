@@ -76,6 +76,7 @@ class NativeUnionPlanner:
         mutable_tail=12,
         pooled=False,
         encoded=False,
+        preserve_prefix=False,
     ):
         rows, batch = ids.shape[0], query_ends.numel()
         if not 0 < rows <= self.rows or not 0 < batch <= self.batch_capacity:
@@ -102,6 +103,7 @@ class NativeUnionPlanner:
             mutable_tail,
             pooled,
             encoded,
+            **({"preserve_prefix": True} if preserve_prefix else {}),
         )
         return self.topk[:rows], self.slots[:rows], self.membership[:rows]
 

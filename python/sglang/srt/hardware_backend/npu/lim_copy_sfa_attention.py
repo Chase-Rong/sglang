@@ -32,6 +32,7 @@ class NativeCopySparseAttention:
         *,
         scale,
         mutable_tail=12,
+        reuse_plan=False,
     ):
         if region is None:
             if host.device != query.device:
@@ -72,5 +73,6 @@ class NativeCopySparseAttention:
             mutable_tail,
             scale,
             min(self.core_count, max(8, rows)),
+            **({"reuse_plan": True} if reuse_plan else {}),
         )
         return output

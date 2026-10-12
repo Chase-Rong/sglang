@@ -12,7 +12,7 @@ void CopyOut(const at::Tensor &query, const at::Tensor &host, at::Tensor residen
     at::Tensor membership, const at::Tensor &unionSources, const at::Tensor &unionSlots,
     const at::Tensor &unionPhysical, at::Tensor physical, const at::Tensor &state,
     at::Tensor output, at::Tensor workspace, int64_t hostAddress, int64_t mutableTail, double scale,
-    int64_t cores)
+    int64_t cores, bool reusePlan)
 {
     TORCH_CHECK(query.device().type() == c10::DeviceType::PrivateUse1 && query.dim() == 3 &&
         query.size(0) > 0 && query.size(1) > 0 && query.size(1) <= 64 && query.size(2) == 512,
@@ -49,6 +49,7 @@ void CopyOut(const at::Tensor &query, const at::Tensor &host, at::Tensor residen
         unionSlots.sizes() == unionSources.sizes() && unionPhysical.sizes() == unionSources.sizes(),
         "Invalid CopySFA union");
     TORCH_CHECK(cores > 0 && cores <= 64, "CopySFA core count exceeds the qualified A5 range");
+    TORCH_CHECK(!reusePlan || query.size(0) == ends.numel(), "Draft reuse requires one query per request");
     TORCH_CHECK(workspace.device() == query.device() && workspace.scalar_type() == at::kByte &&
         workspace.is_contiguous() && workspace.numel() >= cores * 3 * 128 * 576 * 2 +
             (query.size(0) * 4 + 31) / 32 * 32 + query.size(0) * 512 * 512 * 2,
@@ -69,7 +70,7 @@ void CopyOut(const at::Tensor &query, const at::Tensor &host, at::Tensor residen
             static_cast<uint32_t>(ends.numel()), static_cast<uint32_t>(query.size(1)),
             static_cast<uint32_t>(physical.size(1)), static_cast<uint32_t>(table.size(1)),
             static_cast<uint32_t>(unionSources.size(1)), static_cast<uint32_t>(mutableTail),
-            static_cast<uint32_t>(physical.size(0)), static_cast<float>(scale));
+            static_cast<uint32_t>(physical.size(0)), static_cast<float>(scale), reusePlan);
     };
     at_npu::native::OpCommand::RunOpApi("sgl_lim_copy_sfa", launch);
 }
@@ -77,7 +78,7 @@ void CopyOut(const at::Tensor &query, const at::Tensor &host, at::Tensor residen
 void CopyMeta(const at::Tensor &, const at::Tensor &, at::Tensor, const at::Tensor &,
     const at::Tensor &, const at::Tensor &, const at::Tensor &, const at::Tensor &,
     const at::Tensor &, at::Tensor, const at::Tensor &, const at::Tensor &, const at::Tensor &,
-    at::Tensor, const at::Tensor &, at::Tensor, at::Tensor, int64_t, int64_t, double, int64_t) {}
+    at::Tensor, const at::Tensor &, at::Tensor, at::Tensor, int64_t, int64_t, double, int64_t, bool) {}
 }
 
 TORCH_LIBRARY_FRAGMENT(sgl_lim_native, module)
@@ -85,7 +86,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_lim_native, module)
     module.def("copy_sfa_out(Tensor query, Tensor host, Tensor(a!) resident, Tensor ids, Tensor ends, "
         "Tensor lengths, Tensor kv_lengths, Tensor table, Tensor requests, Tensor(b!) membership, "
         "Tensor union_sources, Tensor union_slots, Tensor union_physical, Tensor(c!) physical, Tensor state, "
-        "Tensor(d!) output, Tensor(e!) workspace, int host_address, int mutable_tail, float scale, int cores=8) -> ()");
+        "Tensor(d!) output, Tensor(e!) workspace, int host_address, int mutable_tail, float scale, int cores=8, "
+        "bool reuse_plan=False) -> ()");
 }
 TORCH_LIBRARY_IMPL(sgl_lim_native, PrivateUse1, module) { module.impl("copy_sfa_out", TORCH_FN(CopyOut)); }
 TORCH_LIBRARY_IMPL(sgl_lim_native, Meta, module) { module.impl("copy_sfa_out", TORCH_FN(CopyMeta)); }

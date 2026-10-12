@@ -24,6 +24,7 @@ def test_fused_lim_long_context_slot_payload(context, batch, routes, heads):
     from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
     from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
         NativeIndexerManager,
+        NativeUnionPlanner,
     )
 
     device = "npu:0"
@@ -38,6 +39,7 @@ def test_fused_lim_long_context_slot_payload(context, batch, routes, heads):
     host_pages = context // 128
     spec = LimCopySfaSpec(context, routes, 4096 if routes == 1 else 12416)
     planner = NativeIndexerManager(spec, batch + 1, batch, device)
+    reference = NativeUnionPlanner(spec, batch + 1, batch, device)
     generator = torch.Generator().manual_seed(71123 + context + rows)
     query_cpu = torch.randn(rows, heads, 128, generator=generator).mul_(0.1)
     query_cpu[:, :, 0] = 0.125
@@ -129,8 +131,37 @@ def test_fused_lim_long_context_slot_payload(context, batch, routes, heads):
                 host_table.copy_(host_table_cpu)
             old_mapping = planner.source_map.cpu()
             old_physical = planner.physical.cpu()
+            for name in ("source_map", "sources", "physical", "state"):
+                getattr(reference, name).copy_(getattr(planner, name))
             graph.replay()
             torch.npu.synchronize()
+            reference.plan(
+                planner.indexer.indices,
+                planner.indexer.raw_scores,
+                ends,
+                lengths,
+                host_table,
+                requests,
+                generations,
+                host_tokens=host_tokens,
+                pooled=True,
+                encoded=True,
+            )
+            torch.npu.synchronize()
+            for candidate, expected in (
+                (output_ids, reference.topk),
+                (output_slots, reference.slots),
+                (
+                    planner.membership[:, 14333:16384],
+                    reference.membership[:, 14333:16384],
+                ),
+                (planner.source_map, reference.source_map),
+                (planner.sources, reference.sources),
+                (planner.state[:, :4], reference.state[:, :4]),
+            ):
+                torch.testing.assert_close(
+                    candidate.cpu(), expected.cpu(), atol=0, rtol=0
+                )
             baseline, _ = torch_npu.npu_lightning_indexer(
                 query=query,
                 key=keys,

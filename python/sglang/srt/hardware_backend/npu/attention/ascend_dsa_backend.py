@@ -433,7 +433,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # The KPool write plan indexes the page table with one row per request.
         # Expand it per query at the indexer's paged entry point for MTP reads;
         # do not change the row semantics here.
-        max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
+        max_seq_len_k = self._page_table_max_seq_len(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
             :, : max_seq_len_k : self.page_size
         ][forward_batch.req_pool_indices[: forward_batch.batch_size]]
@@ -485,7 +485,13 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
         backing = get_offload_backing(self.token_to_kv_pool)
         if backing is not None:
-            metadata.host_page_table = backing.page_binding.host_table(real_page_table)
+            scope = getattr(self, "_draft_host_table_scope", None)
+            if scope is None:
+                metadata.host_page_table = backing.page_binding.host_table(real_page_table)
+            else:
+                metadata.host_page_table = scope.host_table(
+                    backing.page_binding, real_page_table
+                )
         metadata.dsa_seqlens_expanded = seq_lens_expanded
         metadata.token_to_batch_idx = token_request_ids
 
@@ -595,6 +601,13 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             effective_n_per_batch=effective_n_per_batch,
         )
 
+    def _page_table_max_seq_len(self, forward_batch):
+        length = self._cache_seqlens_cpu_max(forward_batch)
+        scope = getattr(self, "_draft_host_table_scope", None)
+        if scope is not None:
+            length += scope.last_step - self.speculative_step_id
+        return length
+
     @profile_method("npu.dsa.replay_metadata")
     def _replay_dsa_metadata(self, forward_batch: ForwardBatch) -> None:
         """Update DSA metadata tensors in-place during graph replay."""
@@ -623,7 +636,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         query_lens = self._query_lens_device(forward_batch)
 
         # 2. real_page_table — recompute and in-place copy
-        max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
+        max_seq_len_k = self._page_table_max_seq_len(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
             :, : max_seq_len_k : self.page_size
         ][forward_batch.req_pool_indices[:bs]]
@@ -652,10 +665,17 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
             backing = get_offload_backing(self.token_to_kv_pool)
             with profile_range("npu.dsa.host_page_table"):
-                metadata.host_page_table.zero_()
-                metadata.host_page_table[:n_rows, :n_cols].copy_(
-                    backing.page_binding.host_table(new_real_page_table)
-                )
+                scope = getattr(self, "_draft_host_table_scope", None)
+                if scope is None:
+                    backing.page_binding.fill_host_table(
+                        new_real_page_table, metadata.host_page_table
+                    )
+                else:
+                    scope.host_table(
+                        backing.page_binding,
+                        new_real_page_table,
+                        metadata.host_page_table,
+                    )
 
         # 3. dsa_seqlens_expanded — update causal lengths for each query token
         needs_causal_expansion = (
@@ -779,3 +799,23 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     """Create an Ascend backend that generates DSA metadata for each draft decode step."""
 
     backend_cls = AscendDSAAttnBackend
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        from sglang.srt.hardware_backend.npu.hicache_offload import (
+            DraftHostTableScope,
+            get_offload_backing,
+        )
+
+        backends = [
+            backend
+            for backend in self.attn_backends[: self.speculative_num_steps - 1]
+            if get_offload_backing(backend.token_to_kv_pool) is not None
+        ]
+        scope = DraftHostTableScope(self.speculative_num_steps - 2)
+        for backend in backends:
+            backend._draft_host_table_scope = scope
+        try:
+            super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        finally:
+            for backend in backends:
+                backend._draft_host_table_scope = None

@@ -89,6 +89,15 @@ __simt_vf__ __launch_bounds__(256) inline void ResetResident(
     asc_threadfence();
 }
 
+__simt_vf__ __launch_bounds__(256) inline void InvalidateSpeculativeSuffix(
+    __gm__ const int32_t *sources, __gm__ int64_t *physical,
+    uint64_t residentBase, uint32_t capacity, int32_t stableLimit)
+{
+    for (uint32_t slot = threadIdx.x; slot < capacity; slot += blockDim.x)
+        if (sources[residentBase + slot] >= stableLimit) physical[residentBase + slot] = -1;
+    asc_threadfence();
+}
+
 __simt_vf__ __launch_bounds__(256) inline void PrepareUnionSort(
     __ubuf__ const int32_t *tokens, __ubuf__ float *keys, __ubuf__ uint32_t *indices,
     uint32_t base, uint32_t valid, uint32_t padded)

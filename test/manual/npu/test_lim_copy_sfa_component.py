@@ -1,5 +1,6 @@
 """Actual Host-backed NoPE attention using a request-shared device plan."""
 
+import hashlib
 import os
 import json
 import statistics
@@ -36,6 +37,9 @@ def run_request_shared_attention(
     three_way=False,
     attention_heads=8,
     changing_topk=False,
+    context=16384,
+    indexer_heads=64,
+    pooled_shift=103,
 ):
     import torch_npu  # noqa: F401
 
@@ -58,7 +62,13 @@ def run_request_shared_attention(
     torch.npu.set_per_process_memory_fraction(
         (2 << 30) / torch.npu.get_device_properties(0).total_memory, 0
     )
-    pages = batch * 128 + 1
+    if context % 512 or not routes < kv_length <= context:
+        raise ValueError(
+            "Context must be page aligned and cover the selected KV length"
+        )
+    pages_per_request = context // 128
+    index_pages_per_request = context // 512
+    pages = batch * pages_per_request + 1
     backing = DecodeHostKvBacking(
         layers=1,
         pages=pages,
@@ -67,7 +77,7 @@ def run_request_shared_attention(
         rope_dim=0,
         dtype=torch.bfloat16,
         device_id=0,
-        host_budget=1 << 30,
+        host_budget=max(1 << 30, pages * 128 * 1024 + (1 << 20)),
         integrated=True,
     )
     region = backing.regions[0][0]
@@ -77,7 +87,7 @@ def run_request_shared_attention(
         .bfloat16()
     )
     region.tensor.copy_(source)
-    spec = LimCopySfaSpec(16384, routes, 4096 if routes == 1 else 12416)
+    spec = LimCopySfaSpec(context, routes, 4096 if routes == 1 else 12416)
     options = {}
     if native_fused:
         from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
@@ -106,16 +116,20 @@ def run_request_shared_attention(
     ids = torch.full((rows, 2051), -1, dtype=torch.int32, device="npu")
     ids[:, :2048] = torch.arange(2048, device="npu")
     lengths = torch.tensor(
-        [kv_length - routes + route + 1 for _ in range(batch) for route in range(routes)],
+        [
+            kv_length - routes + route + 1
+            for _ in range(batch)
+            for route in range(routes)
+        ],
         dtype=torch.int32,
         device="npu",
     )
     ids[:, 2048:2050] = lengths[:, None] - 2
-    scores = torch.ones(rows, 4096, device="npu")
+    scores = torch.ones(rows, context // 4, device="npu")
     query_ends = torch.arange(routes, rows + 1, routes, device="npu", dtype=torch.int32)
     kv_lengths = torch.full((batch,), kv_length, dtype=torch.int32, device="npu")
-    table = torch.arange(1, batch * 128 + 1, dtype=torch.int32, device="npu").view(
-        batch, 128
+    table = torch.arange(1, pages, dtype=torch.int32, device="npu").view(
+        batch, pages_per_request
     )
     request_slots = torch.arange(1, batch + 1, dtype=torch.int64, device="npu")
     if inactive_last:
@@ -138,23 +152,33 @@ def run_request_shared_attention(
         )
         index_generator = torch.Generator().manual_seed(615)
         index_query = (
-            torch.randn(rows, 64, 128, generator=index_generator)
+            torch.randn(rows, indexer_heads, 128, generator=index_generator)
             .mul_(0.1)
             .bfloat16()
             .to("npu")
         )
         index_keys = (
-            torch.randn(batch * 32 + 1, 128, 1, 128, generator=index_generator)
+            torch.randn(
+                batch * index_pages_per_request + 1,
+                128,
+                1,
+                128,
+                generator=index_generator,
+            )
             .mul_(0.1)
             .bfloat16()
             .to("npu")
         )
         index_weights = (
-            torch.rand(rows, 64, generator=index_generator).bfloat16().to("npu")
+            torch.rand(rows, indexer_heads, generator=index_generator)
+            .bfloat16()
+            .to("npu")
         )
         index_table = (
-            torch.arange(1, batch * 32 + 1, dtype=torch.int32, device="npu")
-            .view(batch, 32)
+            torch.arange(
+                1, batch * index_pages_per_request + 1, dtype=torch.int32, device="npu"
+            )
+            .view(batch, index_pages_per_request)
             .repeat_interleave(routes, dim=0)
         )
         ids = component.planner.topk if native_fused else indexer.topk
@@ -175,13 +199,20 @@ def run_request_shared_attention(
             / 512
         )
         for request in range(batch):
-            begin = 128 + request * 4096 + step * 103
+            begin = 128 + request * (context // 4) + step * pooled_shift
             key_cpu.view(-1, 128)[begin : begin + 512, 0] = values.bfloat16()
         index_keys.copy_(key_cpu)
 
     if changing_topk:
         if not three_way:
             raise ValueError("Changing TopK requires the complete three-way chain")
+        if (
+            not 0 <= pooled_shift <= 512
+            or 24 * pooled_shift + 512 > (kv_length - routes) // 4
+        ):
+            raise ValueError(
+                "Changing selection must remain within the causal pooled extent"
+            )
         change_selection(0)
     graph = None
     baseline_graph = None
@@ -249,7 +280,7 @@ def run_request_shared_attention(
                 batch, device="npu"
             ).repeat_interleave(routes),
         )
-        index_layer = SimpleNamespace(index_kpool=4, n_heads=64)
+        index_layer = SimpleNamespace(index_kpool=4, n_heads=indexer_heads)
         attention_layer = SimpleNamespace(layer_id=0, scaling=0.0625)
 
     def forward(*, selection_only=False, attention_only=False):
@@ -359,7 +390,34 @@ def run_request_shared_attention(
             physical = mapping[logical.long() // 128] * 128 + logical.long() % 128
             keys = region.tensor[physical].float()
             expected = torch.softmax(query_cpu[row] @ keys.T * 0.0625, dim=-1) @ keys
-            torch.testing.assert_close(actual[row], expected, atol=0.002, rtol=0.025)
+            try:
+                torch.testing.assert_close(
+                    actual[row], expected, atol=0.002, rtol=0.025
+                )
+            except AssertionError:
+                destination = os.environ.get("SGLANG_LIM_COMPONENT_BENCHMARK")
+                if destination and native_fused and native_copy:
+                    path = Path(destination)
+                    path.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        dict(
+                            row=row,
+                            context=context,
+                            query=query_cpu,
+                            actual=actual,
+                            expected=expected,
+                            keys=keys,
+                            selected=selected,
+                            lengths=lengths.cpu(),
+                            slots=component.planner.slots.cpu(),
+                            membership=component.planner.membership.cpu(),
+                            state=component.planner.state.cpu(),
+                            physical=component.planner.physical.cpu(),
+                            resident=component.kv.cpu(),
+                        ),
+                        path / f"failure_b{batch}_q{routes}.pt",
+                    )
+                raise
 
     try:
         check(forward())
@@ -382,7 +440,7 @@ def run_request_shared_attention(
             )
         if native_copy:
             for request in range(batch):
-                finish = request * 16384 + 128 + kv_length
+                finish = request * context + 128 + kv_length
                 region.tensor[finish - 12 : finish].add_(0.03125)
             check(forward())
             table.copy_(table.flip(-1))
@@ -561,6 +619,8 @@ def run_request_shared_attention(
                         )
                     )
                 if changing_topk:
+                    check(baseline_output)
+                    check(third_output)
                     check(output)
                     torch.testing.assert_close(
                         baseline_output.cpu(), output.cpu(), atol=0.002, rtol=0.025
@@ -572,7 +632,11 @@ def run_request_shared_attention(
                         ids.cpu().sort(-1).values, baseline_ids.cpu().sort(-1).values
                     )
                     counts = component.planner.state[1 : batch + 1, 3].cpu().tolist()
-                    assert all(412 <= count <= 412 + routes * 12 for count in counts)
+                    body_misses = 4 * pooled_shift
+                    assert all(
+                        body_misses <= count <= body_misses + routes * 12
+                        for count in counts
+                    )
                     dynamic_misses.append(counts)
             report = dict(
                 scope=(
@@ -589,7 +653,17 @@ def run_request_shared_attention(
                 native_copy=native_copy,
                 framework=framework,
                 query_routes=routes,
-                context=16384,
+                context=context,
+                indexer_heads=indexer_heads,
+                native_extension=os.environ.get("SGLANG_LIM_NATIVE_EXTENSION"),
+                native_extension_sha256=(
+                    hashlib.sha256(
+                        Path(os.environ["SGLANG_LIM_NATIVE_EXTENSION"]).read_bytes()
+                    ).hexdigest()
+                    if os.environ.get("SGLANG_LIM_NATIVE_EXTENSION")
+                    else None
+                ),
+                pooled_shift=pooled_shift if changing_topk else 0,
                 topk=2051,
                 baseline_resident_tokens=batch * routes * 4096,
                 candidate_resident_tokens=(batch + 1) * spec.resident_tokens,
@@ -791,6 +865,12 @@ def run_request_shared_attention(
             prefix = "indexed_component" if include_indexer else "component"
             if three_way:
                 prefix = "changing_three_way" if changing_topk else "three_way"
+            if context != 16384 or indexer_heads != 64:
+                prefix += f"_s{context}_h{indexer_heads}"
+            if changing_topk and pooled_shift != 103:
+                prefix += f"_shift{pooled_shift}"
+            if kv_length != context:
+                prefix += f"_len{kv_length}"
             (path / f"{prefix}_b{batch}_q{routes}.json").write_text(
                 json.dumps(report, indent=2)
             )

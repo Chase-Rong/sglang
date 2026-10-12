@@ -103,10 +103,15 @@ def fixture(monkeypatch):
     return module, adapter, state, backend, batch, host, region, calls
 
 
-def test_selected_rows_call_exactly_one_manager_and_one_copy(fixture):
+def test_selected_rows_call_exactly_one_manager_and_one_copy(fixture, monkeypatch):
     _, adapter, state, backend, batch, host, region, calls = fixture
     query = torch.zeros(2, 8, 512)
     selected = state.select(backend, batch, 3, query, None, None, None)
+
+    def reject_unused_geometry(_):
+        raise AssertionError("Selected LIM attention must reuse its existing geometry")
+
+    monkeypatch.setattr(backend, "_query_lens_device", reject_unused_geometry)
     result = adapter.forward_fsa(
         backend,
         query,
@@ -122,6 +127,141 @@ def test_selected_rows_call_exactly_one_manager_and_one_copy(fixture):
     assert calls == ["indexer_manage", "write_current", "copy_sfa"]
     assert torch.all(result == 1)
     assert not state.pending
+
+
+def test_selection_and_attention_share_metadata_only_within_forward(
+    fixture, monkeypatch
+):
+    _, _, state, backend, batch, host, region, calls = fixture
+    invocations = []
+    original = state.metadata
+
+    def metadata(*args):
+        result = original(*args)
+        invocations.append(result)
+        return result
+
+    monkeypatch.setattr(state, "metadata", metadata)
+    query = torch.zeros(2, 8, 512)
+    layer = SimpleNamespace(layer_id=3, scaling=0.0625)
+    selected = state.select(backend, batch, 3, query, None, None, None)
+    state.forward(backend, query, layer, batch, selected, host, region)
+    assert len(invocations) == 1
+    batch.positions.add_(1)
+    state.forward(backend, query, layer, batch, selected, host, region)
+    assert len(invocations) == 2
+    assert invocations[-1][1].tolist() == [4097, 4097]
+    assert calls[-2][0] == "given_topk"
+
+
+def test_pending_selection_cannot_cross_metadata_or_batch(fixture):
+    _, _, state, backend, batch, host, region, calls = fixture
+    query = torch.zeros(2, 8, 512)
+    layer = SimpleNamespace(layer_id=3, scaling=0.0625)
+    for replace_batch in (False, True):
+        selected = state.select(backend, batch, 3, query, None, None, None)
+        if replace_batch:
+            batch = SimpleNamespace(**vars(batch))
+        else:
+            backend.forward_metadata = SimpleNamespace(**vars(backend.forward_metadata))
+        state.forward(backend, query, layer, batch, selected, host, region)
+        assert calls[-2][0] == "given_topk"
+
+
+def test_seeded_draft_chain_publishes_once_then_reuses(fixture, monkeypatch):
+    _, _, state, backend, batch, host, region, calls = fixture
+    batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+    batch.reuse_dsa_topk_indices = True
+    batch.draft_sparse_plan_cache = {}
+    monkeypatch.setitem(
+        sys.modules,
+        PREFIX + "lim_copy_sfa_reuse",
+        SimpleNamespace(
+            publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
+        ),
+    )
+    reuse_flags = []
+    original = state.copy_attention.forward
+
+    def copy(*args, **kwargs):
+        reuse_flags.append(kwargs["reuse_plan"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(state.copy_attention, "forward", copy)
+    query = torch.zeros(2, 8, 512)
+    seed = torch.arange(2051, dtype=torch.int32).repeat(2, 1)
+    layer = SimpleNamespace(layer_id=3, scaling=0.0625)
+    for _ in range(4):
+        state.forward(backend, query, layer, batch, seed, host, region)
+        batch.positions.add_(1)
+    assert reuse_flags == [False, True, True, True]
+    assert sum(isinstance(call, tuple) for call in calls) == 1
+    assert calls.count("publish") == 1
+    batch.draft_sparse_plan_cache = {}
+    state.forward(backend, query, layer, batch, seed, host, region)
+    assert reuse_flags[-1] is False
+    assert calls.count("publish") == 2
+
+
+def test_draft_cache_cannot_reuse_an_older_seed_after_replanning(fixture, monkeypatch):
+    _, _, state, backend, batch, host, region, calls = fixture
+    batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+    batch.reuse_dsa_topk_indices = True
+    batch.draft_sparse_plan_cache = {}
+    monkeypatch.setitem(
+        sys.modules,
+        PREFIX + "lim_copy_sfa_reuse",
+        SimpleNamespace(
+            publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
+        ),
+    )
+    query = torch.zeros(2, 8, 512)
+    first = torch.arange(2051, dtype=torch.int32).repeat(2, 1)
+    second = first.flip(1)
+    layer = SimpleNamespace(layer_id=3, scaling=0.0625)
+    for seed in (first, second, first):
+        state.forward(backend, query, layer, batch, seed, host, region)
+    assert calls.count("publish") == 3
+    assert len(batch.draft_sparse_plan_cache) == 1
+
+
+@pytest.mark.parametrize(
+    "change", ["mapping", "generation", "seed", "layer", "requests", "batch"]
+)
+def test_draft_template_invalidates_on_identity_changes(fixture, monkeypatch, change):
+    _, _, state, backend, batch, host, region, calls = fixture
+    batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+    batch.reuse_dsa_topk_indices = True
+    batch.draft_sparse_plan_cache = {}
+    binding = SimpleNamespace(mapping_epoch=0)
+    backend.token_to_kv_pool.full_kv_pool.decode_host_backing.page_binding = binding
+    monkeypatch.setitem(
+        sys.modules,
+        PREFIX + "lim_copy_sfa_reuse",
+        SimpleNamespace(
+            publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
+        ),
+    )
+    query = torch.zeros(2, 8, 512)
+    seed = torch.arange(2051, dtype=torch.int32).repeat(2, 1)
+    layer = SimpleNamespace(layer_id=3, scaling=0.0625)
+    state.forward(backend, query, layer, batch, seed, host, region)
+    if change == "mapping":
+        binding.mapping_epoch += 1
+    elif change == "generation":
+        state.pool.req_generation[1] += 1
+        state.refresh_generations()
+    elif change == "seed":
+        seed = seed.clone()
+    elif change == "layer":
+        layer.layer_id = 7
+    elif change == "requests":
+        batch.req_pool_indices = batch.req_pool_indices.flip(0)
+    else:
+        batch = SimpleNamespace(**vars(batch))
+    state.forward(backend, query, layer, batch, seed, host, region)
+    assert sum(isinstance(call, tuple) for call in calls) == 2
+    assert calls.count("publish") == 2
 
 
 def test_shared_layer_and_draft_seed_keep_exact_supplied_topk(fixture):
