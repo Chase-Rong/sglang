@@ -43,6 +43,9 @@ __aicore__ inline void Fill(GM_ADDR host, GM_ADDR resident, GM_ADDR requests,
         planGm.SetGlobalBuffer((__gm__ int16_t *)membership);
         TQueBind<TPosition::VECIN, TPosition::VECOUT, 2> queue;
         pipe.InitBuffer(queue, 2, 1024);
+        TBuf<TPosition::VECCALC> planBuffer;
+        pipe.InitBuffer(planBuffer, 2176 * sizeof(int16_t));
+        auto rowPlan = planBuffer.Get<int16_t>();
         uint64_t pendingDestination = 0;
         bool pending = false;
         uint32_t coreCount = GetBlockNum() * 2;
@@ -73,11 +76,17 @@ __aicore__ inline void Fill(GM_ADDR host, GM_ADDR resident, GM_ADDR requests,
             int32_t start = request == 0 ? 0 : endsGm.GetValue(request - 1);
             int32_t end = endsGm.GetValue(request);
             for (int32_t row = start + GetBlockIdx(); row < end; row += coreCount) {
-                for (uint32_t column = 0; column < 2051; ++column) {
-                    uint64_t offset = static_cast<uint64_t>(row) * 16400 + 14333 + column;
-                    int16_t value = planGm.GetValue(offset);
-                    if (value < 0) planGm.SetValue(offset, -value);
-                }
+                uint64_t offset = static_cast<uint64_t>(row) * 16400 + 14333;
+                DataCopyPad(rowPlan, planGm[offset], DataCopyExtParams{1, 2051 * 2, 0, 0, 0},
+                    DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID7);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);
+                Abs(rowPlan, rowPlan, 2051);
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID7);
+                WaitFlag<HardEvent::V_MTE3>(EVENT_ID7);
+                DataCopyPad(planGm[offset], rowPlan, DataCopyExtParams{1, 2051 * 2, 0, 0, 0});
+                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID7);
+                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID7);
                 planGm.SetValue(static_cast<uint64_t>(row) * 16400 + 16394, 0);
             }
         }
@@ -94,7 +103,8 @@ __aicore__ inline void Fill(GM_ADDR host, GM_ADDR resident, GM_ADDR requests,
 __aicore__ inline void Commit(GM_ADDR ends, GM_ADDR lengths, GM_ADDR requests,
     GM_ADDR unionSources, GM_ADDR unionSlots, GM_ADDR unionPhysical, GM_ADDR physical,
     GM_ADDR state, GM_ADDR membership, uint32_t batch, uint32_t capacity,
-    uint32_t unionWidth, uint32_t mutableTail, uint32_t requestCapacity, TPipe &pipe)
+    uint32_t unionWidth, uint32_t mutableTail, uint32_t requestCapacity, TPipe &pipe,
+    bool preserveMisses = false)
 {
     if ASCEND_IS_AIV {
         GlobalTensor<int32_t> endsGm, lengthsGm, sourcesGm, slotsGm;
@@ -140,7 +150,7 @@ __aicore__ inline void Commit(GM_ADDR ends, GM_ADDR lengths, GM_ADDR requests,
                     int32_t slot = slotsGm.GetValue(entry);
                     if (slot < 0 || slot >= capacity) continue;
                     int32_t source = sourcesGm.GetValue(entry);
-                    bool reusable = true;
+                    bool reusable = !preserveMisses;
                     for (int32_t row = 0; row < end - start && reusable; ++row) {
                         int32_t tail = source - visible[row] + mutableTail;
                         if (tail >= 0 && tail < mutableTail && (presence[row] & (1U << tail))) reusable = false;

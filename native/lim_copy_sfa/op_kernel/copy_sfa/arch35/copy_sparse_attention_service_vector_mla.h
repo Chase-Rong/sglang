@@ -30,6 +30,7 @@
 #include "../common/buffer.h"
 #include "../../lim_schedule.h"
 #include "copy_sparse_attention_layout.h"
+#include "copy_sparse_attention_mask.h"
 
 using namespace AscendC;
 using namespace FaVectorApi;
@@ -180,6 +181,7 @@ private:
     TBuf<> commonTBuf; // Shared reusable space
     TBuf<> selectionPlanTBuf;
     TBuf<> rowMetadataTBuf;
+    TBuf<> taskMaskTBuf;
     TBuf<> missPrefetchTBuf;
     TBuf<> layoutTBuf;
     TQue<QuePosition::VECOUT, 1> stage1OutQue[2]; // Two entries allow ping-pong buffering
@@ -430,11 +432,7 @@ CopySparseAttentionVectorService<TEMPLATE_ARGS>::PrepareExternalSelectionPlan(
     selectionChunkStart = sourceStart;
     selectionChunkAllHit = true;
     if (selectionOrderActive) {
-        for (int64_t index = 0; index < runInfo.s2RealSize; ++index) {
-            int16_t value = rowPlan.GetValue(order.GetValue(index));
-            selectionPlanLocal.SetValue(index, value);
-            if (value < 0) selectionChunkAllHit = false;
-        }
+        selectionChunkAllHit = sourceStart >= selectionBodyMisses;
     } else {
         SetFlag<HardEvent::S_V>(sToVInvalid);
         WaitFlag<HardEvent::S_V>(sToVInvalid);
@@ -702,6 +700,20 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
     auto plan = selectionPlanTBuf.template Get<int16_t>()[SELECTION_PLAN_LOCAL_OFFSET];
     int64_t logicalRow = -1;
     PrepareExternalSelectionPlan(runInfo, constInfo, plan, logicalRow);
+    auto taskMask = taskMaskTBuf.template Get<float>()[runInfo.taskIdMod3 * 128];
+    auto rowTokens = rowMetadataTBuf.template Get<int32_t>();
+    auto rowPlan = rowTokens[ROW_METADATA_ELEMENTS].template ReinterpretCast<int16_t>();
+    auto taskOrder = selectionPlanTBuf.template Get<uint16_t>()[256];
+    int32_t tokenLimit = constInfo.sparseMode == 3 ?
+        runInfo.actualS2Size - runInfo.actualS1Size + runInfo.s1oIdx + 1 : runInfo.actualS2Size;
+    SetFlag<HardEvent::S_V>(sToVInvalid);
+    WaitFlag<HardEvent::S_V>(sToVInvalid);
+    PrepareSparseTaskMask((__ubuf__ float *)taskMask.GetPhyAddr(),
+        (__ubuf__ int32_t *)rowTokens.GetPhyAddr(), (__ubuf__ uint16_t *)taskOrder.GetPhyAddr(),
+        (__ubuf__ int16_t *)rowPlan.GetPhyAddr(), (__ubuf__ int16_t *)plan.GetPhyAddr(),
+        selectionChunkStart, runInfo.s2RealSize, tokenLimit, selectionOrderActive, negativeFloatScalar);
+    SetFlag<HardEvent::V_S>(vToSInvalid);
+    WaitFlag<HardEvent::V_S>(vToSInvalid);
     if (sparseCalSize == 0) {
         SignalKvReady(outputL1, v0ResGm);
         return;
@@ -990,32 +1002,13 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void CopySparseAttentionVectorService
     SetFlag<HardEvent::V_S>(vToSInvalid);
     WaitFlag<HardEvent::V_S>(vToSInvalid);
 
-    int64_t queryRow = runInfo.s1oIdx;
-    if constexpr (LAYOUT_T == CopySparseAttentionLayoutArch35::TND) {
-        queryRow += runInfo.boIdx == 0 ? 0 : cuSeqlensQGm.GetValue(runInfo.boIdx - 1);
-    } else {
-        queryRow += runInfo.boIdx * constInfo.s1Size;
-    }
-    int64_t tokenLimit = constInfo.sparseMode == 3 ?
-        runInfo.actualS2Size - runInfo.actualS1Size + runInfo.s1oIdx + 1 : runInfo.actualS2Size;
-    // Vec0 may already have prepared the next task. Derive this task's mask
-    // order from its GM metadata rather than the mutable selectionOrderActive state.
-    int64_t membershipBase = queryRow * selectionMembershipStride;
-    uint32_t bodyMisses = static_cast<uint16_t>(selectionMembershipMapGm.GetValue(membershipBase + 16394));
-    bool maskReordered = runInfo.s2LoopLimit >= 16 && bodyMisses > 0 && bodyMisses < 2048 && runInfo.s2LoopCount < 16;
-    int64_t sourceStart = runInfo.s2LoopCount * constInfo.s2BaseSize;
-    int64_t orderedStart = SglLimSchedule::GatherIndex(runInfo.boIdx, sourceStart);
-    for (int64_t column = 0; column < runInfo.s2RealSize; ++column) {
-        int64_t sourceColumn = maskReordered ?
-            static_cast<uint16_t>(selectionMembershipMapGm.GetValue(membershipBase + 4096 + orderedStart + column)) :
-            sourceStart + column;
-        int32_t token = sparseIndicesGm.GetValue(queryRow * constInfo.sparseBlockCount + sourceColumn);
-        if (token < 0 || token >= tokenLimit) {
-            for (int64_t row = 0; row < runInfo.halfMRealSize; ++row) {
-                mmRes.SetValue(row * s2BaseSize + column, negativeFloatScalar);
-            }
-        }
-    }
+    SetFlag<HardEvent::S_V>(sToVInvalid);
+    WaitFlag<HardEvent::S_V>(sToVInvalid);
+    auto taskMask = taskMaskTBuf.template Get<float>()[runInfo.taskIdMod3 * 128];
+    ApplySparseTaskMask((__ubuf__ float *)mmRes.GetPhyAddr(), (__ubuf__ float *)taskMask.GetPhyAddr(),
+        runInfo.s2RealSize, runInfo.halfMRealSize, s2BaseSize, negativeFloatScalar);
+    SetFlag<HardEvent::V_S>(vToSInvalid);
+    WaitFlag<HardEvent::V_S>(vToSInvalid);
     SetFlag<HardEvent::S_V>(sToVInvalid);
     WaitFlag<HardEvent::S_V>(sToVInvalid);
 
@@ -1289,6 +1282,7 @@ void CopySparseAttentionVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pip
     tPipe->InitBuffer(commonTBuf, 512); // Allocate 512 bytes for commonTBuf
     tPipe->InitBuffer(selectionPlanTBuf, 1024);
     tPipe->InitBuffer(rowMetadataTBuf, ROW_METADATA_BYTES);
+    tPipe->InitBuffer(taskMaskTBuf, 3 * 128 * sizeof(float));
     tPipe->InitBuffer(missPrefetchTBuf, 4 * 512 * sizeof(KV_T));
     layoutRows = constInfo.gSize <= 16 ? 32 : 16;
     if (!IS_SPLIT_G && directKvL1) tPipe->InitBuffer(layoutTBuf, (layoutRows + 1) * 512 * sizeof(Q_T));

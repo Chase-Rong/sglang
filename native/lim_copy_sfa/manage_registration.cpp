@@ -53,7 +53,7 @@ void ManageOut(const at::Tensor &ids, const at::Tensor &scores, const at::Tensor
     const at::Tensor &generations, at::Tensor mapping, at::Tensor sources, at::Tensor physical,
     at::Tensor state, at::Tensor outputIds, at::Tensor outputSlots, at::Tensor membership,
     at::Tensor unionSources, at::Tensor unionSlots, at::Tensor unionPhysical,
-    int64_t hostTokens, int64_t mutableTail, bool pooled, bool encoded)
+    int64_t hostTokens, int64_t mutableTail, bool pooled, bool encoded, bool preservePrefix)
 {
     ValidateManager(ids, scores, ends, lengths, table, requests, generations, mapping, sources,
         physical, state, outputIds, outputSlots, membership, unionSources, unionSlots,
@@ -75,7 +75,7 @@ void ManageOut(const at::Tensor &ids, const at::Tensor &scores, const at::Tensor
             static_cast<uint32_t>(mapping.size(0)), static_cast<uint32_t>(mapping.size(1)),
             static_cast<uint32_t>(sources.size(1)), static_cast<uint32_t>(table.size(1)),
             static_cast<uint32_t>(unionSources.size(1)), static_cast<uint32_t>(scores.size(1)),
-            static_cast<uint64_t>(hostTokens), static_cast<uint32_t>(mutableTail), pooled, encoded);
+            static_cast<uint64_t>(hostTokens), static_cast<uint32_t>(mutableTail), pooled, encoded, preservePrefix);
     };
     at_npu::native::OpCommand::RunOpApi("sgl_lim_manage", launch);
 }
@@ -83,7 +83,7 @@ void ManageOut(const at::Tensor &ids, const at::Tensor &scores, const at::Tensor
 void ManageMeta(const at::Tensor &, const at::Tensor &, const at::Tensor &, const at::Tensor &,
     const at::Tensor &, const at::Tensor &, const at::Tensor &, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-    int64_t, int64_t, bool, bool)
+    int64_t, int64_t, bool, bool, bool)
 {}
 }
 
@@ -93,7 +93,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_lim_native, module)
         "Tensor requests, Tensor generations, Tensor(a!) mapping, Tensor(b!) sources, Tensor(c!) physical, "
         "Tensor(d!) state, Tensor(e!) output_ids, Tensor(f!) output_slots, Tensor(g!) membership, "
         "Tensor(h!) union_sources, Tensor(i!) union_slots, Tensor(j!) union_physical, "
-        "int host_tokens, int mutable_tail, bool pooled=False, bool encoded=False) -> ()");
+        "int host_tokens, int mutable_tail, bool pooled=False, bool encoded=False, bool preserve_prefix=False) -> ()");
 }
 TORCH_LIBRARY_IMPL(sgl_lim_native, PrivateUse1, module)
 {

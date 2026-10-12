@@ -6,6 +6,35 @@ from threading import RLock
 import torch
 
 
+class DraftHostTableScope:
+    """Share page mappings only within one fixed-batch draft preparation."""
+
+    def __init__(self, last_step):
+        self.last_step = last_step
+        self.tables = {}
+
+    def host_table(self, binding, source, output=None):
+        shape = source.shape if output is None else output.shape
+        key = (
+            id(binding),
+            getattr(binding, "mapping_epoch", 0),
+            source.shape,
+            shape,
+            source.dtype,
+            source.device,
+        )
+        cached = self.tables.get(key)
+        if cached is not None and (
+            output is None or output.data_ptr() == cached.data_ptr()
+        ):
+            return cached
+        if output is None:
+            output = torch.empty_like(source)
+        binding.fill_host_table(source, output)
+        self.tables.setdefault(key, output)
+        return output
+
+
 class OffloadPageBinding:
     def __init__(self, host_pool, device, device_pages):
         self.host_pool = host_pool
@@ -13,6 +42,7 @@ class OffloadPageBinding:
         self.device = torch.device(device)
         self.device_to_host_cpu = torch.zeros(device_pages, dtype=torch.int64)
         self.device_to_host = self.device_to_host_cpu.to(self.device)
+        self.mapping_epoch = 0
         self.references = torch.zeros(host_pool.page_num, dtype=torch.int64)
         self.cache_references = torch.zeros_like(self.references)
         self.retired = deque()
@@ -72,6 +102,7 @@ class OffloadPageBinding:
         self.device_to_host.index_copy_(
             0, device_pages.to(self.device), host_pages.to(self.device)
         )
+        self.mapping_epoch += 1
 
     def reap(self):
         with self.lock:
@@ -142,6 +173,34 @@ class OffloadPageBinding:
         valid = (pages > 0) & (pages < self.device_to_host.numel())
         mapped = self.device_to_host[pages.clamp(0, self.device_to_host.numel() - 1)]
         return torch.where(valid, mapped, 0).to(device_table.dtype)
+
+    def fill_host_table(self, device_table, output):
+        if (
+            device_table.ndim != 2
+            or output.ndim != 2
+            or any(
+                source > target
+                for source, target in zip(device_table.shape, output.shape)
+            )
+            or device_table.dtype not in (torch.int32, torch.int64)
+            or output.dtype != device_table.dtype
+            or device_table.device != self.device_to_host.device
+            or output.device != device_table.device
+        ):
+            raise ValueError(
+                "Host page-table output must cover the input on the same device and dtype"
+            )
+        if device_table.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.hicache_page_table import (
+                fill_host_page_table,
+            )
+
+            return fill_host_page_table(device_table, self.device_to_host, output)
+        output.zero_()
+        output[: device_table.shape[0], : device_table.shape[1]].copy_(
+            self.host_table(device_table)
+        )
+        return output
 
     def retain_device_rows(self, device_rows):
         with self.lock:

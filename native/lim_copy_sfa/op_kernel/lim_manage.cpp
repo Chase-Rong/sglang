@@ -10,7 +10,7 @@ extern "C" __global__ __aicore__ void sgl_lim_manage(
     GM_ADDR unionSources, GM_ADDR unionSlots, GM_ADDR unionPhysical,
     uint32_t rows, uint32_t batch, uint32_t requestCapacity, uint32_t sourceCapacity,
     uint32_t capacity, uint32_t columns, uint32_t unionWidth, uint32_t scoreColumns,
-    uint64_t hostTokens, uint32_t mutableTail, bool pooledInput, bool encodedScores)
+    uint64_t hostTokens, uint32_t mutableTail, bool pooledInput, bool encodedScores, bool preservePrefix)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 #if __CCE_AICORE__ == 310
@@ -21,7 +21,7 @@ extern "C" __global__ __aicore__ void sgl_lim_manage(
             manager.Init(ids, scores, ends, lengths, table, requests, generations, mapping, sources,
                 physical, state, outputIds, outputSlots, membership, unionSources, unionSlots,
                 unionPhysical, rows, batch, requestCapacity, sourceCapacity, capacity, columns,
-                unionWidth, scoreColumns, hostTokens, mutableTail, pooledInput, encodedScores, pipe);
+                unionWidth, scoreColumns, hostTokens, mutableTail, pooledInput, encodedScores, pipe, false, preservePrefix);
             manager.Run();
         }
     }

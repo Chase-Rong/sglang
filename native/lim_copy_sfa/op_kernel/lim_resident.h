@@ -15,7 +15,8 @@ public:
         GM_ADDR unionSources, GM_ADDR unionSlots, GM_ADDR unionPhysical, uint32_t rows, uint32_t batch,
         uint32_t requestCapacity, uint32_t sourceCapacity, uint32_t residentCapacity, uint32_t columns,
         uint32_t unionWidth, uint32_t scoreColumns, uint64_t hostTokens, uint32_t mutableTail,
-        bool pooledInput, bool encodedScores, TPipe &pipe, bool preparedRows = false)
+        bool pooledInput, bool encodedScores, TPipe &pipe, bool preparedRows = false,
+        bool preservePrefix = false)
     {
         idsGm.SetGlobalBuffer((__gm__ int32_t *)ids);
         scoresGm.SetGlobalBuffer((__gm__ uint32_t *)scores);
@@ -47,6 +48,7 @@ public:
         pooled = pooledInput;
         encoded = encodedScores;
         prepared = preparedRows;
+        preserveDraftPrefix = preservePrefix;
         pipe.InitBuffer(unionBuffer, unionSize * 4);
         pipe.InitBuffer(residentBuffer, (capacity < 5120 ? 5120 : capacity) * 4);
         pipe.InitBuffer(heapBuffer, capacity * 4);
@@ -212,13 +214,24 @@ private:
         uint64_t mapBase = active ? owner * sourceCount : 0;
         uint32_t total = 0;
         int32_t maxLength = 0;
+        int32_t minLength = INT32_MAX;
         for (int32_t row = start; row < end; ++row) {
             int32_t length = lengthsGm.GetValue(row);
             maxLength = maxLength > length ? maxLength : length;
+            minLength = minLength < length ? minLength : length;
         }
         if (FinishPrepared(request, start, end, owner, maxLength)) return;
-        bool reset = active && (stateGm.GetValue(owner * 16) != generationsGm.GetValue(owner) ||
-            maxLength < stateGm.GetValue(owner * 16 + 1));
+        bool generationChanged = active && stateGm.GetValue(owner * 16) != generationsGm.GetValue(owner);
+        bool rollback = active && maxLength < stateGm.GetValue(owner * 16 + 1);
+        bool reset = generationChanged || (rollback && !preserveDraftPrefix);
+        if (rollback && !reset) {
+            asc_vf_call<InvalidateSpeculativeSuffix>(dim3(256),
+                (__gm__ const int32_t *)sourcesGm.GetPhyAddr(), (__gm__ int64_t *)physicalGm.GetPhyAddr(),
+                residentBase, capacity, minLength - static_cast<int32_t>(tailSize));
+            SetFlag<HardEvent::V_S>(EVENT_ID7);
+            WaitFlag<HardEvent::V_S>(EVENT_ID7);
+        }
+        bool reuseClassification = prepared && active && !reset && !rollback;
         if (active) {
             stateGm.SetValue(owner * 16 + 2, reset);
             if (reset) {
@@ -233,11 +246,20 @@ private:
         SetFlag<HardEvent::V_S>(EVENT_ID7);
         WaitFlag<HardEvent::V_S>(EVENT_ID7);
         for (int32_t row = start; row < end && active; ++row) {
-            ClassifyRow(request, row, owner, 0, false);
-            asc_vf_call<CollectRowMisses>(dim3(256), (__ubuf__ const int32_t *)rowIds.GetPhyAddr(),
-                (__ubuf__ const int32_t *)rowSlots.GetPhyAddr(), (__ubuf__ const int16_t *)rowPlan.GetPhyAddr(),
-                (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ uint32_t *)heapLocal.GetPhyAddr(),
-                (__ubuf__ uint32_t *)rowPlan[2080].GetPhyAddr(), total);
+            if (reuseClassification) {
+                asc_vf_call<CollectPreparedRowMisses>(dim3(256),
+                    (__gm__ const int32_t *)outputIdsGm.GetPhyAddr(),
+                    (__gm__ const int32_t *)outputSlotsGm.GetPhyAddr(),
+                    (__gm__ const int16_t *)membershipGm.GetPhyAddr(),
+                    (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ uint32_t *)heapLocal.GetPhyAddr(),
+                    (__ubuf__ uint32_t *)rowPlan[2080].GetPhyAddr(), row, total);
+            } else {
+                ClassifyRow(request, row, owner, 0, false);
+                asc_vf_call<CollectRowMisses>(dim3(256), (__ubuf__ const int32_t *)rowIds.GetPhyAddr(),
+                    (__ubuf__ const int32_t *)rowSlots.GetPhyAddr(), (__ubuf__ const int16_t *)rowPlan.GetPhyAddr(),
+                    (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ uint32_t *)heapLocal.GetPhyAddr(),
+                    (__ubuf__ uint32_t *)rowPlan[2080].GetPhyAddr(), total);
+            }
             SetFlag<HardEvent::V_S>(EVENT_ID7);
             WaitFlag<HardEvent::V_S>(EVENT_ID7);
             total += rowPlan[2080].ReinterpretCast<uint32_t>().GetValue(255);
@@ -282,14 +304,23 @@ private:
             SetFlag<HardEvent::V_S>(EVENT_ID7);
             WaitFlag<HardEvent::V_S>(EVENT_ID7);
         }
-        asc_vf_call<ClassifyManagedRows>(dim3(256), (__gm__ const int32_t *)idsGm.GetPhyAddr(),
-            (__gm__ const int32_t *)tableGm.GetPhyAddr(), (__gm__ const int32_t *)mappingGm.GetPhyAddr(),
-            (__gm__ const int64_t *)physicalGm.GetPhyAddr(), (__gm__ const int32_t *)lengthsGm.GetPhyAddr(),
-            (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ int32_t *)nullptr,
-            (__ubuf__ int16_t *)rowIds.GetPhyAddr(), (__ubuf__ const int32_t *)residentLocal.GetPhyAddr(),
-            (__ubuf__ const int32_t *)heapLocal.GetPhyAddr(), static_cast<uint64_t>(request) * tableColumns,
-            mapBase, residentBase, hostSize, sourceCount, capacity, tableColumns,
-            static_cast<uint32_t>(start), static_cast<uint32_t>(end), tailSize, unique, pooled, active, true);
+        if (reuseClassification) {
+            asc_vf_call<RepairPreparedRows>(dim3(256),
+                (__gm__ const int32_t *)outputIdsGm.GetPhyAddr(),
+                (__gm__ const int16_t *)membershipGm.GetPhyAddr(),
+                (__gm__ const int32_t *)mappingGm.GetPhyAddr(), (__ubuf__ int32_t *)unionLocal.GetPhyAddr(),
+                (__ubuf__ int16_t *)rowIds.GetPhyAddr(), mapBase,
+                static_cast<uint32_t>(start), static_cast<uint32_t>(end), capacity);
+        } else {
+            asc_vf_call<ClassifyManagedRows>(dim3(256), (__gm__ const int32_t *)idsGm.GetPhyAddr(),
+                (__gm__ const int32_t *)tableGm.GetPhyAddr(), (__gm__ const int32_t *)mappingGm.GetPhyAddr(),
+                (__gm__ const int64_t *)physicalGm.GetPhyAddr(), (__gm__ const int32_t *)lengthsGm.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionLocal.GetPhyAddr(), (__ubuf__ int32_t *)nullptr,
+                (__ubuf__ int16_t *)rowIds.GetPhyAddr(), (__ubuf__ const int32_t *)residentLocal.GetPhyAddr(),
+                (__ubuf__ const int32_t *)heapLocal.GetPhyAddr(), static_cast<uint64_t>(request) * tableColumns,
+                mapBase, residentBase, hostSize, sourceCount, capacity, tableColumns,
+                static_cast<uint32_t>(start), static_cast<uint32_t>(end), tailSize, unique, pooled, active, true);
+        }
         SetFlag<HardEvent::V_S>(EVENT_ID7);
         WaitFlag<HardEvent::V_S>(EVENT_ID7);
         for (int32_t row = start; row < end; ++row) {
@@ -326,6 +357,7 @@ private:
     LocalTensor<int32_t> victimLocal;
     uint32_t rowCount, batchCount, requestCount, sourceCount, capacity, tableColumns, unionSize, scoreStride, tailSize;
     uint64_t hostSize;
+    bool preserveDraftPrefix;
     bool pooled, encoded, prepared;
 };
 }

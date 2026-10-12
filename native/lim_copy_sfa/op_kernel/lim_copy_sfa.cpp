@@ -15,7 +15,7 @@ extern "C" __global__ __aicore__ void sgl_lim_copy_sfa(
     GM_ADDR physical, GM_ADDR state, GM_ADDR output, GM_ADDR workspace,
     uint32_t rows, uint32_t batch, uint32_t heads, uint32_t capacity,
     uint32_t columns, uint32_t unionWidth, uint32_t mutableTail,
-    uint32_t requestCapacity, float scale)
+    uint32_t requestCapacity, float scale, bool reusePlan)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 #if __CCE_AICORE__ == 310
@@ -77,7 +77,7 @@ extern "C" __global__ __aicore__ void sgl_lim_copy_sfa(
             pipe.Reset();
         }
         SglCopy::Commit(ends, lengths, requests, unionSources, unionSlots, unionPhysical,
-            physical, state, membership, batch, capacity, unionWidth, mutableTail, requestCapacity, pipe);
+            physical, state, membership, batch, capacity, unionWidth, mutableTail, requestCapacity, pipe, reusePlan);
     }
 #endif
 }

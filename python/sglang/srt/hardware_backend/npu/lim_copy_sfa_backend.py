@@ -44,6 +44,7 @@ class LimCopySfaState:
         self._pool_epoch = getattr(pool, "req_generation_epoch", 0)
         self._epoch = 0
         self._generations_initialized = False
+        self._generation_version = 0
         self.refresh_generations()
         self.spec = LimCopySfaSpec(source_tokens, routes, capacity)
         self.batch_capacity = batch_capacity
@@ -76,6 +77,7 @@ class LimCopySfaState:
         self._pool_epoch = pool_epoch
         self._generation_snapshot.copy_(current)
         self.generations.copy_(current + (self._epoch << 32))
+        self._generation_version += 1
         self._generations_initialized = True
 
     def layer(self, layer_id):
@@ -144,15 +146,64 @@ class LimCopySfaState:
             host_tokens=region.tensor.numel() // 512,
             mutable_tail=self.mutable_tail_tokens,
         )
-        self.pending[layer_id] = topk
+        self.pending[layer_id] = (
+            topk,
+            batch,
+            backend.forward_metadata,
+            (ends, lengths, requests, table),
+        )
         return topk
 
     def forward(self, backend, query, layer, batch, topk, full_kv, region):
         rows = query.shape[0]
-        ends, lengths, requests, table = self.metadata(backend, batch, rows)
         current = self.layer(layer.layer_id)
         selected = self.pending.pop(layer.layer_id, None)
-        if selected is None or selected.data_ptr() != topk.data_ptr():
+        reuse_selected = (
+            selected is not None
+            and selected[0].data_ptr() == topk.data_ptr()
+            and selected[0].shape == topk.shape
+            and selected[1] is batch
+            and selected[2] is backend.forward_metadata
+        )
+        if reuse_selected:
+            ends, lengths, requests, table = selected[3]
+        else:
+            ends, lengths, requests, table = self.metadata(backend, batch, rows)
+
+        cache = getattr(batch, "draft_sparse_plan_cache", None)
+        if (
+            not getattr(batch, "reuse_dsa_topk_indices", False)
+            or not batch.forward_mode.is_decode()
+            or rows != requests.numel()
+        ):
+            cache = None
+        key = None
+        identity = None
+        if cache is not None:
+            from sglang.srt.hardware_backend.npu.fsa_backend import (
+                sparse_pool_and_layer,
+            )
+
+            pool, _ = sparse_pool_and_layer(backend.token_to_kv_pool, layer.layer_id)
+            backing = pool.decode_host_backing
+            binding = getattr(backing, "page_binding", None)
+            key = ("lim_copy_sfa", self, layer.layer_id)
+            identity = (
+                id(batch),
+                rows,
+                topk.data_ptr(),
+                topk.stride(),
+                requests.data_ptr(),
+                table.data_ptr(),
+                table.shape,
+                id(region),
+                self._generation_version,
+                getattr(binding, "mapping_epoch", 0),
+            )
+        reuse_plan = (
+            not reuse_selected and cache is not None and cache.get(key) == identity
+        )
+        if not reuse_selected and not reuse_plan:
             current.planner.plan(
                 topk.contiguous(),
                 self.neutral_scores[:rows],
@@ -163,8 +214,9 @@ class LimCopySfaState:
                 self.generations,
                 host_tokens=full_kv.numel() // 512,
                 mutable_tail=self.mutable_tail_tokens,
+                preserve_prefix=cache is not None,
             )
-        return self.copy_attention.forward(
+        output = self.copy_attention.forward(
             query.contiguous(),
             full_kv,
             region,
@@ -177,7 +229,23 @@ class LimCopySfaState:
             requests,
             scale=layer.scaling,
             mutable_tail=self.mutable_tail_tokens,
+            reuse_plan=reuse_plan,
         )
+        if cache is not None and not reuse_plan:
+            from sglang.srt.hardware_backend.npu.lim_copy_sfa_reuse import (
+                publish_draft_plan,
+            )
+
+            publish_draft_plan(
+                current.planner,
+                lengths,
+                table,
+                requests,
+                host_tokens=full_kv.numel() // 512,
+                mutable_tail=self.mutable_tail_tokens,
+            )
+            cache[key] = identity
+        return output
 
 
 def select_offloaded_topk(backend, indexer, batch, layer_id, query, weights, metadata):
