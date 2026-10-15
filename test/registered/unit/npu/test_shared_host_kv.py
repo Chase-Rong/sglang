@@ -187,7 +187,11 @@ def test_decode_release_waits_for_shared_writer_even_after_deadline(monkeypatch,
         _do_release=lambda *args: released.append(args),
     )
     resolve = namespace["resolve_deferred_releases"]
-    resolve(queue)
+    if shared:
+        with pytest.raises(RuntimeError, match="remain retained"):
+            resolve(queue)
+    else:
+        resolve(queue)
     if not shared:
         assert released == [(request, 3)] and not queue._deferred_releases
         resolve(queue)

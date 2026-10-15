@@ -76,6 +76,38 @@ def rows(*pages, page_size=4):
     ).reshape(-1)
 
 
+def test_pd_transfer_pin_keeps_host_page_live_after_request_release(bound):
+    binding = bound.binding
+    assert binding.ensure_pages(torch.tensor([1]))
+    host_pages = binding.pin_transfer_pages([1])
+    binding.release_device_pages(torch.tensor([1]))
+    assert binding.references[host_pages].tolist() == [1]
+    assert not binding.cache_references.any()
+    binding.unpin_transfer_pages(host_pages)
+    assert binding.references[host_pages].tolist() == [0]
+    assert len(binding.retired) == 1
+
+
+def test_pd_transfer_cannot_pin_unmapped_pages(bound):
+    before = bound.binding.references.clone()
+    with pytest.raises(RuntimeError, match="allocated Host pages"):
+        bound.binding.pin_transfer_pages([1])
+    assert torch.equal(before, bound.binding.references)
+
+
+def test_pd_publication_runs_once_for_packed_target_and_draft(bound):
+    from sglang.srt.hardware_backend.npu.hicache_offload import publish_received_host_kv
+
+    calls = []
+    shared = SimpleNamespace(publish_write=lambda: calls.append("publish"))
+    backing = SimpleNamespace(
+        page_binding=bound.binding, pool=SimpleNamespace(shared_group=shared)
+    )
+    publish_received_host_kv(SimpleNamespace(host_backings=(backing, backing)))
+    assert calls == ["publish"]
+    assert bound.binding.ready_event is bound.device.events[-1]
+
+
 def snapshot(pool):
     binding = pool.binding
     return (

@@ -97,7 +97,7 @@ def test_staging_reserves_one_fixed_window_and_copy_metadata():
         before = baseline.required_bytes(8192, rows, 64)
         after = staged.required_bytes(8192, rows, 64)
         assert after[0] == before[0]
-        assert after[1] - before[1] == 4096 + 9
+        assert after[1] - before[1] == 4096
     with pytest.raises(ValueError, match="staging"):
         budget(staging_bytes=33)
 

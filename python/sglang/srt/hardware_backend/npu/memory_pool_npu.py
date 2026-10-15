@@ -580,25 +580,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             raise ValueError("Prefill layer slots must fit the logical layer count")
         self.prefill_layer_slots = prefill_layer_slots
         self.integrated_offload = integrated_offload
-        if decode_host_token_capacity and not integrated_offload:
-            raise ValueError("Independent Host capacity requires integrated offload")
+        if decode_host_token_capacity and decode_host_budget is None:
+            raise ValueError("Independent Host capacity requires Decode Host backing")
         if integrated_offload and (prefill_layer_slots is None or decode_host_budget is None
                                    or not self._kpool_use_compress):
             raise ValueError("integrated offload requires Prefill slots, Host KV and resident KPool")
         self.prefill_offload_runtime = None
         self.decode_host_backing = None
         if decode_host_budget is not None:
-            if (prefill_layer_slots is not None and not integrated_offload) or index_head_dim is None:
+            if (
+                prefill_layer_slots is not None and not integrated_offload
+            ) or index_head_dim is None:
                 raise ValueError("Decode Host KV requires a dedicated DSA Decode pool")
             from sglang.srt.hardware_backend.npu.decode_host_kv import (
                 DecodeHostKvBacking,
             )
 
             self.decode_host_backing = DecodeHostKvBacking(
-                layers=layer_num, pages=size // page_size + 1, page_size=page_size,
-                latent_dim=kv_lora_rank, rope_dim=qk_rope_head_dim,
-                dtype=self.store_dtype, device_id=torch.npu.current_device(),
-                host_budget=decode_host_budget, shared_group=shared_host_group,
+                layers=layer_num,
+                pages=size // page_size + 1,
+                page_size=page_size,
+                latent_dim=kv_lora_rank,
+                rope_dim=qk_rope_head_dim,
+                dtype=self.store_dtype,
+                device_id=torch.npu.current_device(),
+                host_budget=decode_host_budget,
+                shared_group=shared_host_group,
                 integrated=integrated_offload,
                 host_token_capacity=decode_host_token_capacity,
             )
@@ -695,16 +702,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     kind, str(tensor.dtype), owner,
                 )
             layers[self.start_layer + local_layer] = regions
-        device_id = self.decode_host_backing.pool.device_id
         shared_group = getattr(self.decode_host_backing.pool, "shared_group", None)
+        binding = self.decode_host_backing.page_binding
+        if binding is None:
+            raise RuntimeError("PD receive requires HiCache page ownership")
+        if not binding.ensure_pages(torch.as_tensor(device_pages, dtype=torch.int64)):
+            raise RuntimeError("PD receive cannot allocate its HiCache Host pages")
+        if binding.indexer_mapping is not None:
+            binding.indexer_mapping.update_request_pages(
+                torch.as_tensor(device_pages, dtype=torch.int64)
+            )
+        mapped = binding.device_to_host_cpu[
+            torch.as_tensor(device_pages, dtype=torch.int64)
+        ]
+        if (mapped <= 0).any():
+            raise RuntimeError("PD receive pages have no Host backing")
+        host_pages = tuple(mapped.tolist())
         if shared_group is not None:
             shared_group.validate_identity((
                 room, tuple(map(int, host_pages)), tuple(map(int, device_pages)), prefix,
             ))
-
-        def complete_visibility(layer, start, end):
-            torch.npu.set_device(device_id)
-            torch.npu.synchronize(device_id)
 
         page_ids = {KvComponent.LATENT_K: tuple(map(int, host_pages)),
                     KvComponent.INDEXER_K: tuple(map(int, device_pages))}
@@ -712,13 +729,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             del page_ids[KvComponent.INDEXER_K]
         if self.qk_rope_head_dim:
             page_ids[KvComponent.ROPE_K] = tuple(map(int, host_pages))
-        return LayerReceiveLease(
-            room, session_id, self.page_size, layers,
+        lease = LayerReceiveLease(
+            room,
+            session_id,
+            self.page_size,
+            layers,
             page_ids,
-            complete_visibility, prefix=prefix,
+            lambda layer, start, end: None,
+            prefix=prefix,
             shared_group_id=shared_group.group_id if shared_group is not None else "",
             shared_host_writer=shared_group is None or shared_group.is_writer,
         )
+        pinned_pages = binding.pin_transfer_pages(device_pages)
+        lease.release_pages = lambda: binding.unpin_transfer_pages(pinned_pages)
+        return lease
 
     def physical_layer_index(self, layer_id: int) -> int:
         local_layer = layer_id - self.start_layer

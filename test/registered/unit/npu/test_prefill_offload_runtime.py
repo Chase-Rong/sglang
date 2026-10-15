@@ -4,6 +4,7 @@ import ast
 import contextlib
 import importlib.util
 import sys
+import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,7 +138,7 @@ def make_runtime(modules, *, layers=4, physical_slots=2, publish=None, start_lay
         request_pool,
         adapter,
         publish=publish or (lambda *args: [SimpleNamespace(state="acknowledged")]),
-        timeout_s=0.001,
+        timeout_s=0.1,
     )
     runtime.register_host_layers()
     pool.prefill_offload_runtime = runtime
@@ -234,6 +235,132 @@ def test_receiver_ack_timeout_retains_the_whole_batch_slot(modules):
     assert runtime.slots.active_tokens() == ()
     runtime.release_request("req-0")
     runtime.release_request("req-1")
+
+
+def test_staging_publication_overlaps_following_layer_and_retains_source_slot(modules):
+    started = threading.Event()
+    proceed = threading.Event()
+    operations = []
+
+    def publish(sender, work, binding, ready):
+        assert ready.query()
+        started.set()
+        assert proceed.wait(2)
+        operation = SimpleNamespace(state="acknowledged")
+        operations.append(operation)
+        return [operation]
+
+    runtime, pool, _ = make_runtime(modules, publish=publish)
+    runtime.timeout_s = 2
+    try:
+        runtime.begin_batch(make_batch(2, 0, request_count=1))
+        pool.get_kv_buffer(0)
+        runtime.finish_layer(0)
+        assert started.wait(1)
+        pool.get_kv_buffer(1)
+        assert runtime.slots.owner(0) is not None
+        assert not runtime.can_release_request("req-0")
+        proceed.set()
+        runtime.finish_layer(1)
+        for layer in (2, 3):
+            pool.get_kv_buffer(layer)
+            runtime.finish_layer(layer)
+        runtime.finish_batch()
+        assert len(operations) == 4
+        assert runtime.slots.active_tokens() == ()
+    finally:
+        proceed.set()
+        if runtime._publisher is not None:
+            runtime._publisher.shutdown(wait=True)
+
+
+def test_separate_prefill_uses_copy_streams_and_waits_for_prefetched_layer(
+    modules, monkeypatch
+):
+    runtime, pool, _ = make_runtime(modules)
+    pool.device = "npu:0"
+    trace = []
+    current = [None]
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            trace.append((self.name, "wait_stream", other.name))
+
+        def wait_event(self, event):
+            trace.append((self.name, "wait_event", event.stream.name))
+
+    class Event:
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return True
+
+    current[0] = Stream("compute")
+    streams = []
+
+    def create_stream(**kwargs):
+        stream = Stream(f"copy-{len(streams)}")
+        streams.append(stream)
+        return stream
+
+    @contextlib.contextmanager
+    def use_stream(stream):
+        previous = current[0]
+        current[0] = stream
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            Stream=create_stream,
+            Event=Event,
+            current_stream=lambda: current[0],
+            stream=use_stream,
+            set_device=lambda device: None,
+        ),
+        raising=False,
+    )
+
+    def record_event():
+        event = Event()
+        event.record(current[0])
+        return event
+
+    runtime.adapter.record_event = record_event
+    restore = runtime.adapter.restore_layer
+    save = runtime.adapter.save_layer
+
+    def restore_layer(work):
+        trace.append(("restore", work.token.logical_layer, current[0].name))
+        restore(work)
+
+    def save_layer(work):
+        trace.append(("save", work.token.logical_layer, current[0].name))
+        save(work)
+
+    runtime.adapter.restore_layer = restore_layer
+    runtime.adapter.save_layer = save_layer
+    try:
+        with runtime.forward(make_batch(2, 0, request_count=1)):
+            for layer in range(4):
+                pool.get_kv_buffer(layer)
+                trace.append(("compute", layer))
+                runtime.finish_layer(layer)
+        assert trace.index(("restore", 1, "copy-0")) < trace.index(("compute", 0))
+        assert ("save", 0, "copy-1") in trace
+        assert ("compute", "wait_event", "copy-0") in trace
+        assert ("copy-1", "wait_event", "compute") in trace
+    finally:
+        if runtime._publisher is not None:
+            runtime._publisher.shutdown(wait=True)
 
 
 def test_layer_access_after_attention_completion_is_rejected(modules):

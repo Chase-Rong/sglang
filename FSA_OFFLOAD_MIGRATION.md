@@ -540,3 +540,39 @@ Final artifact SHA256:
   These were launch/configuration failures, not failures of shared Host storage.
 - This validates shared Host functionality at TP component/Graph level. It is
   not full-model, real PD transfer,1M-context, throughput or TPOT validation.
+
+## Separate P/D staging transport (2026-10-14)
+
+Separate NPU Host offload uses one transport path: registered Prefill HBM ->
+MemFabric -> bounded registered Decode HBM staging -> shared MemFabric Host KV.
+Decode allocates the payload through HiCache and pins receive pages until the
+lease completes or transport drain is confirmed. Host payload addresses are
+excluded from transfer-engine registration and hidden in the layer manifest.
+The removed direct-Host pull protocol is rejected during negotiation.
+
+The layer window defaults to64MiB only for separate offload Decode; integrated
+and ordinary PD allocate no layer window. The allocator and memory budget use
+the same effective size. Target/draft share the request-page ownership and the
+window; compressed Indexer, KPool tail and KDA retain their auxiliary-state
+transfer contracts. LIM+CopySFA and external_plan consume the same Host mapping.
+
+Prefill publishes KV-ready layers on a bounded-by-slots background queue.
+Source slots remain owned until both local Host saves and every receiver ACK
+complete. Separate Prefill uses event-ordered H2D prefetch into a free layer slot
+and asynchronous D2H saves. If the next slot is still held by a transfer, prefetch
+waits for normal slot reclamation rather than overwriting the source.
+
+Batch-capable staging packs discrete page spans into one window without merging
+their logical page mappings. One acquire/transfer/commit cycle covers the batch;
+credits return only after local copies complete. Decode submits mapped Host
+copies through the existing MemFabric Prefill DMA binding, and publishes shared
+Host visibility from the scheduler after rank readiness reduction. Transport
+failure retains the window and pages until explicit drain.
+
+The historical external_plan staging smoke completed six TP4+TP4 requests with
+MTP disabled. Its repetitive raw-prompt output was not accuracy-qualified.
+Component tests validated staged DMA into MemFabric Host backing, cross-card
+payload correctness and shared Host visibility on Decode TP ranks. The current
+HiCache/LIM/MTP staging adaptation still requires full-model correctness,
+Graph/MTP5 and cross-machine qualification. Component results do not establish
+end-to-end performance or TPOT improvement.

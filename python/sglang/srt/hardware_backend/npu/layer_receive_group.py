@@ -30,27 +30,53 @@ class LayerReceivePoolGroup:
         if ownership[0] != ownership[1]:
             raise ValueError("target and draft Host backing must have matching writer groups")
 
-    def layer_receive_lease(self, room, session_id, host_pages, device_pages, *, prefix=0):
+    def layer_receive_lease(
+        self, room, session_id, host_pages, device_pages, *, prefix=0
+    ):
         layers = {}
         visibility = {}
         leases = []
-        for offset, pool in self.pools:
-            lease = pool.layer_receive_lease(room, session_id, host_pages, device_pages, prefix=prefix)
-            leases.append(lease)
-            for layer_id, regions in lease.layers.items():
-                wire_layer = offset + layer_id
-                layers[wire_layer] = regions
-                visibility[wire_layer] = (lease.visibility, layer_id)
+        try:
+            for offset, pool in self.pools:
+                lease = pool.layer_receive_lease(
+                    room, session_id, host_pages, device_pages, prefix=prefix
+                )
+                leases.append(lease)
+                for layer_id, regions in lease.layers.items():
+                    wire_layer = offset + layer_id
+                    layers[wire_layer] = regions
+                    visibility[wire_layer] = (lease.visibility, layer_id)
+        except BaseException:
+            for lease in leases:
+                lease.close()
+            raise
         first = leases[0]
         if any(lease.page_ids != first.page_ids for lease in leases[1:]):
+            for lease in leases:
+                lease.close()
             raise ValueError("target and draft leases disagree on physical request pages")
 
         def complete_visibility(layer_id, start, end):
             callback, local_layer = visibility[layer_id]
             callback(local_layer, start, end)
 
-        return LayerReceiveLease(
-            room, session_id, self.page_size, layers, first.page_ids, complete_visibility,
-            prefix=prefix, shared_group_id=first.shared_group_id,
-            shared_host_writer=first.shared_host_writer,
-        )
+        def release_pages():
+            for lease in leases:
+                lease.close()
+
+        try:
+            return LayerReceiveLease(
+                room,
+                session_id,
+                self.page_size,
+                layers,
+                first.page_ids,
+                complete_visibility,
+                prefix=prefix,
+                shared_group_id=first.shared_group_id,
+                shared_host_writer=first.shared_host_writer,
+                release_pages=release_pages,
+            )
+        except BaseException:
+            release_pages()
+            raise

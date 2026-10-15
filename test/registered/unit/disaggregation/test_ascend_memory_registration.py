@@ -4,15 +4,49 @@ import copy
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestAscendMemoryRegistration(unittest.TestCase):
+    def test_dsa_auxiliary_transfer_skips_only_ordinary_kv_entries(self):
+        manager = self.make_manager(prefill_layerwise_aux_kv=True)
+        with patch.object(
+            MooncakeKVManager, "_send_kvcache_generic", return_value=0
+        ) as send:
+            self.assertEqual(
+                manager._send_kvcache_generic(
+                    src_data_ptrs=[0x1000, 0x9000],
+                    dst_data_ptrs=[0x5000, 0xA000],
+                    item_lens=[64, 32],
+                    state_type=StateType.DSA,
+                ),
+                0,
+            )
+        self.assertEqual(send.call_args.kwargs["src_data_ptrs"], [0x9000])
+        self.assertEqual(send.call_args.kwargs["dst_data_ptrs"], [0xA000])
+        self.assertEqual(send.call_args.kwargs["item_lens"], [32])
+
+    def test_dsa_auxiliary_transfer_does_not_resend_an_ordinary_only_component(self):
+        manager = self.make_manager(prefill_layerwise_aux_kv=True)
+        with patch.object(MooncakeKVManager, "_send_kvcache_generic") as send:
+            self.assertEqual(
+                manager._send_kvcache_generic(
+                    src_data_ptrs=[0x1000],
+                    dst_data_ptrs=[0x5000],
+                    item_lens=[64],
+                    state_type=StateType.DSA,
+                ),
+                0,
+            )
+        send.assert_not_called()
+
     def make_manager(self, **overrides):
         args = dict(
             kv_data_ptrs=[0x1000, 0],
@@ -28,6 +62,8 @@ class TestAscendMemoryRegistration(unittest.TestCase):
         manager = AscendKVManager.__new__(AscendKVManager)
         manager.kv_args = SimpleNamespace(**args)
         manager.engine = Mock()
+        manager.engine.batch_register.return_value = 0
+        manager.engine.batch_deregister.return_value = 0
         return manager
 
     def test_register_filters_placeholders_without_changing_wire_metadata(self):

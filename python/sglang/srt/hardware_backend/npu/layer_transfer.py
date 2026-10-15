@@ -46,12 +46,22 @@ class PrefillLayerTarget:
     notify: Callable
     transfer_components: frozenset | None = None
     staging: dict | None = None
+    prefix: int = 0
+    required_tokens: int = 0
 
     def __post_init__(self):
         if not self.session_id or not callable(self.notify):
             raise ValueError(
                 "layer target requires a session and receiver notification"
             )
+        if (
+            type(self.prefix) is not int
+            or self.prefix < 0
+            or type(self.required_tokens) is not int
+            or self.required_tokens < 0
+            or (self.required_tokens and self.prefix > self.required_tokens)
+        ):
+            raise ValueError("invalid layer target token interval")
         if set(self.regions) != set(self.page_ids):
             raise ValueError("layer target component regions and page mappings differ")
         if self.transfer_components is not None and not self.transfer_components.issubset(self.regions):
@@ -156,6 +166,27 @@ def build_layer_transfer_blocks(record, sources, destinations, *, page_size, tra
             transfer_components=transfer_components,
         )
     ]
+
+
+def coalesce_transfer_blocks(blocks):
+    merged = []
+    for source, destination, length in blocks:
+        if min(source, destination, length) <= 0:
+            raise ValueError("transfer addresses and lengths must be positive")
+        if (
+            merged
+            and merged[-1][0] + merged[-1][2] == source
+            and merged[-1][1] + merged[-1][2] == destination
+        ):
+            previous_source, previous_destination, previous_length = merged[-1]
+            merged[-1] = (
+                previous_source,
+                previous_destination,
+                previous_length + length,
+            )
+        else:
+            merged.append((source, destination, length))
+    return merged
 
 
 class LayerTransferOperation:

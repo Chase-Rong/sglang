@@ -2049,8 +2049,9 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            if is_health_check_generate_req(recv_req) and (
+                not self.is_fully_idle(for_health_check=True)
+                or envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)

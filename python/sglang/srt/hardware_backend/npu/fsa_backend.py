@@ -100,14 +100,17 @@ def initialize_fsa_backend(backend, model_runner):
                 model_runner.spec_algorithm, get_spec(), model_runner.model_config
             )
             if (
-                not envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+                getattr(
+                    getattr(owner, "full_kv_pool", owner), "decode_host_backing", None
+                )
+                is None
                 or backend.qk_rope_head_dim != 0
                 or backend.page_size != 128
                 or int(getattr(config, "index_kpool", 1)) != 4
                 or backend.fused_sparse_mode != "fused"
             ):
                 raise ValueError(
-                    "lim_copy_sfa requires GLM5Next NoPE KPool4 integrated offload"
+                    "lim_copy_sfa requires GLM5Next NoPE KPool4 Host offload"
                 )
             source_tokens = (
                 (model_runner.model_config.context_len + 128 + 511) // 512 * 512
@@ -179,13 +182,13 @@ def forward_fsa(
     pool, local_layer = sparse_pool_and_layer(backend.token_to_kv_pool, layer.layer_id)
     backing = getattr(pool, "decode_host_backing", None)
     full_table = metadata.real_page_table
-    if backing is not None and backing.integrated:
+    if backing is not None:
         full_table = metadata.host_page_table
         if full_table is None:
             raise RuntimeError("Integrated FSA requires the HiCache Host page table")
     if getattr(backend.fused_sparse_state, "backend_name", None) == "lim_copy_sfa":
-        if backing is None or not backing.integrated:
-            raise RuntimeError("LIM CopySFA requires integrated Host KV backing")
+        if backing is None or backing.page_binding is None:
+            raise RuntimeError("LIM CopySFA requires mapped Host KV backing")
         return backend.fused_sparse_state.forward(
             backend,
             q,
@@ -218,7 +221,6 @@ def forward_fsa(
             and getattr(forward_batch, "reuse_dsa_topk_indices", False)
             and forward_batch.forward_mode.is_decode()
             and backing is not None
-            and backing.integrated
             else None
         ),
     )

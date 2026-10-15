@@ -126,7 +126,7 @@ class MemFabricHiCachePool(HostKVCache):
         if (
             pool is self.device_pool
             or pool.layer_num != 1
-            or not pool.integrated_offload
+            or backing is None
             or backing.pages != self.page_num
             or any(
                 getattr(pool, key) != getattr(self.device_pool, key)

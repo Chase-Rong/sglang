@@ -51,6 +51,126 @@ def test_manifest_roundtrip_retains_address_kinds_and_independent_pages(modules)
     assert notifications == [(lease.lease_id, record, operation)]
 
 
+def test_host_offload_rejects_a_peer_without_staging(modules):
+    lease, _, _, _, _ = lease_inputs(modules)
+    with pytest.raises(ValueError, match="staging window"):
+        wire_module().parse_targets(
+            lease.manifest(),
+            room=5,
+            session_id=lease.session_id,
+            page_size=2,
+            notify=lambda *args: None,
+            require_staging=True,
+        )
+
+
+def test_removed_pull_protocol_is_rejected(modules):
+    wire = wire_module()
+    with pytest.raises(ValueError, match="protocol version"):
+        wire.decode(wire.encode({"version": 5}))
+
+
+def test_request_ready_waits_for_every_layer_and_complete_token_interval(modules):
+    lease, _, _, _, _ = lease_inputs(modules)
+    lease.required_tokens = 3
+    lease.prefixes = {4: 3, 8: 1}
+    assert not lease.ready()
+    lease.prefixes[8] = 3
+    assert lease.ready()
+    lease.failed = True
+    assert not lease.ready()
+
+
+@pytest.mark.parametrize("prefix,expected", [(1, (1, 3)), (3, None)])
+def test_prefill_publication_preserves_decode_cached_prefix(modules, prefix, expected):
+    from types import SimpleNamespace
+
+    lease, record, _, _, _ = lease_inputs(modules)
+    lease.prefix = prefix
+    lease.required_tokens = 3
+    lease.staging = {"window_bytes": 64, "registration": "staging"}
+    targets = wire_module().parse_targets(
+        lease.manifest(),
+        room=5,
+        session_id=lease.session_id,
+        page_size=2,
+        notify=lambda *args: None,
+        require_staging=True,
+    )
+    published = []
+    tensors = [
+        SimpleNamespace(
+            shape=(8, 4),
+            dtype="bf16",
+            nbytes=64,
+            data_ptr=lambda index=index: 1000 + index * 100,
+            element_size=lambda: 2,
+        )
+        for index in range(3)
+    ]
+    sender = SimpleNamespace(
+        require_prefill_layer_targets=lambda layers: None,
+        _prefill_layer_targets={layer: (target,) for layer, target in targets.items()},
+        kv_mgr=SimpleNamespace(
+            kv_args=SimpleNamespace(prefill_layerwise_aux_kv=False),
+            _registerable_regions=lambda: [
+                (tensor.data_ptr(), 64) for tensor in tensors
+            ],
+        ),
+    )
+
+    def send(record, **kwargs):
+        published.append(record)
+        return SimpleNamespace(state="acknowledged")
+
+    sender.send_layer_ready = send
+    work = SimpleNamespace(
+        token=record.token,
+        host_allocation=SimpleNamespace(page_size=2),
+        valid_range=modules[0].KvPageRange(0, 3),
+    )
+    binding = SimpleNamespace(
+        latent_k=tensors[0],
+        rope_k=tensors[1],
+        indexer_k=tensors[2],
+        source_page_ids=(0, 1),
+    )
+    sender_methods()["publish_prefill_layer"](sender, work, binding, None)
+    if expected is None:
+        assert published == []
+    else:
+        assert {
+            (item.valid_range.start_token, item.valid_range.end_token)
+            for item in published[0].components
+        } == {expected}
+    assert work.valid_range.start_token == 0
+
+
+def test_fully_cached_request_can_complete_without_rewriting_host_kv(modules):
+    from types import SimpleNamespace
+
+    calls = []
+    sender = SimpleNamespace(
+        _prepare_send_indices=lambda *args: ([], slice(0, 0), True, False),
+        _record_transfer_indices=lambda *args: None,
+        _layer_ready_operations={},
+        _prefill_layer_targets={4: (SimpleNamespace(prefix=3, required_tokens=3),)},
+        bootstrap_room=5,
+        aux_index=2,
+        trace_ctx=SimpleNamespace(copy_for_thread=lambda: None),
+        kv_mgr=SimpleNamespace(
+            kv_args=SimpleNamespace(
+                prefill_layerwise_offload=True, prefill_layerwise_aux_kv=False
+            ),
+            add_transfer_request=lambda *args, **kwargs: calls.append((args, kwargs)),
+        ),
+    )
+    sender_methods()["send"](sender, [])
+    assert len(calls) == 1
+    assert calls[0][0][1].size == 0
+    assert calls[0][0][3] is True
+
+
 @pytest.mark.parametrize("writer", [True, False])
 def test_shared_host_manifest_sends_host_once_and_indexer_to_each_rank(modules, writer):
     lease, record, operation, _, _ = lease_inputs(modules)
@@ -177,6 +297,7 @@ def test_sender_automatically_loads_targets_from_bootstrap(modules):
     from types import SimpleNamespace
 
     lease, _, _, _, _ = lease_inputs(modules)
+    lease.staging = {"window_bytes": 64, "registration": "staging"}
     methods = sender_methods()
     sender_type = type("Sender", (), {name: methods[name] for name in (
         "require_prefill_layer_targets", "_load_negotiated_layer_targets",
@@ -224,6 +345,7 @@ def test_bootstrap_fanout_and_dummy_rank_targets(modules, dummy_only):
     from types import SimpleNamespace
 
     lease, _, _, _, _ = lease_inputs(modules)
+    lease.staging = {"window_bytes": 64, "registration": "staging"}
     methods = sender_methods()
     sender_type = type("Sender", (), {name: methods[name] for name in (
         "require_prefill_layer_targets", "_load_negotiated_layer_targets",

@@ -55,7 +55,7 @@ def test_prefill_overlap_and_mtp_can_coexist():
 def service(**changes):
     values = dict(
         get_attention_backends=lambda: ("ascend", "ascend"),
-        disaggregation_transfer_backend="mooncake",
+        disaggregation_transfer_backend="ascend",
         disable_radix_cache=True,
         enable_hisparse=False,
         optimistic_prefill_attempts=0,
@@ -66,7 +66,47 @@ def service(**changes):
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_separate_ascend_services_are_admitted(role):
-    MODULE.validate_offload_service(service(), role)
+    values = (
+        {}
+        if role == "prefill"
+        else dict(disable_radix_cache=False, enable_hierarchical_cache=True)
+    )
+    MODULE.validate_offload_service(service(**values), role)
+
+
+def test_separate_decode_rejects_unmanaged_host_pages():
+    with pytest.raises(ValueError, match="HiCache"):
+        MODULE.validate_offload_service(service(), "decode")
+
+
+@pytest.mark.parametrize(
+    "role,host,integrated,expected",
+    [
+        ("decode", True, False, 64 * 1024 * 1024),
+        ("prefill", True, False, 0),
+        ("decode", False, False, 0),
+        ("null", True, True, 0),
+    ],
+)
+def test_layer_staging_default_is_only_allocated_for_pd_host_decode(
+    role, host, integrated, expected
+):
+    assert (
+        MODULE.layer_staging_bytes(
+            0, role=role, host_offload=host, integrated=integrated
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("size", [-32, 1, 31, 33, True])
+def test_invalid_layer_staging_size_is_rejected(size):
+    with pytest.raises(ValueError, match="32-byte"):
+        MODULE.layer_staging_bytes(size, role="decode", host_offload=True)
+
+
+def test_explicit_staging_size_is_preserved():
+    assert MODULE.layer_staging_bytes(4096, role="decode", host_offload=True) == 4096
 
 
 def test_integrated_service_needs_explicit_admission_and_no_transport():
