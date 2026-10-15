@@ -1550,6 +1550,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            layer_pool = getattr(
+                self.kv_manager.kv_args, "npu_layer_receive_pool", None
+            )
+            if layer_pool is not None:
+                full_device_rows = self.req_to_token_pool.req_to_token[
+                    decode_req.req.kv.req_pool_idx, :origin_input_len
+                ]
+                metadata_kwargs["layer_device_kv_indices"] = kv_to_page_indices(
+                    full_device_rows, page_size
+                ).astype(np.int32)
+                metadata_kwargs["layer_token_count"] = origin_input_len
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
@@ -2414,6 +2425,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                layer_pool = getattr(
+                    decode_req.kv_receiver.kv_mgr.kv_args,
+                    "npu_layer_receive_pool",
+                    None,
+                )
+                if layer_pool is not None:
+                    from sglang.srt.hardware_backend.npu.hicache_offload import (
+                        publish_received_host_kv,
+                    )
+
+                    publish_received_host_kv(layer_pool)
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
@@ -2508,6 +2530,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         now = time.monotonic()
         still_held = []
         to_release = []
+        expired_layer_rooms = []
         for decode_req, deadline, idx, required_acks in self._deferred_releases:
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
@@ -2517,6 +2540,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             strict = getattr(kv_mgr, "requires_strict_abort_drain", lambda room: False)(room)
             if not drained and (now < deadline or strict):
                 still_held.append((decode_req, deadline, idx, required_acks))
+                if strict and now >= deadline:
+                    expired_layer_rooms.append(room)
             else:
                 to_release.append((decode_req, idx, room, drained))
         # Commit the survivors before releasing so a _do_release exception can't
@@ -2534,6 +2559,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
                 logger.exception(f"Deferred KV release failed for room {room}")
+        if expired_layer_rooms:
+            raise RuntimeError(
+                f"PD layer transport did not confirm drain for rooms {expired_layer_rooms}; "
+                "Host pages and staging remain retained; restart the worker"
+            )
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""

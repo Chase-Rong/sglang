@@ -928,8 +928,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         release_polls = [KVPoll.Success] * len(polls)
         draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
-        runtimes = [runtime for pool in (self.token_to_kv_pool, draft_pool)
-                    if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None]
+        target_pool = self.disagg_prefill_bootstrap_queue.token_to_kv_pool
+        runtimes = [
+            runtime
+            for pool in (target_pool, draft_pool)
+            if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None
+        ]
         if runtimes:
             from sglang.srt.hardware_backend.npu.prefill_offload_runtime import PrefillReleaseCheck
 

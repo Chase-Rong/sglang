@@ -766,6 +766,9 @@ def test_integrated_allows_mtp_aligned_prefixes(assembler):
 def test_full_mamba_registers_indexer_with_full_layer_mapping(assembler, integrated):
     device, anchor = device_and_anchor()
     device.integrated_offload = integrated
+    if not integrated:
+        device.decode_host_backing = None
+        device._kpool_use_compress = False
     assembler.MLATokenToKVPoolHost = Mock(return_value=anchor)
     assembler.memory.hicache_mem_layout = (
         "page_first_kv_split" if integrated else "page_first"

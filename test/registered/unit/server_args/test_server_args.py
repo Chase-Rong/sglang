@@ -704,6 +704,39 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
+    def test_npu_decode_offload_preserves_hicache_ownership(self):
+        with (
+            envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.override(True),
+            envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.override(16 * 1024**3),
+        ):
+            for speculative_algorithm in (None, "NEXTN"):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    device="npu",
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="ascend",
+                    enable_hierarchical_cache=True,
+                    speculative_algorithm=speculative_algorithm,
+                )
+                handle_pd_disaggregation(server_args)
+                self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+                self.assertFalse(server_args.disaggregation_decode_enable_radix_cache)
+
+    def test_decode_without_npu_host_offload_keeps_chunk_cache(self):
+        with (
+            envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.override(False),
+            envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.override(0),
+        ):
+            server_args = ServerArgs(
+                model_path="dummy",
+                device="npu",
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="ascend",
+                enable_hierarchical_cache=True,
+            )
+            handle_pd_disaggregation(server_args)
+            self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
+
     def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
         server_args = ServerArgs(
             model_path="dummy",

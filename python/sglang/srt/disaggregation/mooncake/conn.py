@@ -227,20 +227,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._layer_leases = {}
         self._layer_operations = {}
         self._layer_send_lock = threading.RLock()
-        staging_bytes = envs.SGLANG_NPU_LAYER_STAGING_BYTES.get()
-        if staging_bytes and disaggregation_mode == DisaggregationMode.DECODE:
-            from sglang.srt.hardware_backend.npu.layer_staging import create_npu_layer_staging
+        from sglang.srt.hardware_backend.npu.offload_config import layer_staging_bytes
 
-            layer_pool = getattr(args, "npu_layer_receive_pool", None)
+        layer_pool = getattr(args, "npu_layer_receive_pool", None)
+        staging_bytes = layer_staging_bytes(
+            envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
+            role=disaggregation_mode,
+            host_offload=layer_pool is not None,
+        )
+        if staging_bytes:
+            from sglang.srt.hardware_backend.npu.layer_staging import (
+                create_npu_layer_staging,
+            )
+
             backings = getattr(layer_pool, "host_backings", None)
             if backings is None:
                 backings = (getattr(layer_pool, "decode_host_backing", None),)
             if any(backing is None for backing in backings):
-                raise ValueError("NPU layer staging requires registered Decode Host offload")
-            self._layer_staging = create_npu_layer_staging(staging_bytes, backings[0].pool.device_id)
+                raise ValueError(
+                    "NPU layer staging requires registered Decode Host offload"
+                )
+            self._layer_staging = create_npu_layer_staging(
+                staging_bytes, backings[0].pool.device_id
+            )
             self._layer_staged_host_regions = {
                 (region.host_ptr, region.nbytes)
-                for backing in backings for layer in backing.regions for region in layer
+                for backing in backings
+                for layer in backing.regions
+                for region in layer
                 if region is not None
             }
         self.init_engine()
@@ -2658,6 +2672,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 writer_endpoint=(None if info.is_dummy else
                                  (getattr(self.kv_mgr, "local_ip", None),
                                   getattr(self.kv_mgr, "rank_port", None))),
+                require_staging=True,
                 notify=lambda lease, record, operation, peer=info:
                     self._notify_layer_receiver(peer, lease, record, operation),
             )
@@ -2666,6 +2681,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 if not info.is_dummy:
                     layer_targets.append(target)
         self._prefill_layer_dummy_only = bool(infos) and all(info.is_dummy for info in infos.values())
+        expected_layers = set(getattr(self.kv_mgr.kv_args, "kv_layer_ids", ()) or ())
+        if expected_layers and expected_layers != set(targets):
+            raise ValueError("Prefill and Decode target/draft layer inventories differ")
         for layer, layer_targets in targets.items():
             if layer_targets:
                 self.configure_prefill_layer_targets(layer, layer_targets)
@@ -2694,7 +2712,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
         from sglang.srt.hardware_backend.npu.prefill_offload import (
-            KvComponent, LayerReadyRecord, PdComponentDescriptor, PdSourceKind,
+            KvComponent,
+            KvPageRange,
+            LayerReadyRecord,
+            PdComponentDescriptor,
+            PdSourceKind,
         )
 
         wire_layer = work.token.logical_layer if layer_ids is None else layer_ids[work.token.logical_layer]
@@ -2723,20 +2745,30 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         for target in self._prefill_layer_targets[transfer_token.logical_layer]:
             if set(target.regions) != set(sources):
                 raise ValueError("receiver registration lacks a Prefill KV component")
-            record = LayerReadyRecord(transfer_token, tuple(
-                PdComponentDescriptor(
-                    request_id=work.token.request_id,
-                    logical_layer=transfer_token.logical_layer,
-                    generation=work.token.generation,
-                    component=component,
-                    source_kind=PdSourceKind.NPU_REGISTERED,
-                    source_slot=work.token.slot_id,
-                    source_page_ids=binding.source_page_ids,
-                    destination_page_ids=tuple(target.page_ids[component][:len(binding.source_page_ids)]),
-                    valid_range=work.valid_range,
-                    bytes_per_page=region.bytes_per_page,
-                ) for component, region in sources.items()
-            ))
+            start_token = max(work.valid_range.start_token, target.prefix)
+            if start_token >= work.valid_range.end_token:
+                continue
+            valid_range = KvPageRange(start_token, work.valid_range.end_token)
+            record = LayerReadyRecord(
+                transfer_token,
+                tuple(
+                    PdComponentDescriptor(
+                        request_id=work.token.request_id,
+                        logical_layer=transfer_token.logical_layer,
+                        generation=work.token.generation,
+                        component=component,
+                        source_kind=PdSourceKind.NPU_REGISTERED,
+                        source_slot=work.token.slot_id,
+                        source_page_ids=binding.source_page_ids,
+                        destination_page_ids=tuple(
+                            target.page_ids[component][: len(binding.source_page_ids)]
+                        ),
+                        valid_range=valid_range,
+                        bytes_per_page=region.bytes_per_page,
+                    )
+                    for component, region in sources.items()
+                ),
+            )
             operation = self.send_layer_ready(
                 record, source_regions=sources, destination_regions=target.regions,
                 destination_session_id=target.session_id, page_size=page_size,
@@ -2774,6 +2806,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         if not destination_session_id:
             raise ValueError("layer transfer requires a destination session")
+        if (
+            getattr(self.kv_mgr.kv_args, "prefill_layerwise_offload", False)
+            and staging is None
+        ):
+            raise ValueError("NPU Host offload requires its negotiated staging window")
         if self.conclude_state is not None:
             raise RuntimeError("cannot submit a layer after request completion")
         key = (record.token, destination_session_id)
@@ -2832,7 +2869,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
                     raise RuntimeError("request aborted before staging write")
                 operation.transport_drained = False
-                status = self.kv_mgr._transfer_data(session_id, [block])
+                status = self.kv_mgr._transfer_data(
+                    session_id, block if isinstance(block, list) else [block]
+                )
                 operation.transport_drained = status == 0
                 return status
 
@@ -2885,7 +2924,22 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             return
 
         if getattr(self.kv_mgr.kv_args, "prefill_layerwise_offload", False):
-            if (not self._layer_ready_operations and not getattr(self, "_prefill_layer_dummy_only", False)) or any(
+            targets = tuple(
+                target
+                for layer_targets in getattr(
+                    self, "_prefill_layer_targets", {}
+                ).values()
+                for target in layer_targets
+            )
+            cached = bool(targets) and all(
+                target.required_tokens > 0 and target.prefix >= target.required_tokens
+                for target in targets
+            )
+            if (
+                not self._layer_ready_operations
+                and not cached
+                and not getattr(self, "_prefill_layer_dummy_only", False)
+            ) or any(
                 operation.state != "acknowledged"
                 for operation in self._layer_ready_operations.values()
             ):
@@ -3008,12 +3062,16 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     def clear(self):
         lease = self.kv_mgr._layer_leases.get(self.bootstrap_room)
         if lease is not None:
-            success = self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Success
+            success = (
+                self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Success
+                and lease.ready()
+            )
             if not success and not lease.drained:
                 raise RuntimeError("cannot release a Decode layer lease before transport drain")
             staging = getattr(self.kv_mgr, "_layer_staging", None)
             if staging is not None:
                 staging.forget(lease)
+            lease.close()
             del self.kv_mgr._layer_leases[self.bootstrap_room]
         super().clear()
 
@@ -3127,6 +3185,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        layer_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        layer_token_count: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -3140,31 +3200,69 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         layer_manifest = b""
         layer_pool = getattr(self.kv_mgr.kv_args, "npu_layer_receive_pool", None)
         if layer_pool is not None:
-            from sglang.srt.hardware_backend.npu.layer_protocol import select_layer_writers
+            from sglang.srt.hardware_backend.npu.layer_protocol import (
+                select_layer_writers,
+            )
 
             if self.kv_mgr.enable_staging:
-                raise ValueError("NPU layer leases require direct receive until staging is negotiated")
+                raise ValueError(
+                    "NPU layer offload uses its own staging; disable generic KV staging"
+                )
+            if getattr(self.kv_mgr, "_layer_staging", None) is None:
+                raise ValueError("PD Host offload requires its layer staging window")
             if self.bootstrap_room in self.kv_mgr._layer_leases:
                 raise RuntimeError("request already owns a layer receive lease")
+            layer_device_pages = (
+                (kv_indices if device_kv_indices is None else device_kv_indices)
+                if layer_device_kv_indices is None
+                else layer_device_kv_indices
+            )
             lease = layer_pool.layer_receive_lease(
-                self.bootstrap_room, self.session_id, kv_indices,
-                kv_indices if device_kv_indices is None else device_kv_indices,
+                self.bootstrap_room,
+                self.session_id,
+                kv_indices,
+                layer_device_pages,
                 prefix=decode_prefix_len or 0,
             )
-            lease.layer_writers = select_layer_writers(self.bootstrap_infos, lease.layers)
-            endpoints = lease.writer_endpoints()
-            lease.writer_endpoint = next(iter(endpoints)) if len(endpoints) == 1 else None
-            staging = getattr(self.kv_mgr, "_layer_staging", None)
-            if staging is not None:
-                lease.staging = staging.manifest()
-            inventory = set(self.kv_mgr._registerable_regions())
-            if any((region.address, region.nbytes) not in inventory and (
-                region.address, region.nbytes
-            ) not in getattr(self.kv_mgr, "_layer_staged_host_regions", ())
-                   for regions in lease.layers.values() for region in regions.values()):
-                raise RuntimeError("Decode layer manifest contains an unregistered region")
-            self.kv_mgr._layer_leases[self.bootstrap_room] = lease
-            layer_manifest = lease.manifest()
+            if (
+                type(layer_token_count) is not int
+                or not lease.prefix
+                <= layer_token_count
+                <= min(map(len, lease.page_ids.values())) * lease.page_size
+            ):
+                lease.close()
+                raise ValueError(
+                    "PD layer receive requires the complete request token count"
+                )
+            lease.required_tokens = layer_token_count
+            try:
+                lease.layer_writers = select_layer_writers(
+                    self.bootstrap_infos, lease.layers
+                )
+                endpoints = lease.writer_endpoints()
+                lease.writer_endpoint = (
+                    next(iter(endpoints)) if len(endpoints) == 1 else None
+                )
+                staging = getattr(self.kv_mgr, "_layer_staging", None)
+                if staging is not None:
+                    lease.staging = staging.manifest()
+                inventory = set(self.kv_mgr._registerable_regions())
+                if any(
+                    (region.address, region.nbytes) not in inventory
+                    and (region.address, region.nbytes)
+                    not in getattr(self.kv_mgr, "_layer_staged_host_regions", ())
+                    for regions in lease.layers.values()
+                    for region in regions.values()
+                ):
+                    raise RuntimeError(
+                        "Decode layer manifest contains an unregistered region"
+                    )
+                self.kv_mgr._layer_leases[self.bootstrap_room] = lease
+                layer_manifest = lease.manifest()
+            except BaseException:
+                self.kv_mgr._layer_leases.pop(self.bootstrap_room, None)
+                lease.close()
+                raise
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -3217,6 +3315,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return self.conclude_state
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        lease = self.kv_mgr._layer_leases.get(self.bootstrap_room)
+        if lease is not None:
+            if lease.failed:
+                status = KVPoll.Failed
+            elif status == KVPoll.Success and not lease.ready():
+                status = KVPoll.Transferring
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         elif status == KVPoll.WaitingForInput:

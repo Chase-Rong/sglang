@@ -205,9 +205,13 @@ def sender_methods():
 
 
 def manager(**kwargs):
-    defaults = dict(_layer_send_lock=threading.RLock(), _layer_operations={},
-                    check_status=lambda room: "transferring",
-                    update_status=lambda *args: None)
+    defaults = dict(
+        kv_args=SimpleNamespace(),
+        _layer_send_lock=threading.RLock(),
+        _layer_operations={},
+        check_status=lambda room: "transferring",
+        update_status=lambda *args: None,
+    )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
 

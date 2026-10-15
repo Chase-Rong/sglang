@@ -8,7 +8,7 @@ from sglang.srt.hardware_backend.npu.prefill_offload import KvComponent, PdSourc
 
 
 class LayerStagingReceiver:
-    def __init__(self, address, window_bytes, *, owner, copy, drain):
+    def __init__(self, address, window_bytes, *, owner, copy, drain, copy_batch=None):
         if address <= 0 or window_bytes < 32 or window_bytes % 32:
             raise ValueError("layer staging requires a positive, 32-byte aligned window")
         if owner is None or not callable(copy) or not callable(drain):
@@ -18,6 +18,7 @@ class LayerStagingReceiver:
         self.owner = owner
         self.copy = copy
         self.drain = drain
+        self.copy_batch = copy_batch
         self.registration = uuid4().hex
         self.generation = 0
         self.active = None
@@ -26,7 +27,38 @@ class LayerStagingReceiver:
         self.lock = threading.RLock()
 
     def manifest(self):
-        return {"window_bytes": self.window_bytes, "registration": self.registration}
+        result = {"window_bytes": self.window_bytes, "registration": self.registration}
+        if self.copy_batch is not None:
+            result["batch"] = True
+        return result
+
+    def _validate_batch(self, lease, payload, *, check_progress=True):
+        chunks = payload.get("chunks")
+        if self.copy_batch is None or not isinstance(chunks, list) or not chunks:
+            raise ValueError("invalid staged batch")
+        progress = dict(lease.staged_progress.get(tuple(payload["token"]), {}))
+        entries = []
+        signatures = []
+        offset = 0
+        for chunk in chunks:
+            if not isinstance(chunk, dict) or set(chunk) != {
+                "component",
+                "offset",
+                "bytes",
+                "chunk",
+            }:
+                raise ValueError("invalid staged batch descriptor")
+            signature, region, destination = self._validate(lease, {**payload, **chunk})
+            component = signature[2]
+            if check_progress and progress.get(component, 0) != chunk["offset"]:
+                raise ValueError("staged batch components must be in order")
+            progress[component] = chunk["offset"] + chunk["bytes"]
+            entries.append((region, destination, chunk["bytes"], offset))
+            signatures.append(signature)
+            offset += chunk["bytes"]
+            if offset > self.window_bytes:
+                raise ValueError("staged batch exceeds its window")
+        return tuple(signatures), tuple(entries)
 
     def _validate(self, lease, payload):
         if (lease.staging != self.manifest()
@@ -56,6 +88,33 @@ class LayerStagingReceiver:
 
     def acquire(self, lease, payload):
         with self.lock:
+            if "chunks" in payload:
+                signatures, entries = self._validate_batch(lease, payload)
+                if self.active is not None:
+                    if self.active["signature"] == signatures:
+                        return self._grant()
+                    return {"busy": True}
+                identity = signatures[0][1]
+                owner_key = (lease.lease_id, identity[2])
+                previous = self.layer_owners.get(owner_key)
+                if (
+                    previous is not None
+                    and previous != identity
+                    and previous not in lease.completed
+                ):
+                    raise ValueError("another generation owns this staged layer")
+                self.layer_owners[owner_key] = identity
+                lease.staged_intervals[identity] = tuple(payload["range"])
+                lease.request_id = identity[1]
+                self.generation += 1
+                self.active = dict(
+                    signature=signatures,
+                    lease=lease,
+                    entries=entries,
+                    grant=self.generation,
+                    event=None,
+                )
+                return self._grant()
             signature, region, destination_offset = self._validate(lease, payload)
             if self.active is not None:
                 if self.active["signature"] == signature:
@@ -84,6 +143,8 @@ class LayerStagingReceiver:
 
     def commit(self, lease, payload):
         with self.lock:
+            if "chunks" in payload:
+                return self._commit_batch(lease, payload)
             signature, _, _ = self._validate(lease, payload)
             receipt_key = (lease.lease_id, signature[1])
             receipt = (signature, payload.get("grant"))
@@ -111,6 +172,38 @@ class LayerStagingReceiver:
             self.active = None
             return {"committed": True, "grant": payload["grant"]}
 
+    def _commit_batch(self, lease, payload):
+        signatures, entries = self._validate_batch(lease, payload, check_progress=False)
+        identity = signatures[0][1]
+        receipt_key = (lease.lease_id, identity)
+        receipt = (signatures, payload.get("grant"))
+        if self.last_commits.get(receipt_key) == receipt:
+            return {"committed": True, "grant": payload["grant"]}
+        active = self.active
+        if (
+            active is None
+            or active["signature"] != signatures
+            or active["grant"] != payload.get("grant")
+        ):
+            raise ValueError("staged batch does not own its window credit")
+        try:
+            active["event"] = self.copy_batch(entries)
+            if active["event"] is None:
+                raise RuntimeError("staging batch did not return a completion event")
+            active["event"].synchronize()
+            if not active["event"].query():
+                raise RuntimeError("staging batch has not completed")
+        except Exception:
+            lease.failed = True
+            raise
+        for signature in signatures:
+            lease.staged_progress.setdefault(identity, {})[signature[2]] = (
+                signature[3] + signature[4]
+            )
+        self.last_commits[receipt_key] = receipt
+        self.active = None
+        return {"committed": True, "grant": payload["grant"]}
+
     def abort(self, lease, *, transport_drained):
         if not transport_drained:
             raise RuntimeError("cannot return staging credit before remote writers drain")
@@ -134,87 +227,142 @@ class LayerStagingReceiver:
 
 def create_npu_layer_staging(window_bytes, device_id):
     import torch
-    from sglang.srt.hardware_backend.npu.fsa_native import unidex_copy_inplace
+    from sglang.srt.hardware_backend.npu.fsa_native import native_ops
 
     if window_bytes < 32 or window_bytes % 32:
         raise ValueError("NPU staging window must be positive and 32-byte aligned")
     device = f"npu:{device_id}"
     with torch.npu.device(device_id):
         buffer = torch.empty(window_bytes, dtype=torch.uint8, device=device)
-        indices = torch.zeros(1, dtype=torch.int64, device=device)
-        valid = torch.ones(1, dtype=torch.bool, device=device)
         stream = torch.npu.Stream(device=device_id)
         stream.wait_stream(torch.npu.current_stream())
 
-    def copy(region, offset, count):
+    def copy_batch(entries):
         with torch.npu.device(device_id), torch.npu.stream(stream):
-            if region.kind == PdSourceKind.HOST_REGISTERED:
-                tensor = region.owner.tensor
-                destination_address = region.owner.device_ptr + offset
-            else:
-                tensor = region.owner
-                destination_address = tensor.data_ptr() + offset
-            for chunk_offset in range(0, count, 32768):
-                chunk_bytes = min(32768, count - chunk_offset)
-                begin = offset + chunk_offset
-                destination = tensor.view(torch.uint8).reshape(-1)[begin:begin + chunk_bytes].view(1, chunk_bytes)
-                source = buffer[chunk_offset:chunk_offset + chunk_bytes].view(1, chunk_bytes)
-                unidex_copy_inplace(
-                    source, destination, indices, indices, valid, 1, 1,
-                    dst_ptr=destination_address + chunk_offset,
+            grouped = {}
+            for region, destination, count, source in entries:
+                if region.kind == PdSourceKind.HOST_REGISTERED:
+                    owner, plans = grouped.setdefault(
+                        id(region.owner), (region.owner, [])
+                    )
+                    plans.append((source, destination, count))
+                else:
+                    region.owner.view(torch.uint8).reshape(-1)[
+                        destination : destination + count
+                    ].copy_(buffer[source : source + count], non_blocking=True)
+            for owner, plans in grouped.values():
+                native_ops().prefill_dma_copy(
+                    buffer.view(-1, 1),
+                    owner.tensor.view(torch.uint8).view(-1, 1),
+                    owner.device_ptr,
+                    torch.tensor(plans, dtype=torch.int64),
+                    True,
                 )
             event = torch.npu.Event()
             event.record(stream)
             return event
+
+    def copy(region, offset, count):
+        return copy_batch(((region, offset, count, 0),))
 
     def drain():
         with torch.npu.device(device_id):
             stream.synchronize()
 
     return LayerStagingReceiver(
-        buffer.data_ptr(), window_bytes, owner=(buffer, indices, valid, stream), copy=copy, drain=drain,
+        buffer.data_ptr(),
+        window_bytes,
+        owner=(buffer, stream),
+        copy=copy,
+        drain=drain,
+        copy_batch=copy_batch,
     )
 
 
+def staging_batches(spans, window_bytes, *, batched):
+    offsets = {}
+    entries = []
+    used = 0
+    for span in spans:
+        consumed = 0
+        while consumed < span.nbytes:
+            count = min(window_bytes - used, span.nbytes - consumed)
+            component_offset = offsets.get(span.component, 0)
+            entries.append(
+                (
+                    span.source_address + consumed,
+                    used,
+                    dict(
+                        component=span.component.value,
+                        offset=component_offset,
+                        bytes=count,
+                        chunk=uuid4().hex,
+                    ),
+                )
+            )
+            offsets[span.component] = component_offset + count
+            consumed += count
+            used += count
+            if used == window_bytes or not batched:
+                yield entries
+                entries, used = [], 0
+    if entries:
+        yield entries
+
+
 def execute_staged_layer(operation, spans, manifest, payload, *, rpc, transfer, timeout_s):
+    from sglang.srt.hardware_backend.npu.layer_transfer import coalesce_transfer_blocks
+
     if operation.state != "pending":
         raise RuntimeError("staged layer was already submitted")
     operation.state = "transferring"
     operation.transport_drained = True
     deadline = time.monotonic() + timeout_s
-    offsets = {}
+    batched = manifest.get("batch", False)
     try:
-        for span in spans:
-            consumed = 0
-            while consumed < span.nbytes:
-                count = min(manifest["window_bytes"], span.nbytes - consumed)
-                offset = offsets.get(span.component, 0)
-                chunk = {
-                    **payload, "component": span.component.value, "offset": offset,
-                    "bytes": count, "chunk": uuid4().hex,
-                    "staging_registration": manifest["registration"],
-                }
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("layer staging window credit timed out")
-                    grant = rpc(b"FSA_STAGE_ACQUIRE", chunk, remaining)
-                    if not grant.get("busy"):
-                        break
-                    threading.Event().wait(min(0.002, remaining))
-                if (type(grant.get("grant")) is not int or grant["grant"] <= 0
-                        or type(grant.get("address")) is not int or grant["address"] <= 0
-                        or grant.get("window_bytes") != manifest["window_bytes"]):
-                    raise ValueError("receiver granted an invalid staging window")
-                status = transfer((span.source_address + consumed, grant["address"], count))
-                if status != 0:
-                    raise RuntimeError(f"staged transport failed with status {status}")
-                receipt = rpc(b"FSA_STAGE_COMMIT", {**chunk, "grant": grant["grant"]},
-                              deadline - time.monotonic())
-                if not receipt.get("committed") or receipt.get("grant") != grant["grant"]:
-                    raise RuntimeError("receiver did not complete the staged local copy")
-                consumed += count
-                offsets[span.component] = offset + count
+        for entries in staging_batches(
+            spans, manifest["window_bytes"], batched=batched
+        ):
+            descriptors = [entry[2] for entry in entries]
+            chunk = {
+                **payload,
+                "staging_registration": manifest["registration"],
+                **({"chunks": descriptors} if batched else descriptors[0]),
+            }
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("layer staging window credit timed out")
+                grant = rpc(b"FSA_STAGE_ACQUIRE", chunk, remaining)
+                if not grant.get("busy"):
+                    break
+                threading.Event().wait(min(0.002, remaining))
+            if (
+                type(grant.get("grant")) is not int
+                or grant["grant"] <= 0
+                or type(grant.get("address")) is not int
+                or grant["address"] <= 0
+                or grant.get("window_bytes") != manifest["window_bytes"]
+            ):
+                raise ValueError("receiver granted an invalid staging window")
+            blocks = coalesce_transfer_blocks(
+                [
+                    (source, grant["address"] + offset, descriptor["bytes"])
+                    for source, offset, descriptor in entries
+                ]
+            )
+            operation.transport_drained = False
+            status = transfer(blocks if batched else blocks[0])
+            if status != 0:
+                raise RuntimeError(f"staged transport failed with status {status}")
+            operation.transport_drained = True
+            receipt = rpc(
+                b"FSA_STAGE_COMMIT",
+                {**chunk, "grant": grant["grant"]},
+                deadline - time.monotonic(),
+            )
+            if not receipt.get("committed") or receipt.get("grant") != grant["grant"]:
+                raise RuntimeError("receiver did not complete the staged local copy")
         if operation.state == "drained":
             raise RuntimeError("staged layer aborted before final publication")
     except Exception:

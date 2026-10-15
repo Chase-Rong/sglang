@@ -76,7 +76,11 @@ def fixture(monkeypatch):
     )
     host = torch.empty(4096, 512, dtype=torch.bfloat16)
     region = SimpleNamespace(tensor=host)
-    backing = SimpleNamespace(integrated=True, regions=[(region, None), (region, None)])
+    backing = SimpleNamespace(
+        integrated=True,
+        regions=[(region, None), (region, None)],
+        page_binding=SimpleNamespace(mapping_epoch=0),
+    )
     sparse_pool = SimpleNamespace(start_layer=0, decode_host_backing=backing)
     kv_pool = SimpleNamespace(
         full_kv_pool=sparse_pool,

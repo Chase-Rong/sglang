@@ -1,6 +1,16 @@
 """Admission contracts for the separate Ascend sparse offload lifecycle."""
 
 
+def layer_staging_bytes(configured, *, role, host_offload, integrated=False):
+    if type(configured) is not int or configured < 0 or configured % 32:
+        raise ValueError(
+            "NPU layer staging bytes must be nonnegative and 32-byte aligned"
+        )
+    if integrated or role != "decode" or not host_offload:
+        return 0
+    return configured or 64 * 1024 * 1024
+
+
 def validate_offload_service(server_args, role, *, integrated=False):
     if integrated and role != "null":
         raise ValueError("integrated offload requires one non-disaggregated service")
@@ -31,12 +41,25 @@ def validate_offload_service(server_args, role, *, integrated=False):
             and server_args.disaggregation_transfer_backend
             not in ("ascend", "mooncake")
         )
-        or (not integrated and not server_args.disable_radix_cache)
+        or (
+            not integrated and role == "prefill" and not server_args.disable_radix_cache
+        )
         or server_args.enable_hisparse
     ):
         raise ValueError(
             "NPU sparse offload requires Ascend/Mooncake transport, disabled radix cache and no HiSparse coordinator"
         )
+    if not integrated and server_args.disaggregation_transfer_backend != "ascend":
+        raise ValueError("NPU PD offload requires the Ascend MemFabric backend")
+    if (
+        role == "decode"
+        and not integrated
+        and (
+            server_args.disable_radix_cache
+            or not getattr(server_args, "enable_hierarchical_cache", False)
+        )
+    ):
+        raise ValueError("PD offload Decode requires HiCache and enabled radix cache")
     if role == "prefill" and server_args.optimistic_prefill_attempts:
         raise ValueError(
             "bounded Prefill must finish layer bootstrap before forward; disable optimistic Prefill"
@@ -184,9 +207,9 @@ def fsa_pool_options(kvc, layer_count):
         return {"prefill_layer_slots": slots}
     if role != "decode" or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
         raise ValueError("Decode Host backing requires the fused/reference FSA path")
-    if envs.SGLANG_NPU_LAYER_STAGING_BYTES.get() <= 0:
-        raise ValueError("Decode Host receive requires a bounded NPU staging window")
+    host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
     return {
+        "decode_host_token_capacity": host_tokens,
         "decode_host_budget": host_budget,
         "shared_host_group": shared_host_group_from_runtime(torch.npu.current_device()),
     }

@@ -122,7 +122,7 @@ class LimCopySfaState:
         lengths = torch.where(active, lengths, 0)
         table = backend.forward_metadata.host_page_table
         if table is None:
-            raise RuntimeError("LIM requires integrated HiCache Host page mapping")
+            raise RuntimeError("LIM requires HiCache Host page mapping")
         return ends, lengths, requests, table
 
     def select(self, backend, batch, layer_id, query, key, weights, pool_table):

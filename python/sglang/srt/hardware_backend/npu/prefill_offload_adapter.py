@@ -337,6 +337,10 @@ class NpuPrefillOffloadAdapter:
         self._binding(work)
         return self._save_events[work.token]
 
+    def attention_ready_event(self, work: LayerWork):
+        self._binding(work)
+        return self._attention_events[work.token]
+
     @staticmethod
     def _record_npu_event():
         event = torch.npu.Event()

@@ -25,7 +25,12 @@ def decode(message):
     if len(message) > MAX_MESSAGE_BYTES:
         raise ValueError("layer control message exceeds size limit")
     payload = json.loads(message)
-    if not isinstance(payload, dict) or payload.get("version") not in (VERSION, 2, 3, 4):
+    if not isinstance(payload, dict) or payload.get("version") not in (
+        VERSION,
+        2,
+        3,
+        4,
+    ):
         raise ValueError("unsupported layer protocol version")
     return payload
 
@@ -57,6 +62,8 @@ class LayerReceiveLease:
     staged_intervals: dict = field(default_factory=dict)
     layer_writers: dict = field(default_factory=dict)
     drained_writers: set = field(default_factory=set)
+    release_pages: object = None
+    required_tokens: int = 0
 
     def __post_init__(self):
         if self.room < 0 or not self.session_id or self.page_size <= 0 or not self.layers:
@@ -85,28 +92,66 @@ class LayerReceiveLease:
 
     def manifest(self):
         multiple_writers = len(self.writer_endpoints()) > 1
-        return encode({
-            "version": 4 if multiple_writers else (3 if self.staging is not None else (2 if self.shared_group_id else VERSION)),
-            "layer_writers": ({str(layer): endpoint for layer, endpoint in self.layer_writers.items()}
-                              if multiple_writers else None),
-            "staging": self.staging,
-            "shared_host": ({"group": self.shared_group_id, "writer": self.shared_host_writer}
-                            if self.shared_group_id else None),
-            "room": self.room, "session": self.session_id, "lease": self.lease_id,
-            "page_size": self.page_size,
-            "pages": {component.value: pages for component, pages in self.page_ids.items()},
-            "layers": {
-                str(layer): {
-                    component.value: {
-                        "address": 1 if self.staging is not None else region.address,
-                        "nbytes": region.nbytes,
-                        "page_bytes": region.bytes_per_page,
-                        "registration": region.registration_id,
-                        "kind": region.kind.value, "dtype": region.dtype,
-                    } for component, region in regions.items()
-                } for layer, regions in self.layers.items()
-            },
-        })
+        return encode(
+            {
+                "version": 4
+                if multiple_writers
+                else (
+                    3
+                    if self.staging is not None
+                    else (2 if self.shared_group_id else VERSION)
+                ),
+                "layer_writers": (
+                    {
+                        str(layer): endpoint
+                        for layer, endpoint in self.layer_writers.items()
+                    }
+                    if multiple_writers
+                    else None
+                ),
+                "staging": self.staging,
+                "shared_host": (
+                    {"group": self.shared_group_id, "writer": self.shared_host_writer}
+                    if self.shared_group_id
+                    else None
+                ),
+                "room": self.room,
+                "session": self.session_id,
+                "lease": self.lease_id,
+                "page_size": self.page_size,
+                "prefix": self.prefix,
+                "tokens": self.required_tokens,
+                "pages": {
+                    component.value: pages for component, pages in self.page_ids.items()
+                },
+                "layers": {
+                    str(layer): {
+                        component.value: {
+                            "address": 1
+                            if self.staging is not None
+                            else region.address,
+                            "nbytes": region.nbytes,
+                            "page_bytes": region.bytes_per_page,
+                            "registration": region.registration_id,
+                            "kind": region.kind.value,
+                            "dtype": region.dtype,
+                        }
+                        for component, region in regions.items()
+                    }
+                    for layer, regions in self.layers.items()
+                },
+            }
+        )
+
+    def close(self):
+        if self.release_pages is not None:
+            self.release_pages()
+            self.release_pages = None
+
+    def ready(self):
+        return not self.failed and all(
+            prefix >= self.required_tokens for prefix in self.prefixes.values()
+        )
 
     def receive(self, payload):
         identity, layer, start, end = self.validate_notification(payload)
@@ -213,30 +258,60 @@ def select_layer_writers(bootstrap_infos, layer_ids):
     return selected
 
 
-def parse_targets(message, *, room, session_id, page_size, notify, writer_endpoint=None):
+def parse_targets(
+    message,
+    *,
+    room,
+    session_id,
+    page_size,
+    notify,
+    writer_endpoint=None,
+    require_staging=False,
+):
     payload = decode(message)
+    if payload.get("transport") is not None:
+        raise ValueError("unsupported layer transport")
     if (payload["room"], payload["session"], payload["page_size"]) != (
         room, session_id, page_size
     ) or not payload.get("lease"):
         raise ValueError("receiver manifest disagrees with the bootstrap endpoint")
     pages = {KvComponent(name): tuple(values) for name, values in payload["pages"].items()}
+    prefix = payload.get("prefix", 0)
+    required_tokens = payload.get("tokens", 0)
+    capacity = min(map(len, pages.values())) * page_size
+    if (
+        type(prefix) is not int
+        or not 0 <= prefix <= capacity
+        or type(required_tokens) is not int
+        or not 0 <= required_tokens <= capacity
+        or (required_tokens and required_tokens < prefix)
+    ):
+        raise ValueError("invalid layer receiver token interval")
     layers = {}
     shared = payload.get("shared_host")
     transfer_components = None
     if shared is not None:
-        if (payload["version"] not in (2, 3, 4) or not isinstance(shared, dict)
-                or not isinstance(shared.get("group"), str) or not shared["group"]
-                or type(shared.get("writer")) is not bool):
+        if (
+            payload["version"] not in (2, 3, 4)
+            or not isinstance(shared, dict)
+            or not isinstance(shared.get("group"), str)
+            or not shared["group"]
+            or type(shared.get("writer")) is not bool
+        ):
             raise ValueError("invalid shared Host receiver ownership")
         if not shared["writer"]:
             transfer_components = frozenset({KvComponent.INDEXER_K})
     staging = payload.get("staging")
+    if require_staging and staging is None:
+        raise ValueError("NPU Host offload requires a negotiated layer staging window")
     if staging is not None:
         if (payload["version"] not in (3, 4) or not isinstance(staging, dict)
                 or type(staging.get("window_bytes")) is not int or staging["window_bytes"] < 32
                 or staging["window_bytes"] % 32 or not isinstance(staging.get("registration"), str)
                 or not staging["registration"]):
             raise ValueError("invalid layer staging negotiation")
+        if "batch" in staging and staging["batch"] is not True:
+            raise ValueError("invalid layer staging batch capability")
     for layer, components in payload["layers"].items():
         regions = {}
         for name, region in components.items():
@@ -251,21 +326,37 @@ def parse_targets(message, *, room, session_id, page_size, notify, writer_endpoi
             raise ValueError("invalid per-layer writer negotiation")
         writers = {int(layer): tuple(endpoint) for layer, endpoint in writers.items()}
         if set(writers) != set(layers) or any(
-            len(endpoint) != 2 or not isinstance(endpoint[0], str) or not endpoint[0]
-            or type(endpoint[1]) is not int or not 0 < endpoint[1] <= 65535
+            len(endpoint) != 2
+            or not isinstance(endpoint[0], str)
+            or not endpoint[0]
+            or type(endpoint[1]) is not int
+            or not 0 < endpoint[1] <= 65535
             for endpoint in writers.values()
         ):
-            raise ValueError("per-layer writer inventory does not match receiver layers")
+            raise ValueError(
+                "per-layer writer inventory does not match receiver layers"
+            )
     LayerReceiveLease(room, session_id, page_size, layers, pages, lambda *args: None,
                       layer_writers=writers or {})
     return {
         layer: PrefillLayerTarget(
-            session_id, regions, pages,
-            lambda record, operation, lease=payload["lease"]: notify(lease, record, operation),
-            transfer_components.intersection(regions) if transfer_components is not None else None,
+            session_id,
+            regions,
+            pages,
+            lambda record, operation, lease=payload["lease"]: notify(
+                lease, record, operation
+            ),
+            transfer_components.intersection(regions)
+            if transfer_components is not None
+            else None,
             staging,
-        ) for layer, regions in layers.items()
-        if writers is None or writer_endpoint is None or writers[layer] == writer_endpoint
+            prefix,
+            required_tokens,
+        )
+        for layer, regions in layers.items()
+        if writers is None
+        or writer_endpoint is None
+        or writers[layer] == writer_endpoint
     }
 
 

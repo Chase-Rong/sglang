@@ -104,6 +104,19 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 disable_radix_cache=False,
             )
             logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
+        elif (
+            cfg.device == "npu"
+            and cfg.enable_hierarchical_cache
+            and cfg.disaggregation_transfer_backend == "ascend"
+            and envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get()
+            and envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get() > 0
+        ):
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disable_radix_cache=False,
+            )
+            logger.info("NPU Decode offload retains HiCache Host page ownership")
         else:
             declare_resolution(
                 server_args,

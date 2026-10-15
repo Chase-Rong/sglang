@@ -34,7 +34,11 @@ def test_host_capacity_budget_route_includes_mtp_layers(
 ):
     from test_decode_memory_budget import MODULE as budget_module
     from test_speculative_sparse import MODULE as speculative_module
+    from test_offload_config import MODULE as offload_config
 
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.hardware_backend.npu.offload_config", offload_config
+    )
     monkeypatch.setitem(
         sys.modules,
         "sglang.srt.hardware_backend.npu.speculative_sparse",
@@ -49,6 +53,7 @@ def test_host_capacity_budget_route_includes_mtp_layers(
         SGLANG_NPU_DECODE_HOST_KV_BYTES=1 << 34,
         SGLANG_NPU_SHARED_HOST_KV=True,
         SGLANG_NPU_LAYER_STAGING_BYTES=0,
+        SGLANG_NPU_DSA_OFFLOAD_BACKEND="external_plan",
     )
     monkeypatch.setitem(
         sys.modules,
@@ -116,7 +121,8 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     )
     actual = budget_module.budget_from_config(kvc, 11)
     assert actual.layers == 12
-    assert actual.host_token_capacity == (host_tokens if integrated else 0)
+    assert actual.host_token_capacity == host_tokens
+    assert actual.staging_bytes == (0 if integrated else 64 * 1024 * 1024)
     assert actual.host_bytes_per_token == 12 * 512 * 2
     assert actual.prefill_layer_slots == (3 if integrated else 0)
     assert actual.graph_rows == 24 and actual.rows_per_request == 6

@@ -50,7 +50,10 @@ def set_default_server_args(args: "ServerArgs"):
 
     cfg = resolving_view(args)
 
-    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get():
+    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get() or (
+        cfg.disaggregation_mode == "decode"
+        and envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get() > 0
+    ):
         if (
             cfg.enable_unified_cache_external_linker
             or cfg.hicache_storage_backend is not None
