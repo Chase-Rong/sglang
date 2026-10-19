@@ -12,7 +12,7 @@ import test_layer_staging as staging_tests
 
 def test_mapped_host_batch_submits_one_dma_plan_without_host_payload_copy(monkeypatch):
     modules = staging_tests.modules.__wrapped__(monkeypatch)
-    staging = importlib.import_module("sglang.srt.hardware_backend.npu.layer_staging")
+    staging = importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_staging")
     original_empty = torch.empty
 
     def empty(*args, **kwargs):

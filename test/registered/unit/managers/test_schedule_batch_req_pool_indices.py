@@ -47,6 +47,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
         scheduler.future_map = MagicMock()
+        scheduler.hisparse_coordinator = None
 
         reqs = [
             _make_req(req_pool_idx=4, origin_input_ids=[1, 2, 3], output_ids=[7]),

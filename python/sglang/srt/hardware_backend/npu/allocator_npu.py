@@ -24,7 +24,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
-        from sglang.srt.hardware_backend.npu.hicache_offload import get_offload_backing
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import get_offload_backing
 
         self.offload_backing = get_offload_backing(kvcache)
         if self.offload_backing is not None:

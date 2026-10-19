@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
     FusedSparseAttentionState,
     paged_kv_view,
     run_fused_sparse_attention,
@@ -26,14 +26,19 @@ def initialize_fsa_backend(backend, model_runner):
     from sglang.srt.configs.model_config import dsa_layer_skips_topk
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-    from sglang.srt.hardware_backend.npu.speculative_sparse import (
+    from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
         sparse_mtp_rows,
         sparse_mtp_tail,
     )
-    from sglang.srt.runtime_context import get_exec, get_spec
+    from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 
     backend.fused_sparse_state = None
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import (
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+    ):
+        return
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import (
         resolve_dsa_offload_backend,
     )
 
@@ -51,6 +56,10 @@ def initialize_fsa_backend(backend, model_runner):
         return
     if offload_backend == "external_plan":
         native_ops()
+    else:
+        from sglang.srt.hardware_backend.npu.hisparse.config import validate_lim_dtypes
+
+        validate_lim_dtypes(model_runner.kv_cache_dtype, model_runner.dtype)
     if backend.kv_lora_rank != 512 or backend.qk_rope_head_dim not in (0, 64):
         raise ValueError("FSA requires absorbed MLA latent=512 and RoPE=0 or 64")
     backend.fused_sparse_mode = envs.SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE.get()
@@ -92,7 +101,7 @@ def initialize_fsa_backend(backend, model_runner):
             model_runner.spec_algorithm, get_spec(), model_runner.model_config
         )
         if offload_backend == "lim_copy_sfa":
-            from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import (
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
                 LimCopySfaState,
             )
 

@@ -1,5 +1,6 @@
 """Decode capacity solver boundaries, independent of Ascend imports."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from dataclasses import replace
@@ -7,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-SOURCE = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/decode_memory_budget.py"
-SPEC = importlib.util.spec_from_file_location("decode_budget_under_test", SOURCE)
+SOURCE = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/hisparse/decode_memory_budget.py"
+SPEC = importlib.util.spec_from_file_location(npu_module_name("decode_budget_under_test"), npu_source_path(SOURCE))
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)

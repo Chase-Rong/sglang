@@ -21,8 +21,8 @@ pytestmark = pytest.mark.skipif(
 def test_seeded_draft_chain(batch, accepted):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import LimCopySfaState
+    from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import DecodeHostKvBacking
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import LimCopySfaState
     from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 
     torch.npu.set_device(0)

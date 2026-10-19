@@ -18,7 +18,7 @@ def device():
     import torch_npu
 
     device_id = int(os.environ["SGLANG_FSA_TEST_DEVICE_ID"])
-    torch.npu.set_device(device_id)
+    torch_npu.npu.set_device(device_id)
     return torch.device(f"npu:{device_id}")
 
 
@@ -41,7 +41,7 @@ def reference_attention(query, keys, indices, batch):
 @pytest.mark.parametrize("order", ["ascending", "shuffled"])
 def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, heads, tail, seed, valid_prefix, mode, order):
     from sglang.srt.hardware_backend.npu.fsa_native import RegisteredHostRegion
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
         FusedSparseAttentionState,
         run_fused_sparse_attention,
     )
@@ -195,7 +195,7 @@ def test_host_attention_cold_warm_reshuffle_and_graph(device, dtype, batch, head
 
 @pytest.mark.parametrize("inference_mode", [False, True])
 def test_generation_refresh_preserves_graph_values_and_storage(device, inference_mode):
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import FusedSparseAttentionState
 
     pool = SimpleNamespace(req_generation=torch.tensor([0, 1, 1], device="cpu"), req_generation_epoch=0)
     graph = torch.npu.NPUGraph()
@@ -233,7 +233,7 @@ def test_generation_refresh_preserves_graph_values_and_storage(device, inference
 @pytest.mark.parametrize("draft_rows", [3, 6])
 def test_mtp_graph_rewrites_mutable_tail_without_owner_change(device, dtype, draft_rows):
     from sglang.srt.hardware_backend.npu.fsa_native import RegisteredHostRegion
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
 
     torch.manual_seed(721)
     requests, heads, sequence, page_size = 2, 16, 256, 128

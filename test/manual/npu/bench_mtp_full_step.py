@@ -93,7 +93,7 @@ class StepProbe:
 def install_probe(output_dir, variant):
     import torch
 
-    from sglang.srt.hardware_backend.npu import fsa_backend
+    from sglang.srt.hardware_backend.npu.hisparse import fsa_backend
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 
     output = Path(output_dir) / f"worker_{os.getpid()}.jsonl"

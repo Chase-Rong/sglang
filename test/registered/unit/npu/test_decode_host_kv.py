@@ -1,5 +1,6 @@
 """Decode backing geometry and write-through tests using CPU copy primitives."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from types import ModuleType, SimpleNamespace
@@ -20,10 +21,10 @@ def modules(monkeypatch):
 
 @pytest.fixture
 def backing_module(modules, monkeypatch):
-    name = "sglang.srt.hardware_backend.npu.decode_host_kv"
-    spec = importlib.util.spec_from_file_location(name, NPU / "decode_host_kv.py")
+    name = "sglang.srt.hardware_backend.npu.hisparse.decode_host_kv"
+    spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(NPU / "hisparse/decode_host_kv.py"))
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     spec.loader.exec_module(module)
 
     class HostPool:
@@ -50,7 +51,7 @@ def backing_module(modules, monkeypatch):
 
     fabric = ModuleType("sglang.srt.hardware_backend.npu.memfabric_host_kv")
     fabric.MemFabricHostKvPool = HostPool
-    monkeypatch.setitem(sys.modules, fabric.__name__, fabric)
+    monkeypatch.setitem(sys.modules, npu_module_name(fabric.__name__), fabric)
     monkeypatch.setattr(torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False)
     return module
 
@@ -102,9 +103,9 @@ def test_pd_lease_uses_hicache_pages_and_registers_indexer_mapping(
 ):
     for short_name in ("layer_transfer", "layer_protocol"):
         name = f"sglang.srt.hardware_backend.npu.{short_name}"
-        spec = importlib.util.spec_from_file_location(name, NPU / f"{short_name}.py")
+        spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(NPU / f"{short_name}.py"))
         module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), module)
         spec.loader.exec_module(module)
     pool = production_pool_type()(
         size=16,

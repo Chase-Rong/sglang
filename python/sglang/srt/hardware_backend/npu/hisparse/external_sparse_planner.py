@@ -268,7 +268,7 @@ def materialize_layer_plan(
         // cache.max_tokens
     )
     if physical_keys.device.type == "npu":
-        from sglang.srt.hardware_backend.npu.fsa_layer_plan import build_layer_plan
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_layer_plan import build_layer_plan
 
         safe_slots, miss = build_layer_plan(
             physical_keys,

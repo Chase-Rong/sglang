@@ -1,5 +1,6 @@
 """Dependency and data checks for the two-slot Prefill pipeline without NPU hardware."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import contextlib
 import importlib.util
 import sys
@@ -85,13 +86,13 @@ def setup(monkeypatch):
     for name in ("sglang", "sglang.srt", "sglang.srt.hardware_backend", prefix):
         module = ModuleType(name)
         module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     loaded = {}
     for name in ("prefill_dma", "prefill_overlap"):
         qualified = prefix + "." + name
-        spec = importlib.util.spec_from_file_location(qualified, ROOT / (name + ".py"))
+        spec = importlib.util.spec_from_file_location(npu_module_name(qualified), npu_source_path(ROOT / (name + ".py")))
         module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, qualified, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(qualified), module)
         spec.loader.exec_module(module)
         loaded[name] = module
 
@@ -414,7 +415,7 @@ def test_real_hicache_binding_drives_async_pipeline(
     mapped = backing.page_binding.host_rows(mapping)
     assert torch.all(mapped != mapping)
     runtime = sys.modules[
-        prefix + ".prefill_overlap"
+        prefix + ".hisparse.prefill_overlap"
     ].PipelinedIntegratedOffloadRuntime(
         pool, SimpleNamespace(req_to_token=mapping.reshape(1, -1))
     )

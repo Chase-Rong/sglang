@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.npu.decode_memory_budget import budget_from_config
+from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import budget_from_config
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.runtime_context import get_context, get_disagg, get_exec, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -46,7 +46,8 @@ def test_budget_uses_published_graph_config_without_removed_server_fields(monkey
 @pytest.mark.parametrize("requests,graph_max,expected", [(8, 4, 8), (2, 8, 8)])
 def test_fsa_reservation_covers_request_capacity_after_graph_lock(monkeypatch, requests, graph_max, expected):
     monkeypatch.setenv("SGLANG_NPU_DSA_OFFLOAD_BACKEND", "external_plan")
-    from sglang.srt.hardware_backend.npu import fsa_backend, fsa_native
+    from sglang.srt.hardware_backend.npu import fsa_native
+    from sglang.srt.hardware_backend.npu.hisparse import fsa_backend
 
     monkeypatch.setenv("SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION", "1")
     monkeypatch.setattr(fsa_native, "native_ops", lambda: None)
@@ -65,7 +66,7 @@ def test_fsa_reservation_covers_request_capacity_after_graph_lock(monkeypatch, r
 
 
 def test_joint_result_can_be_stored_on_real_slotted_configurator(monkeypatch):
-    from sglang.srt.hardware_backend.npu.decode_memory_budget import DecodeKvMemoryBudget
+    from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import DecodeKvMemoryBudget
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor import pool_configurator
     from sglang.srt.runtime_context import get_memory, get_schedule
@@ -86,7 +87,7 @@ def test_joint_result_can_be_stored_on_real_slotted_configurator(monkeypatch):
 
 
 def test_real_configurator_preserves_requests_when_token_budget_shrinks(monkeypatch):
-    from sglang.srt.hardware_backend.npu.decode_memory_budget import DecodeKvMemoryBudget
+    from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import DecodeKvMemoryBudget
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor import pool_configurator
     from sglang.srt.runtime_context import get_memory, get_schedule
@@ -126,7 +127,7 @@ def test_worker_single_request_limit_uses_shared_pool_without_dividing_by_concur
 
 
 def test_real_configurator_caps_requests_and_emits_warning(monkeypatch, caplog):
-    from sglang.srt.hardware_backend.npu.decode_memory_budget import DecodeKvMemoryBudget
+    from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import DecodeKvMemoryBudget
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor import pool_configurator
     from sglang.srt.runtime_context import get_memory, get_schedule

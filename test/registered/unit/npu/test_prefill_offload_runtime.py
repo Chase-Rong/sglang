@@ -1,5 +1,6 @@
 """Production NPU pool methods and batched layer lifetime with CPU copy oracles."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import ast
 import contextlib
 import importlib.util
@@ -23,7 +24,7 @@ def modules(monkeypatch):
     for name in ("sglang", "sglang.srt", "sglang.srt.hardware_backend", prefix):
         module = types.ModuleType(name)
         module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     modules = {}
     for name in (
         "prefill_offload",
@@ -32,9 +33,9 @@ def modules(monkeypatch):
         "prefill_offload_runtime",
     ):
         qualified = f"{prefix}.{name}"
-        spec = importlib.util.spec_from_file_location(qualified, NPU / f"{name}.py")
+        spec = importlib.util.spec_from_file_location(npu_module_name(qualified), npu_source_path(NPU / f"{name}.py"))
         module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, qualified, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(qualified), module)
         spec.loader.exec_module(module)
         modules[name] = module
     return modules
@@ -235,6 +236,31 @@ def test_receiver_ack_timeout_retains_the_whole_batch_slot(modules):
     assert runtime.slots.active_tokens() == ()
     runtime.release_request("req-0")
     runtime.release_request("req-1")
+
+
+@pytest.mark.parametrize("transport_drained", [False, True])
+def test_shutdown_retains_slots_until_transport_drains(modules, transport_drained):
+    operation = SimpleNamespace(state="transferred", transport_drained=transport_drained)
+    runtime, pool, _ = make_runtime(
+        modules, layers=1, physical_slots=1, publish=lambda *args: [operation]
+    )
+    batch = make_batch(2, 0)
+    for sender in batch.prefill_offload_senders:
+        sender.abort = lambda: None
+    with pytest.raises(TimeoutError, match="ACK"):
+        with runtime.forward(batch):
+            pool.get_index_k_buffer(0)
+            runtime.finish_layer(0)
+    if not transport_drained:
+        with pytest.raises(TimeoutError, match="transport"):
+            runtime.drain_for_shutdown()
+        assert runtime.layers and runtime.slots.active_tokens()
+        operation.transport_drained = True
+    runtime.drain_for_shutdown()
+    runtime.drain_for_shutdown()
+    assert not runtime.layers and not runtime.slots.active_tokens()
+    assert runtime._publisher is None
+    assert operation.state == "drained"
 
 
 def test_staging_publication_overlaps_following_layer_and_retains_source_slot(modules):
@@ -445,7 +471,7 @@ def test_completed_request_can_release_while_an_unrelated_batch_is_active(module
 def test_release_poll_waits_for_target_draft_and_transport_drain(modules, monkeypatch):
     connection = types.ModuleType("sglang.srt.disaggregation.base.conn")
     connection.KVPoll = SimpleNamespace(WaitingForInput=1, Success=2)
-    monkeypatch.setitem(sys.modules, connection.__name__, connection)
+    monkeypatch.setitem(sys.modules, npu_module_name(connection.__name__), connection)
     ready = [True, False]
     runtimes = [SimpleNamespace(can_release_request=lambda request, index=index: ready[index])
                 for index in range(2)]

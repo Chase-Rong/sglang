@@ -1,7 +1,7 @@
 """One PD lease covering distinct target and draft model KV namespaces."""
 
-from sglang.srt.hardware_backend.npu.layer_protocol import LayerReceiveLease
-from sglang.srt.hardware_backend.npu.offload_config import validate_mtp_pool_pair
+from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import LayerReceiveLease
+from sglang.srt.hardware_backend.npu.hisparse.offload_config import validate_mtp_pool_pair
 
 
 class LayerReceivePoolGroup:

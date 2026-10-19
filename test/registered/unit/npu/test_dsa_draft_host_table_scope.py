@@ -1,5 +1,6 @@
 """Exercise draft preparation lifecycle without importing NPU model dependencies."""
 
+from npu_test_paths import npu_module_name
 import ast
 import sys
 from pathlib import Path
@@ -70,7 +71,7 @@ def test_draft_scope_is_fresh_and_cleared_on_error(monkeypatch, fail):
 
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.hardware_backend.npu.hicache_offload",
+        npu_module_name("sglang.srt.hardware_backend.npu.hisparse.hicache_offload"),
         SimpleNamespace(
             DraftHostTableScope=lambda last_step: SimpleNamespace(last_step=last_step),
             get_offload_backing=lambda pool: pool,

@@ -25,11 +25,11 @@ pytestmark = pytest.mark.skipif(
 
 class DraftChain:
     def __init__(self, batch, steps, reuse):
-        from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
-        from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+        from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import DecodeHostKvBacking
+        from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
             FusedSparseAttentionState,
         )
-        from sglang.srt.hardware_backend.npu.hicache_offload import OffloadPageBinding
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
 
         self.batch, self.steps, self.reuse = batch, steps, reuse
         self.sequence = 8192
@@ -144,7 +144,7 @@ class DraftChain:
         self.topk[:, 2050] = -1
 
     def run(self):
-        from sglang.srt.hardware_backend.npu.fsa_backend import forward_fsa
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import forward_fsa
         from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 
         self.forward.spec_info.dsa_topk_indices = self.topk
@@ -241,7 +241,7 @@ def verify_pair(before, after):
 @pytest.mark.parametrize("batch,steps", [(1, 3), (1, 4), (10, 3), (10, 4)])
 def test_draft_chain_eager_graph_seed_tail_and_generation(batch, steps):
     import torch_npu  # noqa: F401
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
         NativeSparsePlanner,
     )
 

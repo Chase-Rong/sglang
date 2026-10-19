@@ -1,5 +1,6 @@
 """CPU interpreter regression for Ascend scalar loads at request boundaries."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import os
 import sys
@@ -19,9 +20,9 @@ def test_first_request_predecessor_is_in_bounds_and_preserves_causal_limits():
 
     path = (
         Path(__file__).resolve().parents[4]
-        / "python/sglang/srt/hardware_backend/npu/fsa_metadata.py"
+        / "python/sglang/srt/hardware_backend/npu/hisparse/fsa_metadata.py"
     )
-    spec = importlib.util.spec_from_file_location("fsa_metadata_under_test", path)
+    spec = importlib.util.spec_from_file_location(npu_module_name("fsa_metadata_under_test"), npu_source_path(path))
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)

@@ -274,7 +274,7 @@ class LegacyFsaComparator:
         *,
         planner_type=None,
     ):
-        from sglang.srt.hardware_backend.npu.lim_copy_sfa_device_plan import (
+        from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_device_plan import (
             DeviceUnionPlanner,
         )
 
@@ -357,7 +357,7 @@ class LegacyFsaComparator:
         *,
         scale,
     ):
-        from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+        from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
             FusedSparseAttentionInputs,
             paged_kv_view,
             run_fused_sparse_attention,

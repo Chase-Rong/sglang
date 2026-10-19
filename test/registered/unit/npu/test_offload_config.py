@@ -1,17 +1,17 @@
 """Offload service and target/draft admission contracts; execution is remote-only."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-
 SOURCE = (
     Path(__file__).parents[4]
-    / "python/sglang/srt/hardware_backend/npu/offload_config.py"
+    / "python/sglang/srt/hardware_backend/npu/hisparse/offload_config.py"
 )
-SPEC = importlib.util.spec_from_file_location("offload_config_under_test", SOURCE)
+SPEC = importlib.util.spec_from_file_location(npu_module_name("offload_config_under_test"), npu_source_path(SOURCE))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
@@ -139,7 +139,6 @@ def test_integrated_service_needs_explicit_admission_and_no_transport():
         {"get_attention_backends": lambda: ("ascend", "triton")},
         {"get_attention_backends": lambda: ("triton", "ascend")},
         {"disaggregation_transfer_backend": "nixl"},
-        {"enable_hisparse": True},
         {"disable_radix_cache": False},
         {"optimistic_prefill_attempts": 1},
     ],
@@ -147,6 +146,14 @@ def test_integrated_service_needs_explicit_admission_and_no_transport():
 def test_incompatible_prefill_lifecycle_rejected_before_pool_creation(changes):
     with pytest.raises(ValueError):
         MODULE.validate_offload_service(service(**changes), "prefill")
+
+
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+def test_hisparse_reuses_existing_offload_service_contract(role):
+    values = dict(enable_hisparse=True)
+    if role != "prefill":
+        values.update(disable_radix_cache=False, enable_hierarchical_cache=True)
+    MODULE.validate_offload_service(service(**values), role, integrated=role == "null")
 
 
 def pool(**changes):

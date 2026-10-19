@@ -453,7 +453,7 @@ def mask_causal_topk(topk, row_requests, query_lengths, kv_lengths, *, positions
 
 def build_external_metadata_plan(*args, **kwargs):
     # Keep CPU contract users independent of Triton and the NPU runtime.
-    from sglang.srt.hardware_backend.npu.fsa_metadata import (
+    from sglang.srt.hardware_backend.npu.hisparse.fsa_metadata import (
         build_external_metadata_plan as build,
     )
 
@@ -551,7 +551,7 @@ class FusedSparseAttentionState:
         manager.capacity_locked = True
 
     def _ensure_planner(self, layer_id, cache, topk):
-        from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
             MappedSparsePlanner,
             NativeSparsePlanner,
         )
@@ -698,7 +698,7 @@ class FusedSparseAttentionState:
         selection_plan = None
         membership_region = None
         if self.external_planner:
-            from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+            from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
                 DraftSparsePlanReuse,
                 materialize_layer_plan,
             )
@@ -949,7 +949,7 @@ def run_fused_sparse_attention(inputs: FusedSparseAttentionInputs, mode="fused")
         if name not in ("selection_plan", "selection_cache")
     }
     if mode == "reference":
-        from sglang.srt.hardware_backend.npu.external_sparse_planner import MappedSelectionPlan
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import MappedSelectionPlan
 
         if isinstance(inputs.selection_plan, MappedSelectionPlan):
             raise ValueError("reference attention requires device-resident plan metadata")
@@ -957,7 +957,7 @@ def run_fused_sparse_attention(inputs: FusedSparseAttentionInputs, mode="fused")
             raise ValueError(
                 "miss-only reference attention requires the production planner"
             )
-        from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
             run_reference_sparse_attention,
         )
 
@@ -967,7 +967,7 @@ def run_fused_sparse_attention(inputs: FusedSparseAttentionInputs, mode="fused")
     else:
         raise ValueError(f"unknown FSA execution mode: {mode}")
     if inputs.selection_plan is not None:
-        from sglang.srt.hardware_backend.npu.external_sparse_planner import (
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
             commit_layer_plan,
         )
 

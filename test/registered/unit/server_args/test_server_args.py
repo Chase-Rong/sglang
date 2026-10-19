@@ -856,6 +856,10 @@ class TestSkipTokenizerInit(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(override_platform(is_npu=False))
+
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.
     @staticmethod

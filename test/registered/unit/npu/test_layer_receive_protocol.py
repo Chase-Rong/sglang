@@ -17,7 +17,7 @@ def modules(monkeypatch):
 
 
 def wire_module():
-    return importlib.import_module("sglang.srt.hardware_backend.npu.layer_protocol")
+    return importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_protocol")
 
 
 def lease_inputs(modules):

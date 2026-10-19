@@ -121,8 +121,8 @@ def main():
             container(["bash", "-n", args.root + "/source/scripts/npu/fsa_pd_role.sh"])
             container(["bash", "-n", args.root + "/source/scripts/npu/fsa_offload_env.sh"])
             repo = Path(__file__).resolve().parents[2]
-            paths = ["python/sglang/srt/hardware_backend/npu/decode_memory_budget.py",
-                     "python/sglang/srt/hardware_backend/npu/fsa_backend.py",
+            paths = ["python/sglang/srt/hardware_backend/npu/hisparse/decode_memory_budget.py",
+                     "python/sglang/srt/hardware_backend/npu/hisparse/fsa_backend.py",
                      "python/sglang/srt/mem_cache/kv_cache_configurator.py",
                      "python/sglang/srt/model_executor/pool_configurator.py",
                      "python/sglang/srt/managers/scheduler.py",

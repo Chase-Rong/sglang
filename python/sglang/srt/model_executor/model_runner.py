@@ -459,15 +459,8 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
-        # Optional layerwise Prefill offload coordinator. It remains disabled
-        # unless the Ascend feature gate is explicitly enabled.
-        self.prefill_layerwise_offload = None
         self.prefill_offload_adapter = None
         self.prefill_offload_runtime = None
-        # Request IDs whose Prefill Host allocation is owned by this runner.
-        # The allocation intentionally outlives individual chunked-prefill
-        # forwards and is released only by an explicit completion/abort hook.
-        self._prefill_offload_requests = set()
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
@@ -986,315 +979,21 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import (
-            HiSparseCoordinator,
-            resolve_shared_index_layers,
-        )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.managers.hisparse_factory import create_hisparse_coordinator
 
-        hisparse_cfg = parse_hisparse_config()
-        hisparse_top_k = getattr(
-            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-        )
-        self.hisparse_coordinator = HiSparseCoordinator(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            top_k=hisparse_top_k,
-            device_buffer_size=hisparse_cfg.device_buffer_size,
-            device=self.device,
-            tp_group=(
-                self.attention_tp_group.cpu_group
-                if get_parallel().enable_dp_attention
-                else self.tp_group.cpu_group
-            ),
-            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            swap_in_block_size=hisparse_cfg.swap_in_block_size,
-            shared_index_layers=resolve_shared_index_layers(
-                hf_text_config=self.model_config.hf_text_config,
-                pp_size=self.ps.pp_size,
-                is_speculative=self.spec_algorithm.is_speculative(),
-            ),
-        )
+        self.hisparse_coordinator = create_hisparse_coordinator(self)
 
     def maybe_init_prefill_layerwise_offload(self):
-        if not envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get():
-            return
-        if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get():
-            from sglang.srt.hardware_backend.npu.prefill_overlap import PipelinedIntegratedOffloadRuntime
-
-            pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
-            # Eager forwards and direct MTP graph replay both enter the runtime
-            # context, which waits for the preceding Prefill Host publication.
-            runtime = PipelinedIntegratedOffloadRuntime(pool, self.req_to_token_pool)
-            self.prefill_offload_runtime = runtime
-            self.token_to_kv_pool.prefill_offload_runtime = runtime
-            return
-        if self.device != "npu":
-            raise RuntimeError(
-                "SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD requires NPU"
-            )
-        if self.server_args.disaggregation_mode != "prefill":
-            raise RuntimeError(
-                "layerwise Prefill offload must run on the Prefill service"
-            )
-        from sglang.srt.hardware_backend.npu.speculative_sparse import sparse_mtp_tail
-
-        sparse_mtp_tail(self.spec_algorithm, get_spec(), self.model_config)
-        from sglang.srt.hardware_backend.npu.prefill_offload_runtime import validate_prefill_parallel_layout
-
-        validate_prefill_parallel_layout(
-            cp_size=self.ps.attn_cp_size,
-            dcp_size=self.ps.attn_dcp_size,
-            replicated_cp=get_parallel().enable_dsa_prefill_context_parallel,
-            layer_split=get_parallel().enable_dsa_cache_layer_split,
-            all_cp_transfer=envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get(),
-        )
-        if not self.server_args.disable_radix_cache:
-            raise ValueError("bounded Prefill runtime requires --disable-radix-cache")
-        from sglang.srt.hardware_backend.npu.prefill_offload import (
-            HostKvPagePool,
-            PrefillKvMemoryBudget,
-            PrefillLayerSlotManager,
-            PrefillLayerwiseOffload,
-        )
-
-        pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
-        logical_layers = pool.layer_num
-        physical_slots = pool.prefill_layer_slots
-        if physical_slots <= 0 or physical_slots > logical_layers:
-            raise ValueError(
-                "SGLANG_NPU_PREFILL_LAYER_SLOTS must be in "
-                f"[1, {logical_layers}], got {physical_slots}"
-            )
-        page_count = (
-            int(self.max_total_num_tokens) + self.page_size - 1
-        ) // self.page_size
-        self.prefill_layerwise_offload = PrefillLayerwiseOffload(
-            PrefillLayerSlotManager(logical_layers, physical_slots),
-            HostKvPagePool(page_count, self.page_size),
-        )
-        from sglang.srt.hardware_backend.npu.prefill_offload_adapter import (
-            NpuPrefillOffloadAdapter,
-        )
-        from sglang.srt.hardware_backend.npu.prefill_offload_runtime import (
-            NpuPrefillOffloadRuntime,
-        )
-        from sglang.srt.hardware_backend.npu.registered_host_kv import (
-            NpuRegisteredHostKvPool,
-        )
-
-        from sglang.srt.hardware_backend.npu.shared_host_kv import shared_host_group_from_runtime
-
-        device_id = torch.npu.current_device()
-        host_pool = NpuRegisteredHostKvPool(
-            device_id, shared_group=shared_host_group_from_runtime(device_id)
-        )
-        pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
-        budget = PrefillKvMemoryBudget(
-            pool.layer_num,
-            pool.prefill_layer_slots,
-            (pool.kv_lora_rank + pool.qk_rope_head_dim
-             + (0 if getattr(pool, "_kpool_use_compress", False) else pool.index_head_dim))
-            * torch._utils._element_size(pool.store_dtype),
-            envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
-        )
-        budget.validate_host_capacity(pool.size, self.page_size)
-        adapter = NpuPrefillOffloadAdapter(host_pool, page_size=self.page_size)
-        runtime = NpuPrefillOffloadRuntime(
-            pool,
-            self.req_to_token_pool,
-            adapter,
-            publish=lambda sender, work, binding, event: sender.publish_prefill_layer(
-                work, binding, event,
-                layer_offset=getattr(self.token_to_kv_pool, "fsa_transfer_layer_offset", 0),
-                layer_ids=getattr(pool, "fsa_wire_layer_ids", None),
-            ),
-            timeout_s=envs.SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S.get(),
-        )
-        runtime.register_host_layers()
-        self.prefill_offload_adapter = adapter
-        self.prefill_offload_runtime = runtime
-        self.token_to_kv_pool.prefill_offload_runtime = runtime
+        initialize = getattr(self.hisparse_coordinator, "initialize_prefill", None)
+        if initialize is not None:
+            initialize()
 
     def prefill_offload_forward(self, forward_batch):
-        runtime = self.prefill_offload_runtime
-        if runtime is None or forward_batch.forward_mode.is_idle():
+        coordinator = self.hisparse_coordinator
+        forward = getattr(coordinator, "prefill_offload_forward", None)
+        if forward is None:
             return contextlib.nullcontext()
-        return runtime.forward(forward_batch)
-
-    def begin_prefill_offload_request(self, request_id: str, token_count: int):
-        """Reserve Host pages before a Prefill request enters layer execution."""
-        if self.prefill_layerwise_offload is None:
-            return None
-        if request_id in self._prefill_offload_requests:
-            return self.prefill_layerwise_offload.grow_request(request_id, token_count)
-        allocation = self.prefill_layerwise_offload.begin_request(
-            request_id, token_count
-        )
-        self._prefill_offload_requests.add(request_id)
-        return allocation
-
-    def begin_prefill_offload_batch(self, forward_batch: ForwardBatch) -> None:
-        """Admit all real requests in one Prefill/extend forward.
-
-        A request can appear in multiple chunked-prefill batches.  Allocation
-        is therefore keyed by ``ForwardBatch.rids`` rather than by a forward
-        invocation.  This hook only establishes Host ownership; layer saves
-        and PD publication remain explicit layer callbacks.
-        """
-        if self.prefill_offload_runtime is not None:
-            return
-        if self.prefill_layerwise_offload is None or not forward_batch.forward_mode.is_extend():
-            return
-        if not forward_batch.rids:
-            raise RuntimeError(
-                "Prefill layerwise offload requires request IDs in ForwardBatch"
-            )
-        seq_lens = forward_batch.seq_lens_cpu
-        if seq_lens is None:
-            seq_lens = forward_batch.seq_lens.detach().cpu()
-        for index, request_id in enumerate(forward_batch.rids):
-            token_count = int(seq_lens[index].item())
-            if token_count <= 0:
-                raise ValueError(f"invalid Prefill token count for request {request_id}")
-            self.begin_prefill_offload_request(request_id, token_count)
-
-    def abort_prefill_offload_request(self, request_id: str) -> None:
-        """Release request ownership after cancellation work has drained."""
-        if self.prefill_offload_runtime is not None:
-            self.prefill_offload_runtime.release_request(request_id)
-            return
-        if self.prefill_layerwise_offload is None:
-            return
-        if request_id not in self._prefill_offload_requests:
-            return
-        self.end_prefill_offload_request(request_id)
-
-    def complete_prefill_offload_request(self, request_id: str) -> None:
-        """Complete a request after the PD sender reports drain/ACK."""
-        self.end_prefill_offload_request(request_id)
-
-    def begin_prefill_offload_layer(
-        self,
-        request_id: str,
-        logical_layer: int,
-        token_count: int,
-        valid_range,
-        *,
-        pd_readers: int = 0,
-        restore: bool = True,
-    ):
-        """Acquire one bounded layer slot; the scheduler owns retry/wait policy."""
-        if self.prefill_layerwise_offload is None:
-            return None
-        return self.prefill_layerwise_offload.begin_layer(
-            request_id,
-            logical_layer,
-            token_count,
-            valid_range,
-            pd_readers=pd_readers,
-            restore=restore and self.prefill_offload_adapter is None,
-        )
-
-    def bind_prefill_offload_layer(
-        self,
-        work,
-        latent_k,
-        rope_k,
-        indexer_k=None,
-        *,
-        token_indices=None,
-        device_row_indices=None,
-        source_page_ids=None,
-        destination_pages=None,
-    ) -> None:
-        """Bind layer tensors before restoring a deferred layer work item."""
-        adapter = self.prefill_offload_adapter
-        if adapter is None:
-            raise RuntimeError("Prefill Host adapter is not configured")
-        try:
-            adapter.bind_layer(
-                work,
-                latent_k,
-                rope_k,
-                indexer_k,
-                token_indices=token_indices,
-                device_row_indices=device_row_indices,
-                source_page_ids=source_page_ids,
-                destination_pages=destination_pages,
-            )
-            adapter.restore_layer(work)
-        except Exception:
-            self.prefill_layerwise_offload.fail_layer(work)
-            raise
-        work.restored = True
-
-    def configure_prefill_offload_adapter(self, adapter) -> None:
-        """Attach the concrete NPU Host KV adapter to the lifecycle state."""
-        if self.prefill_layerwise_offload is None:
-            raise RuntimeError("Prefill layerwise offload is not enabled")
-        if adapter is None:
-            raise ValueError("adapter must not be None")
-        self.prefill_offload_adapter = adapter
-        self.prefill_layerwise_offload.restore_callback = adapter.restore_layer
-        self.prefill_layerwise_offload.save_callback = adapter.save_layer
-        self.prefill_layerwise_offload.publish_callback = getattr(
-            adapter, "publish", None
-        )
-
-    def start_prefill_offload_layer_save(self, work) -> None:
-        """Mark KV written and enqueue the Host save for one layer."""
-        coordinator = self.prefill_layerwise_offload
-        adapter = self.prefill_offload_adapter
-        if coordinator is None or adapter is None:
-            raise RuntimeError("Prefill Host adapter is not configured")
-        coordinator.mark_kv_written(work)
-        coordinator.start_host_save(work)
-
-    def complete_prefill_offload_layer_save(self, work) -> object:
-        """Publish a layer after its asynchronous Host save has completed."""
-        coordinator = self.prefill_layerwise_offload
-        adapter = self.prefill_offload_adapter
-        if coordinator is None or adapter is None:
-            raise RuntimeError("Prefill Host adapter is not configured")
-        adapter.complete_host_save(work)
-        coordinator.complete_host_save(work)
-        record = coordinator.publish_layer_ready(work, adapter.descriptors(work))
-        return record
-
-    def record_prefill_offload_attention_done(self, work) -> None:
-        if self.prefill_offload_adapter is None:
-            raise RuntimeError("Prefill Host adapter is not configured")
-        self.prefill_offload_adapter.record_attention_done(work)
-
-    def complete_prefill_offload_attention(self, work) -> None:
-        if self.prefill_offload_adapter is None:
-            raise RuntimeError("Prefill Host adapter is not configured")
-        self.prefill_offload_adapter.complete_attention(work)
-        self.prefill_layerwise_offload.mark_attention_done(work)
-
-    def end_prefill_offload_layer(self, work) -> None:
-        """Release a layer only after attention, Host save and PD drain."""
-        if self.prefill_layerwise_offload is None:
-            return
-        if self.prefill_offload_adapter is not None:
-            self.prefill_offload_adapter.validate_layer_release(work)
-        self.prefill_layerwise_offload.release_layer(work)
-        if self.prefill_offload_adapter is not None:
-            self.prefill_offload_adapter.release_layer(work)
-
-    def end_prefill_offload_request(self, request_id: str) -> None:
-        """Release request Host pages after all layer slots are released."""
-        if self.prefill_offload_runtime is not None:
-            self.prefill_offload_runtime.release_request(request_id)
-            return
-        if self.prefill_layerwise_offload is None:
-            return
-        allocation = self.prefill_layerwise_offload.validate_request_release(request_id)
-        if self.prefill_offload_adapter is not None:
-            self.prefill_offload_adapter.release_request(allocation)
-        self.prefill_layerwise_offload.end_request(request_id)
-        self._prefill_offload_requests.discard(request_id)
+        return forward(forward_batch)
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)
@@ -1698,7 +1397,9 @@ class ModelRunner:
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa and hisparse settings."""
-        if self.enable_hisparse:
+        if self.enable_hisparse and getattr(
+            getattr(self, "hisparse_coordinator", None), "uses_staging", True
+        ):
             # HiSparse uses the host-backed full pool capacity.
             size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
             if size_full is not None:
@@ -2084,10 +1785,6 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr, self.prefill_offload_forward(forward_batch):
-            # Establish Host ownership before any Prefill layer can write KV.
-            # This is deliberately before graph/eager dispatch; graph replay
-            # itself is decode-only and must never allocate request pages.
-            self.begin_prefill_offload_batch(forward_batch)
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

@@ -1,5 +1,6 @@
 """MTP admission and mutable suffix bounds; no device execution."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import ast
 import importlib.util
 from pathlib import Path
@@ -8,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 
-SOURCE = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/speculative_sparse.py"
-SPEC = importlib.util.spec_from_file_location("speculative_sparse_under_test", SOURCE)
+SOURCE = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/hisparse/speculative_sparse.py"
+SPEC = importlib.util.spec_from_file_location(npu_module_name("speculative_sparse_under_test"), npu_source_path(SOURCE))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
@@ -63,7 +64,7 @@ def test_target_sizing_requires_actual_draft_inventory():
 
 
 def test_prefill_draft_cannot_capture_bounded_slots_outside_an_active_batch():
-    source = SOURCE.parents[2] / "speculative/eagle_worker_v2.py"
+    source = SOURCE.parents[3] / "speculative/eagle_worker_v2.py"
     module = ast.parse(source.read_text(encoding="utf-8"))
     method = next(node for node in ast.walk(module)
                   if isinstance(node, ast.FunctionDef) and node.name == "_capture_cuda_graphs")

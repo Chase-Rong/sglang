@@ -1,5 +1,6 @@
 """Exercise scheduler transfer completion without loading NPU workers."""
 
+from npu_test_paths import npu_module_name
 import ast
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -38,7 +39,7 @@ def test_prefill_completion_uses_bootstrap_pools_and_releases_after_drain(
         )
     source = Path(__file__).parents[4] / "python/sglang/srt"
     runtime_ast = ast.parse(
-        (source / "hardware_backend/npu/prefill_offload_runtime.py").read_text()
+        (source / "hardware_backend/npu/hisparse/prefill_offload_runtime.py").read_text()
     )
     check_node = next(
         node
@@ -47,9 +48,9 @@ def test_prefill_completion_uses_bootstrap_pools_and_releases_after_drain(
     )
     connection = types.ModuleType("sglang.srt.disaggregation.base.conn")
     connection.KVPoll = Poll
-    monkeypatch.setitem(sys.modules, connection.__name__, connection)
+    monkeypatch.setitem(sys.modules, npu_module_name(connection.__name__), connection)
     runtime_module = types.ModuleType(
-        "sglang.srt.hardware_backend.npu.prefill_offload_runtime"
+        "sglang.srt.hardware_backend.npu.hisparse.prefill_offload_runtime"
     )
     exec(
         compile(
@@ -57,7 +58,7 @@ def test_prefill_completion_uses_bootstrap_pools_and_releases_after_drain(
         ),
         runtime_module.__dict__,
     )
-    monkeypatch.setitem(sys.modules, runtime_module.__name__, runtime_module)
+    monkeypatch.setitem(sys.modules, npu_module_name(runtime_module.__name__), runtime_module)
     tree = ast.parse((source / "disaggregation/prefill.py").read_text())
     method = next(
         node

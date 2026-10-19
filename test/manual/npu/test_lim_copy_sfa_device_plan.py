@@ -26,7 +26,7 @@ def reference_module():
 
 @pytest.mark.parametrize("batch,routes", [(1, 1), (1, 6), (10, 1), (10, 6)])
 def test_device_plan_matches_score_union_reference(batch, routes):
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_device_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_device_plan import (
         DeviceUnionPlanner,
     )
 
@@ -36,7 +36,7 @@ def test_device_plan_matches_score_union_reference(batch, routes):
 def run_plan_reference_case(batch, routes, planner_type):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
 
     torch.npu.set_device(0)
     torch.npu.set_per_process_memory_fraction(

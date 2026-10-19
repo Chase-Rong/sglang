@@ -36,18 +36,11 @@ def validate_offload_service(server_args, role, *, integrated=False):
                 "Integrated offload requires HiCache and enabled radix cache"
             )
     if (
-        (
-            not integrated
-            and server_args.disaggregation_transfer_backend
-            not in ("ascend", "mooncake")
-        )
-        or (
-            not integrated and role == "prefill" and not server_args.disable_radix_cache
-        )
-        or server_args.enable_hisparse
-    ):
+        not integrated
+        and server_args.disaggregation_transfer_backend not in ("ascend", "mooncake")
+    ) or (not integrated and role == "prefill" and not server_args.disable_radix_cache):
         raise ValueError(
-            "NPU sparse offload requires Ascend/Mooncake transport, disabled radix cache and no HiSparse coordinator"
+            "NPU sparse offload requires Ascend/Mooncake transport and disabled Prefill radix cache"
         )
     if not integrated and server_args.disaggregation_transfer_backend != "ascend":
         raise ValueError("NPU PD offload requires the Ascend MemFabric backend")
@@ -139,6 +132,7 @@ def validate_prefill_overlap(
 def fsa_pool_options(kvc, layer_count):
     import torch
 
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
     from sglang.srt.hardware_backend.npu.shared_host_kv import (
@@ -164,9 +158,13 @@ def fsa_pool_options(kvc, layer_count):
     role = get_disagg().disaggregation_mode
     if str(kvc.device).split(":")[0] != "npu" or not kvc.use_mla_backend:
         raise ValueError("FSA Host offload requires an NPU MLA pool")
-    validate_offload_service(kvc.server_args, role, integrated=integrated)
+    validate_offload_service(resolved_view(kvc.server_args), role, integrated=integrated)
     if kvc.kv_cache_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("FSA Host KV requires FP16 or BF16 storage")
+    if role != "prefill" and envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa":
+        from sglang.srt.hardware_backend.npu.hisparse.config import validate_lim_dtypes
+
+        validate_lim_dtypes(kvc.kv_cache_dtype, kvc.model_dtype)
     native_ops()
     if integrated:
         if (

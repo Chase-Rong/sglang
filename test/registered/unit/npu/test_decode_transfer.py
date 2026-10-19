@@ -19,7 +19,7 @@ class DecodeCase:
         import torch_npu
 
         from sglang.srt.hardware_backend.npu.fsa_native import RegisteredHostRegion
-        from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+        from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
             FusedSparseAttentionState,
         )
 
@@ -72,7 +72,7 @@ class DecodeCase:
         self.graphs = []
 
     def invoke(self, layer=0):
-        from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+        from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
             run_fused_sparse_attention,
         )
 

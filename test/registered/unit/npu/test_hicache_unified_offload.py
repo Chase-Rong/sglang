@@ -19,7 +19,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu import hicache_mamba_pool
-from sglang.srt.hardware_backend.npu.hicache_offload import OffloadPageBinding
+from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
 from sglang.srt.managers import cache_controller as controller_module
 from sglang.srt.mem_cache import l2_transfer, memory_pool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator

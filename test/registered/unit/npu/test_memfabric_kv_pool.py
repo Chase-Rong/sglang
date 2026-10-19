@@ -1,5 +1,6 @@
 """Allocator failure cleanup and ownership tests without allocating device memory."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ def allocator(monkeypatch):
     for name in ("sglang", "sglang.srt", "sglang.srt.hardware_backend", prefix):
         package = ModuleType(name)
         package.__path__ = []
-        monkeypatch.setitem(sys.modules, name, package)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), package)
     loaded = {}
     for name in (
         "fsa_native",
@@ -28,10 +29,10 @@ def allocator(monkeypatch):
         "decode_host_kv",
     ):
         spec = importlib.util.spec_from_file_location(
-            prefix + "." + name, ROOT / (name + ".py")
+            npu_module_name(prefix + "." + name), npu_source_path(ROOT / (name + ".py"))
         )
         module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, spec.name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(spec.name), module)
         spec.loader.exec_module(module)
         loaded[name] = module
     events = []
@@ -66,7 +67,7 @@ def allocator(monkeypatch):
         free=lambda pointer: events.append(("free", pointer)),
         uninitialize=lambda: events.append(("uninitialize",)),
     )
-    monkeypatch.setitem(sys.modules, "memfabric_hybrid", fabric)
+    monkeypatch.setitem(sys.modules, npu_module_name("memfabric_hybrid"), fabric)
     monkeypatch.setattr(loaded["memfabric_host_kv"], "native_ops", lambda: operations)
     return SimpleNamespace(
         module=loaded["memfabric_host_kv"],
