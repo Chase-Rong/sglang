@@ -91,10 +91,10 @@ class DecodeHostKvBacking:
 
     def bind_hicache(self, device_pool):
         if self.hicache_pool is None:
-            from sglang.srt.hardware_backend.npu.hicache_host_pool import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_host_pool import (
                 MemFabricHiCachePool,
             )
-            from sglang.srt.hardware_backend.npu.hicache_offload import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
                 OffloadPageBinding,
             )
 

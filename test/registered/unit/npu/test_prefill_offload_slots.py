@@ -1,3 +1,4 @@
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 from pathlib import Path
 
@@ -14,7 +15,7 @@ _MODULE_PATH = (
     / "prefill_offload.py"
 )
 _SPEC = importlib.util.spec_from_file_location(
-    "prefill_offload_under_test", _MODULE_PATH
+    npu_module_name("prefill_offload_under_test"), npu_source_path(_MODULE_PATH)
 )
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None

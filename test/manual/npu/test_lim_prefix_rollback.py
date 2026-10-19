@@ -17,8 +17,8 @@ def test_rollback_invalidates_unselected_suffix_and_preserves_generation_reset(
 ):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeUnionPlanner,
     )
 

@@ -592,7 +592,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 prefill_layer_slots is not None and not integrated_offload
             ) or index_head_dim is None:
                 raise ValueError("Decode Host KV requires a dedicated DSA Decode pool")
-            from sglang.srt.hardware_backend.npu.decode_host_kv import (
+            from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import (
                 DecodeHostKvBacking,
             )
 
@@ -670,9 +670,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def layer_receive_lease(self, room, session_id, host_pages, device_pages, prefix=0):
         from uuid import uuid4
 
-        from sglang.srt.hardware_backend.npu.layer_protocol import LayerReceiveLease
-        from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
-        from sglang.srt.hardware_backend.npu.prefill_offload import (
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import LayerReceiveLease
+        from sglang.srt.hardware_backend.npu.hisparse.layer_transfer import RegisteredLayerRegion
+        from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
             KvComponent,
             PdSourceKind,
         )

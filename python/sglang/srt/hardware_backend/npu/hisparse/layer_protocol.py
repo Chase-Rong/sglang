@@ -4,11 +4,11 @@ import json
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from sglang.srt.hardware_backend.npu.layer_transfer import (
+from sglang.srt.hardware_backend.npu.hisparse.layer_transfer import (
     PrefillLayerTarget,
     RegisteredLayerRegion,
 )
-from sglang.srt.hardware_backend.npu.prefill_offload import KvComponent, PdSourceKind
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import KvComponent, PdSourceKind
 
 VERSION = 1
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024

@@ -22,12 +22,12 @@ pytestmark = pytest.mark.skipif(
 def exercise_sfa_pipeline(prefix, chunk, repeats, *, profile_dir=None, modes=None):
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
         FusedSparseAttentionState,
         run_fused_sparse_attention,
     )
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.hardware_backend.npu.prefill_overlap import (
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_overlap import (
         PipelinedIntegratedOffloadRuntime,
     )
 

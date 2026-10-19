@@ -36,8 +36,8 @@ pytestmark = pytest.mark.skipif(
 def test_grouped_lim_per_query_causality_and_table_fallback(heads, request_rows):
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeIndexerManager,
     )
 

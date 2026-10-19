@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-from sglang.srt.hardware_backend.npu.prefill_offload import (
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
     KvComponent,
     LayerReadyRecord,
     PdSourceKind,

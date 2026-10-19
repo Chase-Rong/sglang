@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_factory import uses_native_hisparse
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -104,7 +105,7 @@ logger = logging.getLogger(__name__)
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
-        not memory_config.enable_hisparse
+        not uses_native_hisparse()
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
@@ -1492,7 +1493,7 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
         dsa_pool_kwargs = {}
-        from sglang.srt.hardware_backend.npu.offload_config import fsa_pool_options
+        from sglang.srt.hardware_backend.npu.hisparse.offload_config import fsa_pool_options
 
         fsa_options = fsa_pool_options(self, self.layer_info.num_effective_layers)
         if is_dsa_model:
@@ -1567,7 +1568,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if uses_native_hisparse():
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1847,7 +1848,7 @@ class KVCacheConfigurator:
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
         if self.device == "npu" and self.use_mla_backend:
-            from sglang.srt.hardware_backend.npu.offload_config import fsa_pool_options
+            from sglang.srt.hardware_backend.npu.hisparse.offload_config import fsa_pool_options
 
             extra_args["fsa_pool_kwargs"] = fsa_pool_options(self, len(full_attention_layer_ids))
         quant_method = self._build_mha_quant_method(
@@ -2020,7 +2021,7 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
-                    if get_memory().enable_hisparse:
+                    if uses_native_hisparse():
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
@@ -2056,7 +2057,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if uses_native_hisparse() and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
@@ -2538,7 +2539,7 @@ class KVCacheConfigurator:
         budget = getattr(configurator, "_decode_budget", None)
         if budget is None:
             return None
-        from sglang.srt.hardware_backend.npu.decode_memory_budget import (
+        from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
             solve_joint_dsa_kda_tokens,
         )
 

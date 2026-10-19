@@ -21,7 +21,7 @@ def device():
 
 
 def test_metadata_preserves_causal_pages_padding_and_generation(device):
-    from sglang.srt.hardware_backend.npu import fused_sparse_attention as fsa
+    from sglang.srt.hardware_backend.npu.hisparse import fused_sparse_attention as fsa
 
     build = getattr(fsa, "build_external_metadata_plan", None)
     assert callable(build), "fused external metadata producer is missing"
@@ -79,7 +79,7 @@ def oracle(
     tail,
 ):
     """Existing unfused CPU path; separate from the new device implementation."""
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
         build_reference_sparse_plan,
         mask_causal_topk,
     )
@@ -125,7 +125,7 @@ def oracle(
 def test_metadata_graph_reads_dynamic_inputs(
     device, rows, width, page_size, tail, with_positions, inference
 ):
-    from sglang.srt.hardware_backend.npu import fused_sparse_attention as fsa
+    from sglang.srt.hardware_backend.npu.hisparse import fused_sparse_attention as fsa
 
     build = getattr(fsa, "build_external_metadata_plan", None)
     assert callable(build), "fused external metadata producer is missing"

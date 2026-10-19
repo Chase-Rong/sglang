@@ -39,7 +39,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.engine = TransferEngine()
         self.hostname = hostname
         self.npu_id = npu_id
-        from sglang.srt.hardware_backend.npu.offload_config import (
+        from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
             resolve_transfer_device,
         )
 

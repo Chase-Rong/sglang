@@ -3,11 +3,11 @@
 import torch
 import triton
 
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_device_plan import (
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_device_plan import (
     _commit,
     _mutable_presence,
 )
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import (
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import (
     NativePooledIndexer,
     native_indexer_ops,
 )

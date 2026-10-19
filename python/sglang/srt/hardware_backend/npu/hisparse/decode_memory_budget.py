@@ -278,8 +278,8 @@ def budget_from_config(kvc, layers):
 
     from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
     from sglang.srt.environ import envs
-    from sglang.srt.hardware_backend.npu.offload_config import layer_staging_bytes
-    from sglang.srt.hardware_backend.npu.speculative_sparse import (
+    from sglang.srt.hardware_backend.npu.hisparse.offload_config import layer_staging_bytes
+    from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
         sparse_mtp_draft_layers,
         sparse_mtp_rows,
     )

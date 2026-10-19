@@ -54,8 +54,8 @@ def run_request_shared_attention(
             "Three-way benchmarking requires the native pair and a results directory"
         )
 
-    from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import DecodeHostKvBacking
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
     from lim_copy_sfa_reference import LegacyFsaComparator
 
     torch.npu.set_device(0)
@@ -90,7 +90,7 @@ def run_request_shared_attention(
     spec = LimCopySfaSpec(context, routes, 4096 if routes == 1 else 12416)
     options = {}
     if native_fused:
-        from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+        from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
             NativeIndexerManager,
         )
 
@@ -99,7 +99,7 @@ def run_request_shared_attention(
         spec, batch + 1, batch, "npu:0", torch.bfloat16, **options
     )
     if native_copy:
-        from sglang.srt.hardware_backend.npu.lim_copy_sfa_attention import (
+        from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_attention import (
             NativeCopySparseAttention,
         )
 
@@ -139,7 +139,7 @@ def run_request_shared_attention(
     if include_indexer:
         import triton
 
-        from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import (
+        from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import (
             NativePooledIndexer,
             _expand,
             _prepare_lengths,
@@ -222,8 +222,8 @@ def run_request_shared_attention(
     phase_outputs = []
 
     if framework:
-        from sglang.srt.hardware_backend.npu.fsa_backend import forward_fsa
-        from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import (
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import forward_fsa
+        from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
             LimCopySfaState,
             select_offloaded_topk,
         )
@@ -466,7 +466,7 @@ def run_request_shared_attention(
         if (
             directory := os.environ.get("SGLANG_LIM_COMPONENT_BENCHMARK")
         ) and not inactive_last:
-            from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+            from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
                 FusedSparseAttentionState,
                 paged_kv_view,
                 run_fused_sparse_attention,
@@ -760,7 +760,7 @@ def run_request_shared_attention(
                 and not native_fused
                 and os.environ.get("SGLANG_LIM_BREAKDOWN") == "1"
             ):
-                from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+                from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
                     FusedSparseAttentionInputs,
                 )
 

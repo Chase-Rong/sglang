@@ -191,7 +191,7 @@ class OffloadPageBinding:
                 "Host page-table output must cover the input on the same device and dtype"
             )
         if device_table.device.type == "npu":
-            from sglang.srt.hardware_backend.npu.hicache_page_table import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_page_table import (
                 fill_host_page_table,
             )
 

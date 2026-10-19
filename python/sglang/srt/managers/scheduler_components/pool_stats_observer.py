@@ -11,6 +11,7 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.managers.hisparse_factory import uses_native_hisparse
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -232,6 +233,8 @@ class SchedulerPoolStatsObserver:
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
+            if h is None:
+                return pool_stats
             return dataclasses.replace(
                 pool_stats,
                 is_hisparse=True,
@@ -311,7 +314,7 @@ class SchedulerPoolStatsObserver:
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
         # bug should be fixed so the clamp can go away.
-        if self.enable_hisparse:
+        if uses_native_hisparse():
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
         if not self.full_tokens_per_layer:

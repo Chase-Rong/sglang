@@ -1,5 +1,6 @@
 """Integrated MTP admission and graph dispatch without accelerator execution."""
 
+from npu_test_paths import npu_module_name
 import ast
 import contextlib
 import sys
@@ -37,11 +38,11 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     from test_offload_config import MODULE as offload_config
 
     monkeypatch.setitem(
-        sys.modules, "sglang.srt.hardware_backend.npu.offload_config", offload_config
+        sys.modules, npu_module_name("sglang.srt.hardware_backend.npu.hisparse.offload_config"), offload_config
     )
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.hardware_backend.npu.speculative_sparse",
+        npu_module_name("sglang.srt.hardware_backend.npu.hisparse.speculative_sparse"),
         speculative_module,
     )
 
@@ -57,7 +58,7 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     )
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.environ",
+        npu_module_name("sglang.srt.environ"),
         SimpleNamespace(
             envs=SimpleNamespace(
                 **{
@@ -69,7 +70,7 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     )
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.configs.model_config",
+        npu_module_name("sglang.srt.configs.model_config"),
         SimpleNamespace(
             is_deepseek_dsa=lambda config: True,
             dsa_layer_skips_topk=lambda *args: False,
@@ -77,7 +78,7 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     )
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.model_executor.pool_configurator",
+        npu_module_name("sglang.srt.model_executor.pool_configurator"),
         SimpleNamespace(
             _get_dsa_cache_layer_ids=lambda kvc, layers: list(range(layers))
         ),
@@ -90,7 +91,7 @@ def test_host_capacity_budget_route_includes_mtp_layers(
     graph = SimpleNamespace(backend="full", bs=[1, 2, 4, 8, 12, 16, 24], max_bs=24)
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.runtime_context",
+        npu_module_name("sglang.srt.runtime_context"),
         SimpleNamespace(
             get_disagg=lambda: SimpleNamespace(
                 disaggregation_mode="null" if integrated else "decode"
@@ -200,8 +201,16 @@ def test_hicache_assembler_borrows_bound_target_and_draft_without_another_pool(r
 
 
 @pytest.mark.parametrize("decode_graph", ["disabled", "full"])
-def test_startup_admits_fixed_width_nextn_hicache_and_keeps_prefix(decode_graph):
+def test_startup_admits_fixed_width_nextn_hicache_and_keeps_prefix(decode_graph, monkeypatch):
+    from test_hisparse_config import CONFIG
+
+    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.hisparse.config", CONFIG)
+    for name, default in CONFIG.ENV_FIELDS.values():
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD", "True")
+    monkeypatch.setenv("SGLANG_NPU_DECODE_HOST_KV_BYTES", str(1 << 30))
     args = SimpleNamespace(
+        disaggregation_mode="null",
         enable_unified_cache_external_linker=False,
         hicache_storage_backend=None,
         speculative_algorithm="EAGLE",
@@ -259,9 +268,15 @@ def test_startup_admits_fixed_width_nextn_hicache_and_keeps_prefix(decode_graph)
 
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("host_tokens", [0, 131072])
+@pytest.mark.parametrize("backend", ["lim_copy_sfa", "external_plan"])
 def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
-    monkeypatch, speculative, host_tokens
+    monkeypatch, speculative, host_tokens, backend
 ):
+    from test_hisparse_config import CONFIG
+
+    monkeypatch.setitem(sys.modules, "sglang.srt.arg_groups.overrides",
+                        SimpleNamespace(resolved_view=lambda value: value))
+    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.hisparse.config", CONFIG)
     # This tests pool options after argument resolution, not startup admission.
     # Integrated HiCache requires radix and shared target/draft page ownership.
     values = dict(SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD=True,
@@ -269,19 +284,20 @@ def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
                   SGLANG_NPU_HICACHE_HOST_TOKENS=host_tokens,
                   SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=True,
                   SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION=True,
-                  SGLANG_NPU_PREFILL_LAYER_SLOTS=2)
+                  SGLANG_NPU_PREFILL_LAYER_SLOTS=2,
+                  SGLANG_NPU_DSA_OFFLOAD_BACKEND=backend)
     envs = SimpleNamespace(**{key: SimpleNamespace(get=lambda value=value: value)
                              for key, value in values.items()})
     group = object()
-    monkeypatch.setitem(sys.modules, "sglang.srt.environ", SimpleNamespace(envs=envs))
-    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.fsa_native",
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.environ"), SimpleNamespace(envs=envs))
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.hardware_backend.npu.fsa_native"),
                         SimpleNamespace(native_ops=lambda: None))
-    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.shared_host_kv",
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.hardware_backend.npu.shared_host_kv"),
                         SimpleNamespace(shared_host_group_from_runtime=lambda device: group))
     monkeypatch.setattr(torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False)
     schedule = SimpleNamespace(enable_mixed_chunk=False)
     parallel = SimpleNamespace(attn_cp_size=1, attn_dcp_size=1)
-    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", SimpleNamespace(
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.runtime_context"), SimpleNamespace(
         get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
         get_schedule=lambda: schedule, get_parallel=lambda: parallel,
         get_spec=lambda: SimpleNamespace(speculative_algorithm="EAGLE" if speculative else None)))
@@ -290,6 +306,7 @@ def test_integrated_pool_geometry_preserves_mtp_without_enabling_copy_overlap(
         use_mla_backend=True,
         server_args=service(disable_radix_cache=False, enable_hierarchical_cache=True),
         kv_cache_dtype=torch.bfloat16,
+        model_dtype=torch.bfloat16,
     )
     options = config.fsa_pool_options(kvc, 4)
     expected = dict(
@@ -317,8 +334,8 @@ def test_runner_keeps_async_prefill_with_mtp(setup, speculative):
     namespace = dict(envs=SimpleNamespace(
         SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD=SimpleNamespace(get=lambda: True),
         SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD=SimpleNamespace(get=lambda: True)))
-    initialize = production_method("model_executor/model_runner.py",
-                                   "maybe_init_prefill_layerwise_offload", namespace)
+    initialize = production_method("hardware_backend/npu/hisparse/prefill.py",
+                                   "initialize_prefill_runtime", namespace)
     runner = SimpleNamespace(token_to_kv_pool=case.pool,
                              req_to_token_pool=case.runtime.request_pool,
                              spec_algorithm=SimpleNamespace(is_none=lambda: not speculative))

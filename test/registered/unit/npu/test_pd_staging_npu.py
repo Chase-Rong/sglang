@@ -16,9 +16,9 @@ pytestmark = pytest.mark.skipif(
 
 def exercise_staging(device_id, shared=None):
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-    from sglang.srt.hardware_backend.npu.layer_staging import create_npu_layer_staging
+    from sglang.srt.hardware_backend.npu.hisparse.layer_staging import create_npu_layer_staging
     from sglang.srt.hardware_backend.npu.memfabric_host_kv import MemFabricHostKvPool
-    from sglang.srt.hardware_backend.npu.prefill_offload import PdSourceKind
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import PdSourceKind
 
     torch.npu.set_device(device_id)
     pool = MemFabricHostKvPool(

@@ -1790,7 +1790,7 @@ class IndexerKPool(MultiPlatformOp):
             and envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
             and not forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import select_offloaded_topk
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import select_offloaded_topk
 
             result = select_offloaded_topk(
                 get_attn_backend(), self, forward_batch, layer_id, query,

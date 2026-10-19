@@ -235,7 +235,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        from sglang.srt.hardware_backend.npu.fsa_backend import initialize_fsa_backend
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import initialize_fsa_backend
 
         initialize_fsa_backend(self, model_runner)
 
@@ -265,7 +265,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             self.fused_sparse_state is not None
             and not forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            from sglang.srt.hardware_backend.npu.fsa_backend import forward_fsa
+            from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import forward_fsa
 
             return forward_fsa(
                 self,
@@ -290,7 +290,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             k_rope=k_rope,
             topk_indices=topk_indices,
         )
-        from sglang.srt.hardware_backend.npu.fsa_backend import sparse_pool_and_layer
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import sparse_pool_and_layer
 
         pool, local_layer = sparse_pool_and_layer(self.token_to_kv_pool, layer.layer_id)
         runtime = getattr(pool, "prefill_offload_runtime", None)
@@ -302,7 +302,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         return output
 
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
-        from sglang.srt.hardware_backend.npu.fsa_backend import reserve_fsa_graph
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import reserve_fsa_graph
 
         reserve_fsa_graph(self, max_num_tokens)
         return super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -481,7 +481,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata.page_size = self.page_size
         metadata.cache_seqlens_int32 = cache_seqlens
         metadata.real_page_table = real_page_table
-        from sglang.srt.hardware_backend.npu.hicache_offload import get_offload_backing
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import get_offload_backing
 
         backing = get_offload_backing(self.token_to_kv_pool)
         if backing is not None:
@@ -659,7 +659,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             )
         metadata.real_page_table[:n_rows, :n_cols].copy_(new_real_page_table)
         if metadata.host_page_table is not None:
-            from sglang.srt.hardware_backend.npu.hicache_offload import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
                 get_offload_backing,
             )
 
@@ -801,7 +801,7 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     backend_cls = AscendDSAAttnBackend
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        from sglang.srt.hardware_backend.npu.hicache_offload import (
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
             DraftHostTableScope,
             get_offload_backing,
         )

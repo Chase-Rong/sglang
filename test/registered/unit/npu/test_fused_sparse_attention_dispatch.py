@@ -1,3 +1,4 @@
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ _MODULE_PATH = (
     / "fused_sparse_attention.py"
 )
 _SPEC = importlib.util.spec_from_file_location(
-    "fused_attention_under_test", _MODULE_PATH
+    npu_module_name("fused_attention_under_test"), npu_source_path(_MODULE_PATH)
 )
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
@@ -84,7 +85,7 @@ def test_mtp_selection_requires_external_validity_tracking():
 
 def test_missing_fused_binary_fails_explicitly(monkeypatch):
     monkeypatch.setitem(
-        sys.modules, "sglang.srt.hardware_backend.npu.fsa_native",
+        sys.modules, npu_module_name("sglang.srt.hardware_backend.npu.fsa_native"),
         SimpleNamespace(load_native_extension=lambda: False),
     )
     monkeypatch.setattr(torch, "ops", SimpleNamespace())

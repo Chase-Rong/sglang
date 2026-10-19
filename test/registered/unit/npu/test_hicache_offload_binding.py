@@ -5,6 +5,7 @@ restore tests require atomic rejection, even while the binding is being fixed.
 This file does not qualify NPU execution, TP visibility or storage integration.
 """
 
+from npu_test_paths import npu_module_name
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -96,7 +97,7 @@ def test_pd_transfer_cannot_pin_unmapped_pages(bound):
 
 
 def test_pd_publication_runs_once_for_packed_target_and_draft(bound):
-    from sglang.srt.hardware_backend.npu.hicache_offload import publish_received_host_kv
+    from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import publish_received_host_kv
 
     calls = []
     shared = SimpleNamespace(publish_write=lambda: calls.append("publish"))
@@ -395,7 +396,7 @@ def test_retain_unmapped_device_pages_fails_without_incrementing_live_refs(bound
 def host_group(runtime, monkeypatch):
     environ = ModuleType("sglang.srt.environ")
     environ.envs = SimpleNamespace()
-    monkeypatch.setitem(sys.modules, environ.__name__, environ)
+    monkeypatch.setitem(sys.modules, npu_module_name(environ.__name__), environ)
     storage = host_tests.load_module(
         monkeypatch,
         "sglang.srt.mem_cache.hicache_storage",

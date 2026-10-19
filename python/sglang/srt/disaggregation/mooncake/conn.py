@@ -227,7 +227,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._layer_leases = {}
         self._layer_operations = {}
         self._layer_send_lock = threading.RLock()
-        from sglang.srt.hardware_backend.npu.offload_config import layer_staging_bytes
+        from sglang.srt.hardware_backend.npu.hisparse.offload_config import layer_staging_bytes
 
         layer_pool = getattr(args, "npu_layer_receive_pool", None)
         staging_bytes = layer_staging_bytes(
@@ -236,7 +236,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             host_offload=layer_pool is not None,
         )
         if staging_bytes:
-            from sglang.srt.hardware_backend.npu.layer_staging import (
+            from sglang.srt.hardware_backend.npu.hisparse.layer_staging import (
                 create_npu_layer_staging,
             )
 
@@ -338,14 +338,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _handle_layer_message(self, message):
         if message[0].startswith(b"FSA_STAGE_"):
-            from sglang.srt.hardware_backend.npu.layer_staging import handle_layer_staging_message
+            from sglang.srt.hardware_backend.npu.hisparse.layer_staging import handle_layer_staging_message
 
             handle_layer_staging_message(self, message)
             return True
         if message[0] not in (b"FSA_LAYER_READY", b"FSA_LAYER_ACK", b"FSA_LAYER_FAILED",
                               b"FSA_LAYER_ABORT", b"FSA_LAYER_ABORT_ACK", b"FSA_LAYER_REJECTED"):
             return False
-        from sglang.srt.hardware_backend.npu.layer_protocol import decode, encode
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import decode, encode
 
         payload = None
         try:
@@ -429,7 +429,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._flush_layer_aborts(room)
 
     def _flush_layer_aborts(self, room):
-        from sglang.srt.hardware_backend.npu.layer_protocol import encode
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import encode
 
         with self._layer_send_lock:
             if getattr(self, "_staging_outstanding", {}).get(room, 0) > 0:
@@ -2657,7 +2657,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             raise RuntimeError("receiver layer-ready registrations have not been negotiated")
 
     def _load_negotiated_layer_targets(self):
-        from sglang.srt.hardware_backend.npu.layer_protocol import parse_targets
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import parse_targets
 
         infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
         if not infos or len(infos) != next(iter(infos.values())).required_dst_info_num:
@@ -2691,7 +2691,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 self._prefill_layer_targets[layer] = ()
 
     def _notify_layer_receiver(self, peer, lease, record, operation):
-        from sglang.srt.hardware_backend.npu.layer_protocol import encode, ready_payload
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import encode, ready_payload
 
         payload = ready_payload(self.bootstrap_room, peer.mooncake_session_id, lease, record, operation)
         payload.update(reply_ip=self.kv_mgr.local_ip, reply_port=self.kv_mgr.rank_port)
@@ -2710,8 +2710,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def publish_prefill_layer(self, work, binding, source_ready_event, *, layer_offset=0, layer_ids=None):
         from dataclasses import replace
 
-        from sglang.srt.hardware_backend.npu.layer_transfer import RegisteredLayerRegion
-        from sglang.srt.hardware_backend.npu.prefill_offload import (
+        from sglang.srt.hardware_backend.npu.hisparse.layer_transfer import RegisteredLayerRegion
+        from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
             KvComponent,
             KvPageRange,
             LayerReadyRecord,
@@ -2798,11 +2798,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         It must run outside graph replay. The caller supplies registrations
         agreed by the layer bootstrap and a completed source-write event.
         """
-        from sglang.srt.hardware_backend.npu.layer_transfer import (
+        from sglang.srt.hardware_backend.npu.hisparse.layer_transfer import (
             LayerTransferOperation,
             build_layer_transfer_spans,
         )
-        from sglang.srt.hardware_backend.npu.prefill_offload import SlotBusyError
+        from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import SlotBusyError
 
         if not destination_session_id:
             raise ValueError("layer transfer requires a destination session")
@@ -2832,7 +2832,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._layer_ready_operations[key] = operation
         try:
             with self.kv_mgr._layer_send_lock:
-                from sglang.srt.hardware_backend.npu.layer_protocol import token_identity
+                from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import token_identity
 
                 identity = (self.bootstrap_room, destination_session_id,
                             tuple(token_identity(record.token)))
@@ -2856,8 +2856,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         return operation
 
     def _execute_staged_layer(self, operation, spans, staging, session_id):
-        from sglang.srt.hardware_backend.npu.layer_protocol import decode, encode, ready_payload
-        from sglang.srt.hardware_backend.npu.layer_staging import execute_staged_layer, request_layer_staging
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import decode, encode, ready_payload
+        from sglang.srt.hardware_backend.npu.hisparse.layer_staging import execute_staged_layer, request_layer_staging
 
         peer = self.kv_mgr.transfer_infos[self.bootstrap_room][session_id]
         manifest = decode(peer.layer_manifest)
@@ -2904,7 +2904,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if operation.state not in ("acknowledged", "drained"):
             raise RuntimeError("layer transfer still needs receiver ACK or failed drain")
         del self._layer_ready_operations[key]
-        from sglang.srt.hardware_backend.npu.layer_protocol import token_identity
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import token_identity
 
         self.kv_mgr._layer_operations.pop(
             (self.bootstrap_room, destination_session_id, tuple(token_identity(token))), None
@@ -3044,7 +3044,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         lease = self.kv_mgr._layer_leases.get(self.bootstrap_room)
         if lease is None:
             return super()._send_abort_notification()
-        from sglang.srt.hardware_backend.npu.layer_protocol import encode
+        from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import encode
 
         lease.failed = True
         payload = encode({"room": self.bootstrap_room, "session": self.session_id,
@@ -3200,7 +3200,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         layer_manifest = b""
         layer_pool = getattr(self.kv_mgr.kv_args, "npu_layer_receive_pool", None)
         if layer_pool is not None:
-            from sglang.srt.hardware_backend.npu.layer_protocol import (
+            from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import (
                 select_layer_writers,
             )
 

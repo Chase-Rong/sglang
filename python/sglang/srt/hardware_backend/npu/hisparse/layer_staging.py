@@ -4,7 +4,7 @@ import threading
 import time
 from uuid import uuid4
 
-from sglang.srt.hardware_backend.npu.prefill_offload import KvComponent, PdSourceKind
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import KvComponent, PdSourceKind
 
 
 class LayerStagingReceiver:
@@ -311,7 +311,7 @@ def staging_batches(spans, window_bytes, *, batched):
 
 
 def execute_staged_layer(operation, spans, manifest, payload, *, rpc, transfer, timeout_s):
-    from sglang.srt.hardware_backend.npu.layer_transfer import coalesce_transfer_blocks
+    from sglang.srt.hardware_backend.npu.hisparse.layer_transfer import coalesce_transfer_blocks
 
     if operation.state != "pending":
         raise RuntimeError("staged layer was already submitted")
@@ -374,7 +374,7 @@ def execute_staged_layer(operation, spans, manifest, payload, *, rpc, transfer, 
 
 def request_layer_staging(manager, peer, header, payload, timeout_s):
     from sglang.srt.disaggregation.base.conn import KVPoll
-    from sglang.srt.hardware_backend.npu.layer_protocol import encode
+    from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import encode
     from sglang.srt.utils.network import NetworkAddress
 
     if timeout_s <= 0:
@@ -413,7 +413,7 @@ def handle_layer_staging_message(manager, message):
     import logging
 
     from sglang.srt.disaggregation.base.conn import KVPoll
-    from sglang.srt.hardware_backend.npu.layer_protocol import decode, encode
+    from sglang.srt.hardware_backend.npu.hisparse.layer_protocol import decode, encode
     from sglang.srt.utils.network import NetworkAddress
 
     logger = logging.getLogger(__name__)

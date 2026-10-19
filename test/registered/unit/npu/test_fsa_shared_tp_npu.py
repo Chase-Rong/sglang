@@ -25,7 +25,7 @@ def tp():
     rank = int(os.environ["RANK"])
     devices = [int(value) for value in os.environ["SGLANG_FSA_TEST_DEVICES"].split(",")]
     device_id = devices[rank]
-    torch.npu.set_device(device_id)
+    torch_npu.npu.set_device(device_id)
     set_custom_all_reduce(False)
     init_distributed_environment(world_size=len(devices), rank=rank, local_rank=device_id,
                                  distributed_init_method="env://", backend="hccl", timeout=90)
@@ -131,8 +131,8 @@ def test_shared_allocation_one_writer_graph_and_independent_detach(tp, dtype):
 @pytest.mark.parametrize("integrated", [False, True])
 @pytest.mark.parametrize("mapped", [False, True])
 def test_shared_decode_fused_replay_with_tp_output_collective(tp, dtype, integrated, mapped):
-    from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
-    from sglang.srt.hardware_backend.npu.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
+    from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import DecodeHostKvBacking
+    from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import FusedSparseAttentionState, run_fused_sparse_attention
 
     backing = DecodeHostKvBacking(layers=1, pages=18, page_size=128, latent_dim=512,
                                   rope_dim=0, dtype=dtype, device_id=tp.device_id,

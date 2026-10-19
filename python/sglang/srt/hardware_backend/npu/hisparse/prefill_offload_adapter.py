@@ -6,7 +6,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
-from sglang.srt.hardware_backend.npu.prefill_offload import (
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
     HostPageAllocation,
     KvComponent,
     LayerWork,

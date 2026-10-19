@@ -1,5 +1,6 @@
 """CPU semantic gates for the alternative A5 pooled offload operators."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -13,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[4]
 
 
 def load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(ROOT / path))
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -22,7 +23,7 @@ def load_module(name, path):
 
 CONTRACT = load_module(
     "lim_contract_under_test",
-    "python/sglang/srt/hardware_backend/npu/lim_copy_sfa_contract.py",
+    "python/sglang/srt/hardware_backend/npu/hisparse/lim_copy_sfa_contract.py",
 )
 REFERENCE = load_module(
     "lim_reference_under_test", "test/manual/npu/lim_copy_sfa_reference.py"
@@ -39,7 +40,7 @@ def test_legacy_comparator_initializes_selected_planner(monkeypatch, explicit_pl
 
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.hardware_backend.npu.lim_copy_sfa_device_plan",
+        npu_module_name("sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_device_plan"),
         SimpleNamespace(DeviceUnionPlanner=make_planner),
     )
     spec = CONTRACT.LimCopySfaSpec(8192, 1, 2176)

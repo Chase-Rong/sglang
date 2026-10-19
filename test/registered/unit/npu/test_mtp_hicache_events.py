@@ -1,5 +1,6 @@
 """CPU stream simulation for target/draft Host writes and real HiCache backup."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import logging
 from functools import cache
@@ -30,7 +31,7 @@ def test_packed_backup_waits_for_both_runtime_dma_writes(monkeypatch, first_read
 
     namespace["NamedTuple"] = NamedTuple
     extract(
-        "hardware_backend/npu/hicache_host_pool.py",
+        "hardware_backend/npu/hisparse/hicache_host_pool.py",
         namespace,
         {
             "MemFabricHiCachePool": {
@@ -54,7 +55,7 @@ def test_packed_backup_waits_for_both_runtime_dma_writes(monkeypatch, first_read
         ),
     )
     spec = importlib.util.spec_from_file_location(
-        "mtp_event_runtime", SRT / "hardware_backend/npu/prefill_overlap.py"
+        npu_module_name("mtp_event_runtime"), npu_source_path(SRT / "hardware_backend/npu/hisparse/prefill_overlap.py")
     )
     runtime_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime_module)

@@ -14,16 +14,16 @@ import test_prefill_layer_transfer as transfer_tests
 @pytest.fixture
 def modules(monkeypatch):
     loaded = transfer_tests.modules.__wrapped__(monkeypatch)
-    name = "sglang.srt.hardware_backend.npu.layer_staging"
+    name = "sglang.srt.hardware_backend.npu.hisparse.layer_staging"
     monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    transfer_tests.load_module(name, transfer_tests.NPU / "layer_staging.py")
+    transfer_tests.load_module(name, transfer_tests.NPU / "hisparse/layer_staging.py")
     return loaded
 
 
 def case(modules):
     protocol, transfer = modules
-    wire = importlib.import_module("sglang.srt.hardware_backend.npu.layer_protocol")
-    staging = importlib.import_module("sglang.srt.hardware_backend.npu.layer_staging")
+    wire = importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_protocol")
+    staging = importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_staging")
     record, sources, destinations = transfer_tests.inputs(*modules)
     record = replace(record, components=tuple(replace(item, bytes_per_page=256) for item in record.components))
     for index, component in enumerate(protocol.KvComponent):

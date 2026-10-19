@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 
 import torch
 
-from sglang.srt.hardware_backend.npu.prefill_offload import (
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
     HostKvPagePool,
     KvPageRange,
     LayerSlotToken,
@@ -434,6 +434,42 @@ class NpuPrefillOffloadRuntime:
             or any(work.token.request_id == request_id
                    for layer in self.layers.values() for work in layer.works)
         )
+
+    def drain_for_shutdown(self):
+        if self.active or self.layers or self.failed:
+            self.failed = True
+            if self.failure_event is None:
+                self.failure_event = self.adapter.record_event()
+            for request in self.requests:
+                request.sender.abort()
+            deadline = time.monotonic() + self.timeout_s
+            for layer in self.layers.values():
+                if layer.publication is not None:
+                    self._wait(
+                        layer.publication.done, deadline,
+                        "Prefill publication has not drained during shutdown",
+                    )
+            operations = [operation for layer in self.layers.values() for operation in layer.transfers]
+            for request in self.requests:
+                operations.extend(request.sender.prefill_layer_operations())
+            self._wait(
+                lambda: all(
+                    operation.state in ("acknowledged", "drained")
+                    or getattr(operation, "transport_drained", False)
+                    for operation in operations
+                ),
+                deadline, "Prefill transport has not drained during shutdown",
+            )
+            for operation in operations:
+                if operation.state not in ("acknowledged", "drained"):
+                    operation.state = "drained"
+            self.drain_failed_batch()
+        if self._publisher is not None:
+            self._publisher.shutdown(wait=True)
+            self._publisher = None
+        for stream in (self.h2d_stream, self.d2h_stream):
+            if stream is not None:
+                stream.synchronize()
 
     def release_request(self, request_id):
         if not self.can_release_request(request_id):

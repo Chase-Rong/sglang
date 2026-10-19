@@ -1,5 +1,6 @@
 """External-plan ABI and per-layer validity, without importing the NPU runtime."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -10,8 +11,8 @@ import pytest
 import torch
 
 
-PATH = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/external_sparse_planner.py"
-SPEC = importlib.util.spec_from_file_location("fsa_external_plan_under_test", PATH)
+PATH = Path(__file__).parents[4] / "python/sglang/srt/hardware_backend/npu/hisparse/external_sparse_planner.py"
+SPEC = importlib.util.spec_from_file_location(npu_module_name("fsa_external_plan_under_test"), npu_source_path(PATH))
 PLANNER = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PLANNER
 SPEC.loader.exec_module(PLANNER)

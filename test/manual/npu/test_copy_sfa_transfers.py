@@ -24,12 +24,12 @@ pytestmark = pytest.mark.skipif(
 def test_copy_sfa_transfer_cases(batch, routes, scenario):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.decode_host_kv import DecodeHostKvBacking
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_attention import (
+    from sglang.srt.hardware_backend.npu.hisparse.decode_host_kv import DecodeHostKvBacking
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_attention import (
         NativeCopySparseAttention,
     )
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeUnionPlanner,
     )
 
