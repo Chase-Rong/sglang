@@ -1675,6 +1675,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved_tokens=reserved_tokens,
         )
 
+    def _uses_decode_cache_eviction(self) -> bool:
+        # NPU Host offload retains HiCache ownership without enabling generic
+        # Decode prefix reuse (which is not supported for every Mamba model).
+        memory = get_memory()
+        return (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            or (
+                _is_npu
+                and memory.enable_hisparse
+                and not memory.disable_radix_cache
+                and memory.enable_hierarchical_cache
+            )
+        )
+
     def _allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
@@ -1701,13 +1715,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 available_size = logical_allocator.available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self._uses_decode_cache_eviction():
                 available_size += self._radix_full_evictable()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self._uses_decode_cache_eviction():
                 available_size += self._radix_full_evictable()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
@@ -1854,7 +1868,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
-            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            self._uses_decode_cache_eviction()
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
@@ -2435,6 +2449,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         publish_received_host_kv,
                     )
 
+                    if self.scheduler.enable_overlap:
+                        # Publication uses the same HCCL group as the model.
+                        # Order it after any in-flight forward graph before
+                        # enqueueing the shared-Host broadcast on this stream.
+                        self.scheduler.schedule_stream.wait_stream(
+                            self.scheduler.forward_stream
+                        )
                     publish_received_host_kv(layer_pool)
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
@@ -2797,7 +2818,9 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
+        # Backup completion unlocks cached pages even when Decode prefix reuse
+        # is disabled (e.g. NPU HiSparse with a Mamba model).
+        if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

@@ -240,6 +240,12 @@ class NpuPrefillOffloadRuntime:
         self._prefetch_next_layer(layer_id)
 
     def _prefetch_next_layer(self, layer_id):
+        # Shared bindings perform a CPU collective. Publication/ACK readiness
+        # below is rank-local, so opportunistic binding can strand one rank in
+        # that collective while another continues into model HCCL operations.
+        # Keep shared bindings at the common demand boundary instead.
+        if getattr(self.adapter.host_pool, "shared_group", None) is not None:
+            return
         next_layer = layer_id + 1
         if (
             self.h2d_stream is None
