@@ -218,6 +218,7 @@ class NpuPrefillOffloadRuntime:
                         sender,
                     )
                 )
+            self._validate_batch_identity(prepared)
         except BaseException:
             for allocation in newly_allocated:
                 self.host_pages.release(allocation)
@@ -231,6 +232,31 @@ class NpuPrefillOffloadRuntime:
                 self.h2d_stream = torch.npu.Stream(device=self.pool.device)
                 self.d2h_stream = torch.npu.Stream(device=self.pool.device)
             self.h2d_stream.wait_stream(torch.npu.current_stream())
+
+    def _validate_batch_identity(self, requests):
+        """Validate shared ownership before rank-local asynchronous prefetch."""
+        shared_group = getattr(self.adapter.host_pool, "shared_group", None)
+        if shared_group is None:
+            return
+        shared_group.validate_identity((
+            "prefill_batch",
+            self.batch_id + 1,
+            self.pool.start_layer,
+            self.pool.layer_num,
+            self.pool.prefill_layer_slots,
+            self.pool.page_size,
+            tuple(
+                (
+                    request.allocation.request_id,
+                    request.allocation.generation,
+                    tuple(request.allocation.page_ids),
+                    request.prefix_length,
+                    request.sequence_length,
+                    request.source_pages,
+                )
+                for request in requests
+            ),
+        ))
 
     def prepare_layer(self, layer_id):
         self._prepare_layer(layer_id)

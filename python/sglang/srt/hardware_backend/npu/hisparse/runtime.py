@@ -163,6 +163,14 @@ class NpuHiSparseCoordinator:
         req.hisparse_staging = False
 
     def request_finished(self, req) -> None:
+        from sglang.srt.runtime_context import get_disagg
+
+        disagg = get_disagg()
+        if (
+            disagg.disaggregation_mode == "decode"
+            and not disagg.disaggregation_decode_enable_radix_cache
+        ):
+            req.skip_radix_cache_insert = True
         self._retire_request(req)
 
     def retract_req(self, req) -> None:
