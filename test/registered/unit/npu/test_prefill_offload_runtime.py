@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,6 +398,103 @@ def test_layer_access_after_attention_completion_is_rejected(modules):
     with pytest.raises(RuntimeError, match="after attention"):
         pool.get_index_k_buffer(0)
     runtime.finish_batch()
+
+
+def test_rank_local_prefetch_does_not_require_collective_participation(
+    modules, monkeypatch
+):
+    identity_barrier = threading.Barrier(2, timeout=2)
+    compute_barrier = threading.Barrier(2, timeout=2)
+    publication_gate = threading.Event()
+    publication_started = threading.Event()
+    identities = [[], []]
+    prefetched = [None, None]
+
+    def writer_publish(sender, work, binding, ready):
+        publication_started.set()
+        assert publication_gate.wait(5)
+        return [SimpleNamespace(state="acknowledged")]
+
+    runtimes = [
+        make_runtime(modules, publish=writer_publish)[0],
+        make_runtime(modules)[0],
+    ]
+    stream = SimpleNamespace(wait_event=lambda event: None)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            stream=lambda stream: contextlib.nullcontext(),
+            current_stream=lambda: stream,
+            Event=lambda: SimpleNamespace(
+                record=lambda stream: None, query=lambda: True
+            ),
+        ),
+        raising=False,
+    )
+
+    def run_rank(rank):
+        runtime = runtimes[rank]
+
+        def validate_identity(identity):
+            identities[rank].append(identity)
+            identity_barrier.wait()
+            assert identities[0][-1] == identities[1][-1]
+            identity_barrier.wait()
+
+        runtime.adapter.host_pool.shared_group = SimpleNamespace(
+            validate_identity=validate_identity
+        )
+        runtime.h2d_stream = stream
+        runtime.timeout_s = 5
+        try:
+            runtime.begin_batch(make_batch(2, 0, request_count=1))
+            runtime.prepare_layer(0)
+            runtime.finish_layer(0)
+            if rank == 0:
+                assert publication_started.wait(2)
+            else:
+                runtime.layers[0].publication.result(timeout=2)
+            compute_barrier.wait()
+            runtime.prepare_layer(1)
+            prefetched[rank] = 2 in runtime.layers
+            compute_barrier.wait()
+            publication_gate.set()
+            runtime.finish_layer(1)
+            for layer_id in (2, 3):
+                runtime.prepare_layer(layer_id)
+                runtime.finish_layer(layer_id)
+            runtime.finish_batch()
+        finally:
+            publication_gate.set()
+            if runtime._publisher is not None:
+                runtime._publisher.shutdown(wait=True)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(run_rank, rank) for rank in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+    assert prefetched == [False, True]
+    assert len(identities[0]) == len(identities[1]) == 1
+    assert all(not runtime.layers for runtime in runtimes)
+
+
+def test_shared_batch_identity_failure_rolls_back_before_layer_work(modules):
+    runtime, pool, host = make_runtime(modules)
+
+    def reject_identity(identity):
+        raise ValueError("shared Host ranks disagree")
+
+    host.shared_group = SimpleNamespace(validate_identity=reject_identity)
+    with pytest.raises(ValueError, match="ranks disagree"):
+        runtime.begin_batch(make_batch(2, 0))
+    assert not runtime.active
+    assert not runtime.layers
+    assert not runtime.adapter.bindings
+    assert runtime.batch_id == 0
+    for request_id in ("req-0", "req-1"):
+        with pytest.raises(KeyError):
+            runtime.host_pages.allocation(request_id)
 
 
 def test_prefill_memory_budget_counts_physical_device_layers_and_all_host_layers(

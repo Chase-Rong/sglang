@@ -232,7 +232,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         layer_pool = getattr(args, "npu_layer_receive_pool", None)
         staging_bytes = layer_staging_bytes(
             envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
-            role=disaggregation_mode,
+            role=disaggregation_mode.value,
             host_offload=layer_pool is not None,
         )
         if staging_bytes:

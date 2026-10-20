@@ -5,11 +5,13 @@ import dataclasses
 import importlib.util
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from http import HTTPStatus
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -174,6 +176,106 @@ def test_manager_keeps_target_draft_and_state_registration(native, pd, receive_i
         total_kv_layers=4,
         req_to_token_pool=queue.req_to_token_pool,
     )
+
+
+@pytest.mark.parametrize("configured", [0, 4096])
+@pytest.mark.parametrize("host_offload", [False, True])
+def test_decode_manager_creates_layer_staging_with_actual_service_enum(
+    monkeypatch, configured, host_offload
+):
+    service_source = SRT / "disaggregation/utils.py"
+    service_tree = ast.parse(service_source.read_text(encoding="utf-8"))
+    service_class = next(
+        node
+        for node in service_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DisaggregationMode"
+    )
+    service_namespace = {"Enum": Enum}
+    exec(
+        compile(
+            ast.Module(body=[service_class], type_ignores=[]),
+            str(service_source),
+            "exec",
+        ),
+        service_namespace,
+    )
+    service = service_namespace["DisaggregationMode"]
+    assert isinstance(service.DECODE, Enum)
+    config_name = "sglang.srt.hardware_backend.npu.hisparse.offload_config"
+    config_spec = importlib.util.spec_from_file_location(
+        config_name, SRT / "hardware_backend/npu/hisparse/offload_config.py"
+    )
+    config = importlib.util.module_from_spec(config_spec)
+    monkeypatch.setitem(sys.modules, config_name, config)
+    config_spec.loader.exec_module(config)
+    window = SimpleNamespace(address=500, window_bytes=configured or 64 * 1024 * 1024)
+    create_window = Mock(return_value=window)
+    staging_name = "sglang.srt.hardware_backend.npu.hisparse.layer_staging"
+    staging = ModuleType(staging_name)
+    staging.create_npu_layer_staging = create_window
+    monkeypatch.setitem(sys.modules, staging_name, staging)
+
+    class CommonManager:
+        def __init__(self, args, disaggregation_mode, server_args, is_mla_backend):
+            self.kv_args = args
+            self.disaggregation_mode = disaggregation_mode
+
+    source = SRT / "disaggregation/mooncake/conn.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MooncakeKVManager"
+    )
+    manager.bases = [ast.Name(id="CommonManager", ctx=ast.Load())]
+    manager.body = [
+        node
+        for node in manager.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    namespace = dict(
+        __name__=__name__,
+        CommonManager=CommonManager,
+        threading=threading,
+        DisaggregationMode=service,
+        envs=SimpleNamespace(
+            SGLANG_NPU_LAYER_STAGING_BYTES=SimpleNamespace(get=lambda: configured),
+            SGLANG_DISAGG_STAGING_BUFFER=SimpleNamespace(get=lambda: False),
+        ),
+        get_observability=lambda: SimpleNamespace(enable_trace=False),
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            manager,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    manager_class = namespace["MooncakeKVManager"]
+    manager_class.init_engine = Mock()
+    manager_class.register_buffer_to_engine = Mock()
+    manager_class.start_decode_thread = Mock()
+    region = SimpleNamespace(host_ptr=100, nbytes=64)
+    backing = SimpleNamespace(pool=SimpleNamespace(device_id=4), regions=[[region]])
+    pool = SimpleNamespace(host_backings=(backing,)) if host_offload else None
+    actual = manager_class(
+        SimpleNamespace(npu_layer_receive_pool=pool),
+        service.DECODE,
+        SimpleNamespace(),
+        True,
+    )
+    if host_offload:
+        create_window.assert_called_once_with(configured or 64 * 1024 * 1024, 4)
+        assert actual._layer_staging is window
+        assert actual._layer_staged_host_regions == {(100, 64)}
+    else:
+        create_window.assert_not_called()
+        assert actual._layer_staging is None
+    manager_class.register_buffer_to_engine.assert_called_once()
+    manager_class.start_decode_thread.assert_called_once()
 
 
 def prefix_queue(module):

@@ -111,12 +111,6 @@ class NpuPrefillOffloadAdapter:
         key = (work.token.request_id, work.token.generation, work.token.logical_layer)
         if key in self.bindings:
             raise ValueError("layer binding already exists")
-        shared_group = getattr(self.host_pool, "shared_group", None)
-        if shared_group is not None:
-            shared_group.validate_identity((
-                key, work.valid_range.start_token, work.valid_range.end_token,
-                tuple(work.host_allocation.page_ids), source_page_ids,
-            ))
         tensors = [(KvComponent.LATENT_K, latent_k), (KvComponent.ROPE_K, rope_k)]
         if indexer_k is not None:
             tensors.append((KvComponent.INDEXER_K, indexer_k))

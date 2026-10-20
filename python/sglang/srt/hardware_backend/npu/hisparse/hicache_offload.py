@@ -322,6 +322,13 @@ def get_offload_backing(kv_pool):
 
 
 def publish_received_host_kv(layer_pool):
+    """Record local readiness after the TP receive-success consensus.
+
+    Staging ACKs already wait for Host writes and receiver visibility, and
+    the scheduler MIN-reduces lease readiness across TP before calling here.
+    Another HCCL broadcast on the scheduling stream can interleave with
+    model collectives replayed on the forward stream.
+    """
     backings = getattr(layer_pool, "host_backings", None)
     if backings is None:
         pool = getattr(layer_pool, "full_kv_pool", layer_pool)
@@ -334,9 +341,6 @@ def publish_received_host_kv(layer_pool):
         if id(binding) in seen:
             continue
         seen.add(id(binding))
-        shared = getattr(backing.pool, "shared_group", None)
-        if shared is not None:
-            shared.publish_write()
         event = torch.npu.Event()
         event.record(torch.npu.current_stream())
         binding.ready_event = event

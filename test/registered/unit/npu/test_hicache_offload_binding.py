@@ -105,7 +105,59 @@ def test_pd_publication_runs_once_for_packed_target_and_draft(bound):
         page_binding=bound.binding, pool=SimpleNamespace(shared_group=shared)
     )
     publish_received_host_kv(SimpleNamespace(host_backings=(backing, backing)))
-    assert calls == ["publish"]
+    assert calls == []
+    assert len(bound.device.events) == 1
+    assert bound.binding.ready_event is bound.device.events[-1]
+
+
+@pytest.mark.parametrize("waiting", ["transfer", "restore"])
+def test_pd_publication_waits_for_tp_receive_and_restore_readiness(bound, waiting):
+    from test_hisparse_pd_dispatch import decode_definitions
+
+    module = decode_definitions()
+    queue = module.DecodeTransferQueue()
+    polls = SimpleNamespace(
+        Failed="failed", Success="success", Bootstrapping="bootstrap",
+        WaitingForInput="waiting", Transferring="transferring",
+    )
+    queue.pop_transferred.__globals__.update(
+        KVPoll=polls,
+        HiCacheRestoreResult=SimpleNamespace(FAILED="failed", PENDING="pending"),
+    )
+    calls = []
+    shared = SimpleNamespace(publish_write=lambda: calls.append("broadcast"))
+    backing = SimpleNamespace(
+        page_binding=bound.binding, pool=SimpleNamespace(shared_group=shared)
+    )
+    request = SimpleNamespace(finished_reason=None, bootstrap_room=5)
+    entry = SimpleNamespace(
+        req=request,
+        kv_receiver=SimpleNamespace(kv_mgr=SimpleNamespace(
+            kv_args=SimpleNamespace(
+                npu_layer_receive_pool=SimpleNamespace(host_backings=(backing,))
+            )
+        )),
+        hicache_restore_status="pending" if waiting == "restore" else "done",
+        metadata_buffer_index=0,
+    )
+    queue.queue = [entry]
+    queue.scheduler = SimpleNamespace(enable_decode_hicache=waiting == "restore")
+    queue._process_hicache_local_restores = lambda entries: None
+    queue.enable_staging = False
+    states = [polls.Transferring if waiting == "transfer" else polls.Success]
+    queue._poll_with_metadata_gate = lambda: states
+    queue._commit_transfer_to_req = lambda entry: calls.append("commit")
+    queue.metadata_buffers = SimpleNamespace(bootstrap_room=[5])
+    queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+        free=lambda index: calls.append("free metadata")
+    )
+    assert queue.pop_transferred() == []
+    assert not bound.device.events
+    assert not calls
+    states[0] = polls.Success
+    entry.hicache_restore_status = "done"
+    assert queue.pop_transferred() == [request]
+    assert calls == ["commit", "free metadata"]
     assert bound.binding.ready_event is bound.device.events[-1]
 
 

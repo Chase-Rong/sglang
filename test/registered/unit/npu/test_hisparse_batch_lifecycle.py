@@ -98,6 +98,53 @@ def test_real_batch_retract_readmit_finish_updates_generation(framework, monkeyp
     assert framework.pool.req_generation[slot] == initial + 3
 
 
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_pd_completion_recycles_capacity_unless_prefix_cache_is_enabled(
+    framework, cache_enabled
+):
+    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.common import release_kv_cache
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.runtime_context import get_context
+
+    allocator = TokenToKVPoolAllocator(
+        size=16, dtype=torch.bfloat16, device="cpu", kvcache=None, need_sort=False
+    )
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=framework.pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    with get_context().override_server_args(
+        disaggregation_mode="decode",
+        disaggregation_decode_enable_radix_cache=cache_enabled,
+    ):
+        for request_index in range(1 if cache_enabled else 3):
+            request = framework.schedule.Req(
+                f"pd-{request_index}",
+                "",
+                array("q", range(10)),
+                framework.params(max_new_tokens=1),
+            )
+            assert framework.pool.alloc([request]) is not None
+            rows = allocator.alloc(10)
+            assert rows is not None
+            framework.pool.write((request.kv.req_pool_idx, slice(0, 10)), rows)
+            request.kv.kv_committed_len = request.kv.kv_allocated_len = 10
+            request.kv.cache_protected_len = 0
+            framework.coordinator.request_finished(request)
+            release_kv_cache(request, cache)
+            assert request.kv.req_pool_idx is None
+            assert allocator.available_size() == (6 if cache_enabled else 16)
+            assert cache.evictable_size() == (10 if cache_enabled else 0)
+
+
 @pytest.mark.parametrize("inherited", [True, False])
 def test_real_batch_merge_and_snapshot_preserve_coordinator(framework, inherited):
     coordinator = framework.coordinator

@@ -18,6 +18,9 @@ RUNTIME = ROOT / "python/sglang/srt/hardware_backend/npu/hisparse/runtime.py"
 
 @pytest.fixture
 def runtime_module(monkeypatch):
+    context = types.ModuleType("sglang.srt.runtime_context")
+    context.get_disagg = lambda: SimpleNamespace(disaggregation_mode="null")
+    monkeypatch.setitem(sys.modules, context.__name__, context)
     qualified = "sglang.srt.hardware_backend.npu.hisparse.runtime"
     spec = importlib.util.spec_from_file_location(qualified, RUNTIME)
     module = importlib.util.module_from_spec(spec)
@@ -249,6 +252,32 @@ def test_retracted_request_can_retire_new_allocation(runtime_module, runner):
     assert runner.req_to_token_pool.req_generation[1] == 10
 
 
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+@pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("already_skipped", [False, True])
+def test_finished_cache_policy_matches_pd_admission(
+    runtime_module, runner, monkeypatch, role, cache_enabled, already_skipped
+):
+    context = sys.modules["sglang.srt.runtime_context"]
+    monkeypatch.setattr(
+        context,
+        "get_disagg",
+        lambda: SimpleNamespace(
+            disaggregation_mode=role,
+            disaggregation_decode_enable_radix_cache=cache_enabled,
+        ),
+    )
+    coordinator = runtime_module.NpuHiSparseCoordinator(runner)
+    request = Request()
+    request.skip_radix_cache_insert = already_skipped
+    coordinator.request_finished(request)
+    assert request.skip_radix_cache_insert == (
+        already_skipped or role == "decode" and not cache_enabled
+    )
+    runner.token_to_kv_pool_allocator.free.assert_not_called()
+    runner.token_to_kv_pool.decode_host_backing.hicache_pool.free.assert_not_called()
+
+
 def test_old_callback_after_pool_reset_is_ignored(runtime_module, runner):
     coordinator = runtime_module.NpuHiSparseCoordinator(runner)
     request = Request()
@@ -340,6 +369,7 @@ def test_real_hicache_backing_survives_finish_restore_and_last_cache_release(
     )
     context = types.ModuleType("sglang.srt.runtime_context")
     context.get_memory = lambda: SimpleNamespace(enable_hisparse=True)
+    context.get_disagg = lambda: SimpleNamespace(disaggregation_mode="null")
     context.get_platform = lambda: SimpleNamespace(is_npu=True)
     context.get_parallel = lambda: SimpleNamespace(enable_dp_attention=False)
     monkeypatch.setitem(sys.modules, context.__name__, context)
