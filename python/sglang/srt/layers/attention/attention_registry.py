@@ -140,9 +140,17 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
+    from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
+
+    if is_deepseek_dsa(runner.model_config.hf_config):
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            AscendDSAAttnBackend,
+        )
+
+        return AscendDSAAttnBackend(runner)
 
     return AscendAttnBackend(runner)
 
@@ -237,7 +245,6 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
-
     major, minor = get_device_capability()
     if not _is_musa:
         assert (major == 8 and not runner.use_mla_backend) or major == 9, (
@@ -398,6 +405,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend as CommunityHybridLinearAttnBackend,
+        )
         from sglang.srt.layers.attention.linear.kda_backend import (
             KDAAttnBackend,
             flashinfer_kda_prefill_default,
@@ -416,7 +426,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-                HybridLinearAttnBackend,
                 Mamba2AttnBackend,
             )
             from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -428,6 +437,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
+
+            HybridLinearAttnBackend = CommunityHybridLinearAttnBackend
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -537,6 +548,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
             linear_attn_backend = KDAAttnBackend(runner)
+            # KDA uses the community target-verify kernels and their per-step
+            # SSM/conv intermediate caches on every device. In particular, it
+            # must not inherit the Ascend GDN wrapper's expanded-window rollback.
+            hybrid_backend_cls = CommunityHybridLinearAttnBackend
+            logger.info("Using community hybrid linear attention backend for KDA.")
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

@@ -301,6 +301,20 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.deepep_utils import (
+                alltoall_buffer_kwargs,
+            )
+
+            buffer_kwargs.update(
+                alltoall_buffer_kwargs(
+                    Buffer,
+                    enabled=envs.SGLANG_USE_NPU_DEEPEP_ALLTOALL.get(),
+                    normal_enabled=deepep_mode.enable_normal(),
+                    use_zbal=_use_zbal,
+                    deep_use_mode=os.getenv("DEEP_USE_MODE"),
+                )
+            )
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
 
@@ -701,7 +715,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:

@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSitu,
     NPUSituMXFP8Quant,
     NPUSwiglu,
+    NPUSwigluClamp,
     NPUSwigluDeepEPKernel,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
@@ -21,10 +22,37 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUFp8MoEMethod,
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
+)
+from sglang.srt.layers.moe.moe_runner.base import (
+    MoeQuantInfo,
+    MoeRunnerConfig,
+    MoeRunnerCore,
+    RunnerInput,
+    RunnerOutput,
+    register_post_permute,
+    register_pre_permute,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
+
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
 )
 
 
@@ -53,34 +81,6 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     if isinstance(kernel, NPUMXFP8MoEMethod):
         return True
     return kernel.use_fused_gmm1
-
-
-from sglang.srt.layers.moe.moe_runner.base import (
-    MoeQuantInfo,
-    MoeRunnerConfig,
-    MoeRunnerCore,
-    RunnerInput,
-    RunnerOutput,
-    register_post_permute,
-    register_pre_permute,
-)
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPLLCombineInput,
-        DeepEPLLDispatchOutput,
-        DeepEPNormalCombineInput,
-        DeepEPNormalDispatchOutput,
-    )
-
-from sglang.srt.layers.moe.utils import (
-    MoeRunnerBackend,
-    get_moe_a2a_backend,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +138,16 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif (
+            isinstance(kernel, NPUFp8MoEMethod)
+            and config.activation == "silu"
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            # GLM's swiglu_limit clamps gate BEFORE SiLU and up on both sides.
+            # gemm1_clamp_limit and the OAI/Step activation formulas are separate
+            # contracts. GMM2 performs FP8 block quantization after this step.
+            self.activation = NPUSwigluClamp(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(

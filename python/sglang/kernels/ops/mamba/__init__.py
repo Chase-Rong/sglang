@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -154,3 +159,14 @@ for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
         )
     )
 del _fn
+
+# Ascend implementations are inventoried lazily; importing this group does not
+# import torch_npu or compile Triton kernels.
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_target_verify_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.causal_conv1d_target_verify:causal_conv1d_target_verify_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)

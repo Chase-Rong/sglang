@@ -199,6 +199,19 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_npu_a5() -> bool:
+    """Whether the visible Ascend device is from the A5 (950) family.
+
+    Do not infer this from FP8 dtype/operator availability: A3 installations
+    can expose the same Python APIs without supporting the A5 kernels.
+    """
+    if not is_npu():
+        return False
+    name = torch.npu.get_device_name().replace(" ", "").lower()
+    return name.startswith("ascend950")
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -3962,7 +3975,6 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
-
     try:
         if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
@@ -4143,7 +4155,6 @@ def require_gathered_buffer():
 
 
 def require_mlp_sync():
-
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
