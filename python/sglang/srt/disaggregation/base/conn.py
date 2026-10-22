@@ -134,6 +134,9 @@ class BaseKVManager(ABC):
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
 
+    def requires_strict_abort_drain(self, bootstrap_room: int) -> bool:
+        return False
+
     def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
         """Whether the checksum sent by the prefill at bootstrap_addr is comparable
         with one over this rank's local KV. A backend returns False for a peer

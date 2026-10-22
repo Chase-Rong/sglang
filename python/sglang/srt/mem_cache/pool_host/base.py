@@ -33,6 +33,9 @@ _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 _host_memory_budget: ContextVar[Optional[int]] = ContextVar(
     "hicache_host_memory_budget", default=None
 )
+_host_memory_account: ContextVar[object] = ContextVar(
+    "hicache_host_memory_account", default=None
+)
 
 
 def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
@@ -79,6 +82,58 @@ def ranks_per_host() -> int:
     if launch_world_size == 1:
         return 1
     return max(launch_world_size // get_parallel().nnodes, 1)
+
+
+class HostMemoryAllocationAccount:
+    """One rank's share of physical Host reserves and its private side pools."""
+
+    def __init__(self, budget_bytes):
+        self.budget_bytes = budget_bytes
+        self.remaining_bytes = budget_bytes
+        self.reservations = {}
+
+    def check(self, owner, requested_bytes):
+        previous = self.reservations.get(owner)
+        if previous is not None:
+            if previous != requested_bytes:
+                raise ValueError("Host physical owner changed its reserve size")
+            return
+        if requested_bytes > self.remaining_bytes:
+            raise MemoryError(
+                f"Host allocation needs {requested_bytes} bytes; "
+                f"{self.remaining_bytes} remain after cgroup/OS/rank accounting"
+            )
+
+    def charge(self, owner, requested_bytes):
+        self.check(owner, requested_bytes)
+        if owner not in self.reservations:
+            self.reservations[owner] = requested_bytes
+            self.remaining_bytes -= requested_bytes
+
+    def refund(self, owner):
+        self.remaining_bytes += self.reservations.pop(owner, 0)
+
+
+@contextmanager
+def ensure_host_memory_budget_scope(account=None):
+    """Keep an outer allowance, or book all new side pools against one snapshot."""
+    if account is not None and _host_memory_account.get() is account:
+        yield
+    elif account is not None:
+        token = _host_memory_account.set(account)
+        try:
+            with host_memory_budget_scope(account.remaining_bytes):
+                try:
+                    yield
+                finally:
+                    account.remaining_bytes = _host_memory_budget.get()
+        finally:
+            _host_memory_account.reset(token)
+    elif _host_memory_budget.get() is not None:
+        yield
+    else:
+        with host_memory_budget_scope(host_memory_budget_bytes()):
+            yield
 
 
 def host_memory_budget_bytes(

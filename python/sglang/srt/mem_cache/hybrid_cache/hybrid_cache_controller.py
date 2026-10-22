@@ -513,6 +513,28 @@ class HybridCacheController(BaseHiCacheController):
         *,
         reclaim: Optional[Callable[[int], Any]] = None,
     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        acquire = getattr(anchor_pool, "acquire_device_pages", None)
+        if callable(acquire):
+            host_indices = acquire(device_indices)
+            if host_indices is None:
+                return None
+            originals = self._transfer_snapshot(extra_pools)
+            try:
+                transfers = self.mem_pool_host.resolve_host_transfers(
+                    extra_pools,
+                    primary_device_indices=device_indices,
+                    primary_host_indices=host_indices,
+                )
+            except Exception:
+                self._rollback_transfers(originals, to_host=True)
+                self.mem_pool_host.free(host_indices)
+                raise
+            if transfers is None and extra_pools:
+                self._rollback_transfers(originals, to_host=True)
+                self.mem_pool_host.free(host_indices)
+                return None
+            return host_indices, transfers
         if self._uses_shared_host_domain(extra_pools):
             allocation = self.allocate_shared_host_transfers(
                 device_indices, extra_pools
@@ -550,11 +572,13 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
     ) -> Optional[torch.Tensor]:
+        originals = self._transfer_snapshot(extra_pools)
         allocation = self.allocate_host_transfers(device_indices, extra_pools)
         if allocation is None:
             return None
         host_indices, pool_transfers = allocation
 
+        previous_operations = list(self.write_queue)
         self.write_queue.append(
             CacheOperation(
                 host_indices,
@@ -565,7 +589,14 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         if flush:
-            self.start_writing()
+            try:
+                self.start_writing()
+            except Exception:
+                self.l2_transfer_engine.device_to_host_stream.synchronize()
+                self.write_queue[:] = previous_operations
+                self._rollback_transfers(originals, to_host=True)
+                self.mem_pool_host.free(host_indices)
+                raise
         return host_indices
 
     def _uses_shared_host_domain(
@@ -949,7 +980,12 @@ class HybridCacheController(BaseHiCacheController):
         excluded from the per-pool token counts.
         """
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        anchor = self.mem_pool_host.anchor_entry.host_pool
+        num_bytes = (
+            0
+            if callable(getattr(anchor, "acquire_device_pages", None))
+            else kv_tokens * anchor.size_per_token
+        )
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -975,6 +1011,7 @@ class HybridCacheController(BaseHiCacheController):
         *,
         device_indices: Optional[torch.Tensor] = None,
         anchor_indices: Optional[torch.Tensor] = None,
+        prepare_device_indices: Optional[Callable[[torch.Tensor], Any]] = None,
     ) -> Optional[torch.Tensor]:
         """Queue an H2D of ``host_indices`` into freshly allocated FULL rows,
         or into caller-owned ``device_indices`` (kept on failure); side pools
@@ -993,18 +1030,38 @@ class HybridCacheController(BaseHiCacheController):
         elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+            if callable(getattr(anchor_pool, "acquire_device_pages", None)):
+                restore = getattr(full_allocator, "alloc_for_host_restore", None)
+                if not callable(restore):
+                    raise RuntimeError(
+                        "Adopted HiCache backing requires "
+                        "alloc_for_host_restore(host_indices) on the FULL allocator"
+                    )
+                device_indices = restore(host_indices)
+            else:
+                device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
 
-        pool_transfers = self._resolve_device_transfers(
-            extra_pools,
-            kv_device_indices=(
-                anchor_indices if anchor_indices is not None else device_indices
-            ),
-            kv_host_indices=host_indices,
-        )
+        originals = self._transfer_snapshot(extra_pools)
+        try:
+            if prepare_device_indices is not None:
+                prepare_device_indices(device_indices)
+            pool_transfers = self._resolve_device_transfers(
+                extra_pools,
+                kv_device_indices=(
+                    anchor_indices if anchor_indices is not None else device_indices
+                ),
+                kv_host_indices=host_indices,
+            )
+        except Exception:
+            self._rollback_transfers(originals, to_host=False)
+            if need_load_kv and not caller_owned:
+                full_allocator.free(device_indices)
+            raise
         if pool_transfers is None and extra_pools:
+            self._rollback_transfers(originals, to_host=False)
             if need_load_kv and not caller_owned:
                 full_allocator.free(device_indices)
             return None
@@ -1019,6 +1076,31 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return device_indices
+
+    @staticmethod
+    def _transfer_snapshot(transfers):
+        return [
+            (transfer, transfer.host_indices, transfer.device_indices)
+            for transfer in transfers or []
+        ]
+
+    def _rollback_transfers(self, originals, *, to_host):
+        for transfer, host_indices, device_indices in reversed(originals):
+            original = host_indices if to_host else device_indices
+            current = transfer.host_indices if to_host else transfer.device_indices
+            if (
+                transfer.indices_from_pool is None
+                and original is None
+                and current is not None
+            ):
+                if to_host:
+                    self.mem_pool_host.free(current, pool=transfer.name)
+                else:
+                    entry = self.mem_pool_host.entry_map[transfer.name]
+                    free = entry.device_free_fn or entry.device_pool.free
+                    free(current)
+            transfer.host_indices = host_indices
+            transfer.device_indices = device_indices
 
     def prefetch(
         self,

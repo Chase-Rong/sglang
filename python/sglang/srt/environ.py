@@ -1048,6 +1048,19 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION = EnvBool(False)
+    SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE = EnvStr("fused")
+    SGLANG_NPU_FSA_RESIDENT_CAPACITY = EnvInt(4096)
+    SGLANG_NPU_DSA_OFFLOAD_BACKEND = EnvStr("lim_copy_sfa")
+    SGLANG_NPU_SHARED_HOST_KV = EnvBool(True)
+    SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD = EnvBool(False)
+    SGLANG_NPU_LAYER_STAGING_BYTES = EnvInt(0)
+    SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S = EnvFloat(30.0)
+    SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD = EnvBool(False)
+    SGLANG_NPU_PREFILL_LAYER_SLOTS = EnvInt(2)
+    SGLANG_NPU_PREFILL_HOST_KV_BYTES = EnvInt(0)
+    SGLANG_NPU_DECODE_HOST_KV_BYTES = EnvInt(0)
+    SGLANG_NPU_HICACHE_HOST_TOKENS = EnvInt(0)
     # Use the vendor's public normal-mode strategy option for affected NPU
     # DeepEP deployments. ZBAL and low-latency-only buffers are unchanged.
     SGLANG_USE_NPU_DEEPEP_ALLTOALL = EnvBool(False)

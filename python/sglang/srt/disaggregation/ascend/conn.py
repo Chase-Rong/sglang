@@ -155,9 +155,14 @@ class AscendKVManager(MooncakeKVManager):
                         f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
                     )
                 region = (ptr, length)
+                if region in getattr(self, "_layer_staged_host_regions", ()):
+                    continue
                 if region not in seen:
                     seen.add(region)
                     regions.append(region)
+        staging = getattr(self, "_layer_staging", None)
+        if staging is not None:
+            regions.append((staging.address, staging.window_bytes))
         return regions
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -381,6 +386,8 @@ class AscendKVManager(MooncakeKVManager):
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
+            if src_ptr in getattr(self.kv_args, "prefill_layerwise_completed_ptrs", ()):
+                return transfer_blocks
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len

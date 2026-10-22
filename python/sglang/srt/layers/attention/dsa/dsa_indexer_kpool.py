@@ -1987,6 +1987,33 @@ class IndexerKPool(MultiPlatformOp):
             # to continue with read-side computation.
             return None
 
+        backend = get_attn_backend()
+        state = getattr(
+            getattr(backend, "full_attn_backend", backend), "fused_sparse_state", None
+        )
+        if (
+            getattr(state, "backend_name", None) == "lim_copy_sfa"
+            and not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
+                select_offloaded_topk,
+            )
+
+            topk_result = select_offloaded_topk(
+                backend,
+                self,
+                forward_batch,
+                layer_id,
+                query,
+                self._get_logits_head_gate_npu(x),
+                metadata,
+            )
+            if topk_result is None:
+                raise RuntimeError(
+                    "LIM selection requires an initialized attention state"
+                )
+            return topk_result
+
         # Decode prepares weights and pooled page metadata in fused kernels.
         if forward_batch.forward_mode.is_decode_or_idle():
             w_bf16, pool_seqlens, pool_block_tables = (

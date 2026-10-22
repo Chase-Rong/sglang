@@ -2675,6 +2675,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        hisparse_coordinator: Optional[HiSparseCoordinator] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -2700,6 +2701,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            hisparse_coordinator=hisparse_coordinator,
         )
         return batch
 
@@ -3921,6 +3923,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        if self.hisparse_coordinator is None:
+            self.hisparse_coordinator = other.hisparse_coordinator
+        elif (
+            other.hisparse_coordinator is not None
+            and other.hisparse_coordinator is not self.hisparse_coordinator
+        ):
+            raise ValueError(
+                "Cannot merge batches with different HiSparse coordinators"
+            )
         strip_beam_tail(self)
         strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -4013,6 +4024,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            hisparse_coordinator=self.hisparse_coordinator,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,

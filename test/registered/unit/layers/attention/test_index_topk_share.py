@@ -141,6 +141,30 @@ def test_disabled_mtp_iteration_is_passthrough():
     assert batch.spec_info.dsa_topk_indices == "untouched"
 
 
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_draft_sparse_plan_cache_is_scoped_and_restored(seeded, fail):
+    batch = _batch(reuse=False, carried="seed" if seeded else None)
+    previous = {"outer": object()}
+    batch.draft_sparse_plan_cache = previous
+
+    def iteration():
+        with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True):
+            assert batch.draft_sparse_plan_cache == ({} if seeded else None)
+            assert batch.draft_sparse_plan_cache is not previous
+            if fail:
+                raise RuntimeError("draft failed")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="draft failed"):
+            iteration()
+    else:
+        iteration()
+    assert batch.draft_sparse_plan_cache is previous
+    assert batch.spec_info.dsa_topk_indices is None
+    assert not batch.reuse_dsa_topk_indices
+
+
 def test_mtp_iteration_preserves_draft_extend_seed():
     batch = _batch(reuse=False, carried="extend-seed")
 

@@ -8,7 +8,10 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
+from sglang.srt.mem_cache.pool_host.base import (
+    shared_host_layout_domains,
+    uses_shared_host_layout,
+)
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -105,11 +108,17 @@ class L2TransferEngine:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
+        bindings = self._reader_bindings(transfers)
         domains = shared_host_layout_domains(t.host_pool for t in transfers)
         for domain in domains:
             domain.acquire_layout()
         finish_recorded = False
+        pinned = []
         try:
+            for binding, rows in bindings:
+                pin = getattr(binding, "pin_host_rows", None)
+                if callable(pin):
+                    pinned.append((binding, pin(torch.cat(rows))))
             with device_module.stream(stream):
                 # Index preparation can read producer-owned device indices.
                 start_event.wait(stream)
@@ -118,11 +127,15 @@ class L2TransferEngine:
                 yield prepared, completion
                 ack_finish.record()
                 finish_recorded = True
+                for binding, _ in bindings:
+                    binding.record_reader(ack_finish)
                 self._record_stream(transfers + prepared, stream)
         except Exception:
             stream.synchronize()
             raise
         finally:
+            for binding, pages in reversed(pinned):
+                binding.unpin_transfer_pages(pages)
             for domain in reversed(domains):
                 domain.release_layout(
                     ack_finish if finish_recorded else None,
@@ -153,12 +166,27 @@ class L2TransferEngine:
         with self._submission(
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
+            prepared_loads = []
+            for transfer in transfers:
+                prepare = getattr(transfer.host_pool, "prepare_load_to_device", None)
+                prepared_loads.append(
+                    prepare(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        self.io_backend,
+                        is_draft=transfer.is_draft,
+                    )
+                    if callable(prepare)
+                    and not uses_shared_host_layout(transfer.host_pool)
+                    else None
+                )
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):
                 if delay_cycles:
                     torch.cuda._sleep(delay_cycles)
-                for transfer in transfers:
+                for transfer, load_layer in zip(transfers, prepared_loads, strict=True):
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -170,17 +198,38 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                    if load_layer is not None:
+                        load_layer(local_layer_id)
+                    else:
+                        transfer.host_pool.load_to_device_per_layer_physical(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
+
+    @staticmethod
+    def _reader_bindings(transfers):
+        bindings = {}
+        for transfer in transfers:
+            binding = getattr(transfer.host_pool, "binding", None)
+            if binding is None:
+                if callable(getattr(transfer.host_pool, "acquire_device_pages", None)):
+                    raise RuntimeError("Adopted HiCache requires a reader binding")
+                continue
+            if not callable(getattr(binding, "record_reader", None)):
+                raise RuntimeError(
+                    "HiCache binding must implement record_reader(event)"
+                )
+            bindings.setdefault(id(binding), (binding, []))[1].append(
+                transfer.host_indices.detach().to(device="cpu", dtype=torch.int64)
+            )
+        return list(bindings.values())
 
     @staticmethod
     def _start_event(start_event):
@@ -198,6 +247,7 @@ class L2TransferEngine:
         tensors.extend(resolved)
         for indices in tensors:
             if indices is not None and (
-                indices.is_cuda or indices.device.type == "xpu"
+                indices.is_cuda
+                or indices.device.type in ("xpu", "npu", "privateuseone", "privateuse1")
             ):
                 indices.record_stream(stream)

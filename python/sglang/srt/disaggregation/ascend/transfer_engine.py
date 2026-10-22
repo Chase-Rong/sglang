@@ -84,13 +84,58 @@ class AscendTransferEngine(MooncakeTransferEngine):
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
+        if len(ptrs) != len(lengths):
+            raise ValueError("Ascend registration pointer and length counts differ")
+        if getattr(self, "_registration_failed", False):
+            raise RuntimeError("Ascend registration state requires engine restart")
+        registered = getattr(self, "_registered_regions", {})
+        pending = {}
+        for pointer, length in zip(ptrs, lengths):
+            if (
+                type(pointer) is not int
+                or type(length) is not int
+                or min(pointer, length) <= 0
+            ):
+                raise ValueError(
+                    "Ascend registration requires positive pointers and lengths"
+                )
+            previous = pending.get(pointer, registered.get(pointer))
+            if previous is not None and previous != length:
+                raise ValueError(
+                    "Ascend registration changed an existing region length"
+                )
+            if pointer not in registered:
+                pending[pointer] = length
+        if not pending:
+            return 0
         try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+            status = self.engine.batch_register_memory(
+                list(pending), list(pending.values())
+            )
+            if status != 0:
+                raise RuntimeError(f"Ascend memory registration failed: {status}")
         except Exception:
-            # Mark register as failed
-            ret_value = -1
-        if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            self._registration_failed = True
+            for pointer in pending:
+                try:
+                    self.engine.unregister_memory(pointer)
+                except Exception:
+                    logger.exception("Could not roll back Ascend registration")
+            raise
+        registered.update(pending)
+        self._registered_regions = registered
+        return 0
+
+    def batch_deregister(self, ptrs):
+        registered = getattr(self, "_registered_regions", {})
+        for pointer in dict.fromkeys(ptrs):
+            if pointer not in registered:
+                continue
+            status = self.engine.unregister_memory(pointer)
+            if status != 0:
+                raise RuntimeError(f"Ascend memory deregistration failed: {status}")
+            del registered[pointer]
+        return 0
 
     @staticmethod
     def _get_transfer_protocol() -> str:

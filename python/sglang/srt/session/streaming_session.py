@@ -291,8 +291,9 @@ class StreamingSession:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
         start = target
-        if self.cache.page_size > 1:
-            start = ceil_align(start, self.cache.page_size)
+        page_size = self.cache.token_to_kv_pool_allocator.page_size
+        if page_size > 1:
+            start = ceil_align(start, page_size)
         if end <= start:
             return
         self.cache.free_kv_row(kv, [(start, end)])

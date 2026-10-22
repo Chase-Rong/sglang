@@ -86,7 +86,6 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
-from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -407,7 +406,9 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         # HiSparse owns target KV only. Draft KV keeps its logical GPU page
         # space and must not construct a second sparse coordinator.
-        self.enable_hisparse = get_memory().enable_hisparse and not is_draft_worker
+        self.enable_hisparse = get_memory().enable_hisparse and (
+            not is_draft_worker or is_npu()
+        )
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
@@ -484,6 +485,8 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.prefill_offload_adapter = None
+        self.prefill_offload_runtime = None
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
@@ -1016,6 +1019,7 @@ class ModelRunner:
         self.maybe_init_watermark_state()
 
         self.maybe_init_hisparse_coordinator()
+        self.maybe_init_prefill_layerwise_offload()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -1030,34 +1034,20 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import (
-            HiSparseCoordinator,
-            resolve_shared_index_layers,
-        )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.managers.hisparse_factory import create_hisparse_coordinator
 
-        hisparse_cfg = parse_hisparse_config()
-        hisparse_top_k = getattr(
-            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-        )
-        self.hisparse_coordinator = HiSparseCoordinator(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            top_k=hisparse_top_k,
-            device_buffer_size=hisparse_cfg.device_buffer_size,
-            device=self.device,
-            tp_group=get_dp_tp_group().cpu_group,
-            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            swap_in_block_size=hisparse_cfg.swap_in_block_size,
-            shared_index_layers=resolve_shared_index_layers(
-                hf_text_config=self.model_config.hf_text_config,
-            ),
-            num_draft_tokens=(
-                0
-                if self.spec_algorithm.is_none()
-                else get_spec().speculative_num_draft_tokens or 0
-            ),
-        )
+        self.hisparse_coordinator = create_hisparse_coordinator(self)
+
+    def maybe_init_prefill_layerwise_offload(self):
+        initialize = getattr(self.hisparse_coordinator, "initialize_prefill", None)
+        if initialize is not None:
+            initialize()
+
+    def prefill_offload_forward(self, forward_batch):
+        forward = getattr(self.hisparse_coordinator, "prefill_offload_forward", None)
+        if forward is None:
+            return contextlib.nullcontext()
+        return forward(forward_batch)
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
         resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
@@ -1190,6 +1180,11 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
+        runtime = self.prefill_offload_runtime
+        if runtime is not None and not getattr(
+            getattr(runtime, "pool", None), "integrated_offload", False
+        ):
+            capture_decode_cuda_graph = False
         is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
         defer_decode_capture = (
             is_scale_joiner
@@ -1525,7 +1520,9 @@ class ModelRunner:
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa and hisparse settings."""
-        if self.enable_hisparse:
+        if self.enable_hisparse and getattr(
+            getattr(self, "hisparse_coordinator", None), "uses_staging", True
+        ):
             # HiSparse uses the host-backed full pool capacity.
             size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
             if size_full is not None:
@@ -1991,6 +1988,7 @@ class ModelRunner:
         with (
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,
+            self.prefill_offload_forward(forward_batch),
         ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

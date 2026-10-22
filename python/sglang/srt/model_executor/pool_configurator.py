@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -30,6 +31,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_factory import uses_native_hisparse
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -89,6 +91,7 @@ class MemoryPoolConfig:
     # Unified pool only: the profiled byte budget the buffer is sized from,
     # instead of re-summing token counts; None when a user token cap is the budget.
     unified_total_bytes: Optional[int] = None
+    offload_host_memory_plan: Optional[object] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -223,6 +226,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._prefill_budget = None
+        self._decode_budget = None
+        self._decode_device_budget = None
+        self._kvc = kvc
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
@@ -255,8 +262,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+            (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
+            and not kvc.is_draft_worker
+            and self._prefill_budget is None
+            and self._decode_budget is None
+        ):
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             fused_full_entry = kvc.fused_entry_bytes("full")
             if fused_full_entry is not None:
@@ -268,7 +278,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 draft_loc_space_scale = 1
-                if get_memory().enable_hisparse:
+                if uses_native_hisparse():
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                     # The draft pool is direct-indexed by the target allocator's
@@ -333,8 +343,104 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+    def _offload_request_rows(self, tokens):
+        joint = getattr(self._kvc, "_joint_capacity", None)
+        if joint is not None:
+            return joint.requests
+        requested = get_schedule().max_running_requests
+        if requested is None or requested <= 0 or requested % self._kvc.attn_dp_size:
+            raise ValueError(
+                "Offload requires positive max-running-requests divisible by attention DP size"
+            )
+        return max(
+            1,
+            min(
+                requested // self._kvc.attn_dp_size,
+                tokens // max(get_schedule().page_size, 2),
+            ),
+        )
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
+        if (
+            str(kvc.device).split(":")[0] == "npu"
+            and envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get()
+        ):
+            from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
+                budget_from_config,
+            )
+
+            self._decode_budget = budget_from_config(kvc, num_layers)
+            return self._decode_budget.device_bytes_per_token
+        if (
+            str(kvc.device).split(":")[0] == "npu"
+            and envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+        ):
+            from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
+                PrefillKvMemoryBudget,
+            )
+
+            if (
+                str(kvc.device).split(":")[0] != "npu"
+                or not kvc.use_mla_backend
+                or not is_deepseek_dsa(kvc.model_config.hf_config)
+                or get_disagg().disaggregation_mode != "prefill"
+            ):
+                raise ValueError(
+                    "bounded Prefill sizing requires an NPU DSA Prefill service"
+                )
+            if kvc.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError("bounded Prefill sizing requires BF16 or FP16 KV")
+            from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
+                sparse_mtp_draft_layers,
+            )
+
+            model = kvc.model_config
+            draft_layers = sparse_mtp_draft_layers(kvc)
+            element_bytes = torch._utils._element_size(kvc.kv_cache_dtype)
+            latent_bytes = (model.kv_lora_rank + model.qk_rope_head_dim) * element_bytes
+            index_bytes = model.index_head_dim * element_bytes
+            pooled_index = get_dsa_index_kpool(
+                model.hf_config
+            ) > 1 and get_dsa_index_kpool_compress(model.hf_config)
+            physical_slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), num_layers)
+            if draft_layers:
+                physical_slots += min(
+                    envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), draft_layers
+                )
+            active_layers = (
+                sum(
+                    not dsa_layer_skips_topk(model.hf_config, layer)
+                    for layer in _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
+                + draft_layers
+            )
+            tail_bytes = 0
+            if pooled_index:
+                requested = get_schedule().max_running_requests
+                if requested is None:
+                    raise ValueError(
+                        "Offload memory budgeting requires explicit --max-running-requests"
+                    )
+                tail_bytes = (
+                    (requested // kvc.attn_dp_size + 1)
+                    * active_layers
+                    * (
+                        get_dsa_index_kpool(model.hf_config)
+                        + (max_speculative_num_draft_tokens() or 0)
+                    )
+                    * model.index_head_dim
+                    * 4
+                )
+            self._prefill_budget = PrefillKvMemoryBudget(
+                host_bytes_per_token=(num_layers + draft_layers)
+                * (latent_bytes + (0 if pooled_index else index_bytes)),
+                device_bytes_per_token=physical_slots * latent_bytes
+                + (num_layers + draft_layers) * index_bytes,
+                host_bytes=envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
+                device_fixed_bytes=tail_bytes,
+            )
+            return self._prefill_budget.device_bytes_per_token
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
@@ -344,7 +450,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if uses_native_hisparse()
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -443,7 +549,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             full_pool_ratio = 1
-            if get_memory().enable_hisparse:
+            if uses_native_hisparse():
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 full_pool_ratio = parse_hisparse_config().host_to_device_ratio
@@ -553,9 +659,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-        memory_config = get_memory()
         indexer_ratio = 1
-        if memory_config.enable_hisparse:
+        if uses_native_hisparse():
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
@@ -566,7 +671,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or kvc.server_args.enable_hisparse
+            or uses_native_hisparse()
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
@@ -612,6 +717,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._decode_budget is not None:
+            self._decode_device_budget = available_bytes
+            tokens = self._decode_budget.max_tokens(
+                available_bytes, page_size, self._offload_request_rows
+            )
+            if tokens <= 0:
+                raise MemoryError(
+                    "Decode budgets cannot hold selection, planner and an Indexer page"
+                )
+            return MemoryPoolConfig(max_total_num_tokens=tokens)
+        if getattr(self, "_prefill_budget", None) is not None:
+            return MemoryPoolConfig(
+                max_total_num_tokens=self._prefill_budget.max_tokens(
+                    available_bytes, page_size
+                )
+            )
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -625,6 +746,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._decode_budget is not None:
+            self._decode_budget.validate(
+                max_total_num_tokens,
+                self._offload_request_rows(max_total_num_tokens),
+                page_size,
+                self._decode_device_budget,
+            )
+        if getattr(self, "_prefill_budget", None) is not None:
+            self._prefill_budget.validate_host_capacity(max_total_num_tokens, page_size)
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
@@ -1121,7 +1251,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if get_memory().enable_hisparse:
+        if uses_native_hisparse():
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
@@ -1162,7 +1292,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             unified_fp8=self._unified_fp8,
             disaggregation_mode=self.disaggregation_mode,
             pp_size=kvc.pp_size,
-            enable_hisparse=get_memory().enable_hisparse,
+            enable_hisparse=uses_native_hisparse(),
         )
 
         if self.is_speculative:

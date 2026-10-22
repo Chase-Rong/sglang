@@ -195,11 +195,11 @@ class SchedulerPoolStatsObserver:
         return [kv for kv in records if kv.holds_kv]
 
     def session_held_tokens(self) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.token_to_kv_pool_allocator.page_size
         return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
 
     def session_held_swa_tokens(self) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.token_to_kv_pool_allocator.page_size
         return sum(
             kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
         )
@@ -247,6 +247,8 @@ class SchedulerPoolStatsObserver:
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
+            if h is None:
+                return pool_stats
             return dataclasses.replace(
                 pool_stats,
                 is_hisparse=True,
@@ -322,7 +324,9 @@ class SchedulerPoolStatsObserver:
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
         # bug should be fixed so the clamp can go away.
-        if self.enable_hisparse:
+        if self.enable_hisparse and getattr(
+            self.hisparse_coordinator, "uses_staging", True
+        ):
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
         if not full_capacity:

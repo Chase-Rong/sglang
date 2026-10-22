@@ -1083,6 +1083,16 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    entries = _npu_layer_transfer_entries(token_to_kv_pool)
+    if entries is not None:
+        layer_ids = [layer for _, layer in entries]
+        if draft_token_to_kv_pool is None:
+            return layer_ids
+        draft_ids = _draft_entry_layer_ids(
+            pool=draft_token_to_kv_pool, num_entries=num_draft_entries
+        )
+        return layer_ids + _remap_draft_layer_ids(draft_ids, num_hidden_layers)
+
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
@@ -1105,7 +1115,10 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
+    entries = _npu_layer_transfer_entries(pool)
+    if entries is not None:
+        ids = [layer for _, layer in entries]
+    elif isinstance(pool, HybridLinearKVPool):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1208,6 +1221,15 @@ def append_state_component(
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if state_type == StateType.DSA and (
+        getattr(kv_args, "prefill_layerwise_offload", False)
+        or getattr(kv_args, "npu_layer_receive_pool", None) is not None
+    ):
+        pointer_layers = dict(zip(kv_args.kv_data_ptrs, kv_args.kv_layer_ids))
+        if all(pointer in pointer_layers for pointer in data_ptrs):
+            layer_ids = [pointer_layers[pointer] for pointer in data_ptrs]
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
@@ -1403,7 +1425,49 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
+def _npu_layer_transfer_entries(pool):
+    storage = getattr(pool, "full_kv_pool", pool)
+    slots = getattr(storage, "prefill_layer_slots", None)
+    backing = getattr(storage, "decode_host_backing", None)
+    if slots is None and backing is None:
+        return None
+    mapping = getattr(pool, "full_attention_layer_id_mapping", None)
+    layer_ids = (
+        list(mapping)
+        if mapping is not None
+        else list(range(storage.start_layer, storage.start_layer + storage.layer_num))
+    )
+    if len(layer_ids) != storage.layer_num:
+        raise ValueError("NPU PD layer inventory does not match its storage")
+    entries = []
+    for buffers in (storage.k_buffer, storage.v_buffer):
+        for local_layer, layer_id in enumerate(layer_ids):
+            entries.append(
+                (buffers[local_layer % (slots or storage.layer_num)], layer_id)
+            )
+    local_to_wire = dict(
+        zip(
+            range(storage.start_layer, storage.start_layer + storage.layer_num),
+            layer_ids,
+        )
+    )
+    if storage.index_k_buffer is not None:
+        entries.extend(
+            (storage.index_k_buffer[index], local_to_wire[layer])
+            for index, layer in enumerate(storage.indexer_layer_ids)
+        )
+    return entries
+
+
 def get_kv_transfer_buf_infos(pool):
+    entries = _npu_layer_transfer_entries(pool)
+    if entries is not None:
+        buffers = [buffer for buffer, _ in entries]
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes for buffer in buffers],
+        )
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(pool, MiniMaxSparseKVPool):

@@ -77,6 +77,37 @@ def set_default_server_args(args: "ServerArgs"):
 
     cfg = resolving_view(args)
 
+    from sglang.srt.hardware_backend.npu.hisparse.config import (
+        resolve_npu_hisparse_config,
+    )
+
+    hisparse = resolve_npu_hisparse_config(cfg)
+    if hisparse is not None:
+        if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            raise ValueError(
+                "NPU HiSparse cannot share ownership with sparse KV offload"
+            )
+        hisparse.apply_environment()
+        declare_resolution(args, "npu_hisparse", enable_hisparse=True)
+        if hisparse.role == "prefill":
+            declare_resolution(args, "npu_hisparse_prefill", disable_radix_cache=True)
+        else:
+            if (
+                cfg.enable_unified_cache_external_linker
+                or cfg.hicache_storage_backend is not None
+            ):
+                raise ValueError("NPU HiSparse requires the HiCache Host tier")
+            declare_resolution(
+                args,
+                "npu_hisparse_hicache",
+                enable_hierarchical_cache=True,
+                disable_radix_cache=False,
+                hicache_write_policy="write_through",
+                hicache_host_memory_mode="cache",
+                hicache_io_backend="kernel_ascend",
+                hicache_mem_layout="page_first_kv_split",
+            )
+
     # NPU only works with "ascend" attention backend for now
     declare_resolution(
         args,

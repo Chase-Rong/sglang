@@ -171,6 +171,8 @@ class HiCacheRestoreGatedKVReceiver:
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
+        if self.decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
+            return KVPoll.Failed
         if poll == KVPoll.Success:
             restore_status = self.decode_req.hicache_restore_status
             if restore_status == HiCacheRestoreResult.PENDING:

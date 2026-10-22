@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
+from sglang.srt.managers.hisparse_factory import uses_native_hisparse
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
     get_req_to_token_extra_context_len,
@@ -134,7 +135,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
     return (
-        not memory_config.enable_hisparse
+        not uses_native_hisparse()
         and not is_draft_worker
         and not memory_config.enable_unified_cache_external_linker
     )
@@ -341,6 +342,10 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    _joint_capacity: Optional[Any] = field(default=None, init=False, repr=False)
+    _offload_host_memory_plan: Optional[Any] = field(
+        default=None, init=False, repr=False
+    )
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -457,6 +462,8 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        if getattr(self, "_offload_host_memory_plan", None) is not None:
+            config.offload_host_memory_plan = self._offload_host_memory_plan
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         alloc = pools.token_to_kv_pool_allocator
@@ -780,6 +787,12 @@ class KVCacheConfigurator:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if self.is_draft_worker and _is_npu:
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
+                bind_draft_page_ownership,
+            )
+
+            bind_draft_page_ownership(token_to_kv_pool_allocator, token_to_kv_pool)
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so
@@ -1943,7 +1956,7 @@ class KVCacheConfigurator:
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_hisparse=get_memory().enable_hisparse,
+            enable_hisparse=uses_native_hisparse(),
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
             unified_fp8=unified_fp8,
             kv_source_layers=kv_source_layers,
@@ -2112,6 +2125,15 @@ class KVCacheConfigurator:
                     ]
                 ),
             }
+        from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
+            fsa_pool_options,
+        )
+
+        offload_options = fsa_pool_options(
+            self,
+            self.layer_info.num_effective_layers,
+            token_capacity=max_total_num_tokens,
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2136,6 +2158,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             **dsa_pool_kwargs,
+            **offload_options,
         )
         return token_to_kv_pool
 
@@ -2174,7 +2197,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse and not self.is_draft_worker:
+        if uses_native_hisparse() and not self.is_draft_worker:
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )
@@ -2393,7 +2416,7 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
-        enable_hisparse = get_memory().enable_hisparse
+        enable_hisparse = uses_native_hisparse()
         hisparse_kwargs = {}
         if enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -2480,6 +2503,20 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
+        if (
+            _is_npu
+            and self.use_mla_backend
+            and is_deepseek_dsa(self.model_config.hf_config)
+        ):
+            from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
+                fsa_pool_options,
+            )
+
+            extra_args["fsa_pool_kwargs"] = fsa_pool_options(
+                self, len(full_attention_layer_ids), token_capacity=max_total_num_tokens
+            )
+            if extra_args["fsa_pool_kwargs"]:
+                extra_args["max_running_requests"] = req_to_token_pool.size
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
@@ -2633,7 +2670,9 @@ class KVCacheConfigurator:
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
-                get_exec().kernel.attention_backend == "ascend"
+                getattr(token_to_kv_pool, "decode_host_backing", None) is not None
+                or getattr(token_to_kv_pool, "prefill_layer_slots", None) is not None
+                or get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
@@ -2709,7 +2748,7 @@ class KVCacheConfigurator:
                         req_to_token_pool=req_to_token_pool,
                     )
                 else:
-                    if get_memory().enable_hisparse:
+                    if uses_native_hisparse():
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
@@ -2762,7 +2801,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if uses_native_hisparse() and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
@@ -2864,6 +2903,10 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        else:
+            joint_rest = self._resolve_joint_dsa_kda_budget(rest_memory, 0, 0, 0)
+            if joint_rest is not None:
+                rest_memory = joint_rest
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
@@ -2945,6 +2988,22 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        joint = getattr(self, "_joint_capacity", None)
+        if joint is not None:
+            requests = min(
+                joint.requests, token_capacity // max(get_schedule().page_size, 2)
+            )
+            if requests <= 0:
+                raise MemoryError(
+                    "Final offload token capacity cannot support one request"
+                )
+            if requests < joint.requests:
+                logger.warning(
+                    "Final token capacity reduced joint request capacity from %d to %d",
+                    joint.requests,
+                    requests,
+                )
+            return requests
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -3027,6 +3086,14 @@ class KVCacheConfigurator:
         )
 
         configurator = create_memory_pool_configurator(self)
+        joint = getattr(self, "_joint_capacity", None)
+        if joint is not None:
+            max_tokens = self._apply_token_constraints(joint.target_tokens)
+            if cap_tokens is not None:
+                max_tokens = min(max_tokens, cap_tokens)
+            return configurator.calculate_pool_sizes_from_max_tokens(
+                max_tokens, get_schedule().page_size
+            )
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
@@ -3051,6 +3118,122 @@ class KVCacheConfigurator:
                 max_tokens, get_schedule().page_size
             )
         return config
+
+    def _resolve_joint_dsa_kda_budget(
+        self,
+        total_rest_memory,
+        state_bytes,
+        ring_bytes,
+        intermediate_bytes,
+        *,
+        fixed_state_bytes=0,
+    ):
+        if not _is_npu or not envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get():
+            return None
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+        budget = getattr(configurator, "_decode_budget", None)
+        if budget is None:
+            return None
+        from dataclasses import replace
+
+        from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
+            solve_joint_dsa_kda_tokens,
+        )
+        from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
+            prepare_host_memory_budget_plan,
+        )
+
+        host_plan = prepare_host_memory_budget_plan(budget.host_bytes)
+        budget = replace(budget, host_memory_plan=host_plan)
+
+        page_size = get_schedule().page_size
+        requested = get_schedule().max_running_requests
+        if requested is None:
+            raise ValueError(
+                "Offload memory budgeting requires explicit --max-running-requests"
+            )
+        if requested <= 0 or requested % self.attn_dp_size:
+            raise ValueError(
+                "max-running-requests must be positive and divisible by attention DP size"
+            )
+        request_limit = requested // self.attn_dp_size
+        explicit_slots = (
+            get_schedule().max_mamba_cache_size
+            if self.mambaish_config is not None
+            else None
+        )
+        if explicit_slots is not None:
+            explicit_slots //= self.attn_dp_size
+        options = dict(
+            slots_per_request=self._calculate_mamba_ratio()
+            if self.mambaish_config is not None
+            else 1,
+            fixed_state_bytes=fixed_state_bytes,
+            ring_bytes_per_slot=ring_bytes,
+            intermediate_bytes_per_request=intermediate_bytes,
+            explicit_state_slots=explicit_slots,
+            request_bytes_per_row=(
+                self.model_config.context_len + get_req_to_token_extra_context_len()
+            )
+            * 4
+            + 28,
+            host_state_bytes_per_slot=state_bytes + ring_bytes
+            if self.mambaish_config is not None
+            else 0,
+            host_to_device_ratio=get_memory().hicache_ratio,
+        )
+        token_limit = self.model_config.context_len * request_limit
+        if get_schedule().max_total_tokens is not None:
+            token_limit = min(token_limit, get_schedule().max_total_tokens)
+        joint = solve_joint_dsa_kda_tokens(
+            budget,
+            int(total_rest_memory * (1 << 30)),
+            token_limit,
+            page_size,
+            request_limit,
+            state_bytes,
+            **options,
+        )
+        if self.mambaish_config is not None:
+            get_context().override(
+                "mamba_pool.joint_dsa_budget",
+                max_mamba_cache_size=joint.state_slots,
+            )
+        self._joint_capacity = joint
+        planner_bytes, _ = budget.fixed_bytes(joint.requests, page_size)
+        self._offload_host_memory_plan = replace(
+            host_plan, planner_bytes_per_rank=planner_bytes
+        )
+        logger.info(
+            "Joint DSA/KDA budget: target_tokens=%d dsa_hbm=%.3f GiB "
+            "kda_hbm=%.3f GiB state_slots=%d requests=%d unused_hbm=%.3f GiB request_hbm=%.3f GiB",
+            joint.target_tokens,
+            joint.dsa_bytes / (1 << 30),
+            joint.kda_bytes / (1 << 30),
+            joint.state_slots,
+            joint.requests,
+            joint.unused_bytes / (1 << 30),
+            joint.request_bytes / (1 << 30),
+        )
+        if joint.requests < request_limit:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) to fit the joint DSA/KDA, Host and token budgets.",
+                request_limit,
+                joint.requests,
+            )
+        logger.info(
+            "Joint request priority: max_running_requests=%d shared_token_capacity=%d "
+            "single_request_token_ceiling=%d",
+            joint.requests,
+            joint.target_tokens,
+            min(self.model_config.context_len, joint.target_tokens),
+        )
+        return total_rest_memory - (joint.kda_bytes + joint.request_bytes) / (1 << 30)
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
@@ -3125,6 +3308,18 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
+
+        joint_rest = self._resolve_joint_dsa_kda_budget(
+            total_rest_memory,
+            stage_per_req,
+            extra_per_slot,
+            stage_per_req * get_spec().speculative_num_draft_tokens
+            if reserves_spec_state
+            else 0,
+            fixed_state_bytes=replayssm_fixed_bytes,
+        )
+        if joint_rest is not None:
+            return joint_rest
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size

@@ -187,6 +187,12 @@ class PrefillBootstrapQueue:
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
     ):
+        if getattr(token_to_kv_pool, "prefill_layer_slots", None) is not None:
+            from sglang.srt.hardware_backend.npu.hisparse.pd import (
+                validate_prefill_bootstrap_policy,
+            )
+
+            validate_prefill_bootstrap_policy(get_disagg(), layerwise_offload=True)
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -285,6 +291,23 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
+        kv_args.prefill_layerwise_offload = (
+            getattr(self.token_to_kv_pool, "prefill_layer_slots", None) is not None
+        )
+        kv_args.prefill_layerwise_aux_kv = kv_args.prefill_layerwise_offload and bool(
+            getattr(self.token_to_kv_pool, "index_kpool_compress", False)
+        )
+        kv_args.prefill_layerwise_completed_ptrs = set()
+        if kv_args.prefill_layerwise_aux_kv:
+            storage = getattr(
+                self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool
+            )
+            kv_args.prefill_layerwise_completed_ptrs.update(
+                tensor.data_ptr()
+                for buffers in (storage.k_buffer, storage.v_buffer)
+                for tensor in buffers
+                if tensor.numel()
+            )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
             self.token_to_kv_pool
         )
@@ -294,6 +317,13 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
+        if kv_args.prefill_layerwise_offload and hasattr(
+            self.token_to_kv_pool, "full_attention_layer_id_mapping"
+        ):
+            layer_ids = tuple(self.token_to_kv_pool.full_attention_layer_id_mapping)
+            kv_args.prefill_start_layer = min(layer_ids)
+            kv_args.prefill_end_layer = max(layer_ids) + 1
+
         draft_kv_pool = (
             self.draft_token_to_kv_pool
             if transfer_draft_cache
@@ -302,10 +332,34 @@ class PrefillBootstrapQueue:
         )
         num_draft_entries = 0
         if draft_kv_pool is not None:
+            if kv_args.prefill_layerwise_offload:
+                from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
+                    validate_mtp_pool_pair,
+                )
+
+                if getattr(draft_kv_pool, "prefill_layer_slots", None) is None:
+                    raise ValueError("bounded target Prefill requires bounded draft KV")
+                validate_mtp_pool_pair(self.token_to_kv_pool, draft_kv_pool)
+                draft_base = self.scheduler.model_config.num_hidden_layers
+                draft_kv_pool.fsa_transfer_layer_offset = (
+                    draft_base - draft_kv_pool.start_layer
+                )
+                draft_storage = getattr(draft_kv_pool, "full_kv_pool", draft_kv_pool)
+                draft_storage.fsa_transfer_layer_offset = (
+                    draft_kv_pool.fsa_transfer_layer_offset
+                )
+                if kv_args.prefill_layerwise_aux_kv:
+                    kv_args.prefill_layerwise_completed_ptrs.update(
+                        tensor.data_ptr()
+                        for buffers in (draft_storage.k_buffer, draft_storage.v_buffer)
+                        for tensor in buffers
+                        if tensor.numel()
+                    )
+                kv_args.prefill_end_layer = draft_base + draft_kv_pool.layer_num
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                draft_kv_pool.get_contiguous_buf_infos()
+                get_kv_transfer_buf_infos(draft_kv_pool)
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -593,6 +647,10 @@ class SchedulerDisaggregationPrefillMixin:
         sender = getattr(req, "disagg_kv_sender", None)
         if sender is not None and hasattr(sender, "abort"):
             sender.abort()
+        if self._defer_prefill_offload_release(
+            req, "release_aborted_prefill_waiting_req"
+        ):
+            return
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -1141,9 +1199,47 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        release_polls = [KVPoll.Success] * len(polls)
+        draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+        target_pool = self.disagg_prefill_bootstrap_queue.token_to_kv_pool
+        runtimes = [
+            runtime
+            for pool in (target_pool, draft_pool)
+            if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None
+        ]
+        if runtimes:
+            from sglang.srt.hardware_backend.npu.hisparse.prefill_offload_runtime import (
+                PrefillReleaseCheck,
+            )
+
+            release_polls = poll_and_all_reduce_attn_cp_tp_group(
+                [
+                    PrefillReleaseCheck(runtimes, req.rid, req.disagg_kv_sender)
+                    for req in self.disagg_prefill_inflight_queue
+                ],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, release_poll in zip(
+            self.disagg_prefill_inflight_queue, polls, release_polls
+        ):
+            if release_poll != KVPoll.Success:
+                undone_reqs.append(req)
+                continue
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                undone_reqs.append(req)
+                continue
+            release_action = getattr(req, "_npu_offload_release_action", None)
+            if release_action is not None:
+                req._npu_offload_release_ready = release_action
+                getattr(self, release_action)(req)
+                if release_action != "optimistic_release_and_requeue":
+                    req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1189,6 +1285,10 @@ class SchedulerDisaggregationPrefillMixin:
                     self.optimistic_release_and_requeue(req)
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
+                if getattr(
+                    req, "_npu_offload_release_action", None
+                ) is not None and not any(pending is req for pending in undone_reqs):
+                    undone_reqs.append(req)
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
@@ -1199,6 +1299,8 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
+                for runtime in runtimes:
+                    runtime.release_request(req.rid)
                 # unlock the tree
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
@@ -1209,7 +1311,11 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                for runtime in runtimes:
+                    runtime.release_request(req.rid)
                 self.handle_inflight_transfer_failure(req)
+                if runtimes:
+                    req.disagg_kv_sender.clear()
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
@@ -1296,6 +1402,31 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
+    def _defer_prefill_offload_release(self: Scheduler, req: Req, action: str) -> bool:
+        bootstrap = self.disagg_prefill_bootstrap_queue
+        runtimes = [
+            runtime
+            for pool in (bootstrap.token_to_kv_pool, bootstrap.draft_token_to_kv_pool)
+            if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None
+        ]
+        if not runtimes:
+            return False
+        if getattr(req, "_npu_offload_release_ready", None) == action:
+            req._npu_offload_release_ready = None
+            req._npu_offload_release_action = None
+            for runtime in runtimes:
+                runtime.release_request(req.rid)
+            return False
+        req._npu_offload_release_action = action
+        if (
+            action != "optimistic_release_and_requeue"
+            and req.disagg_kv_sender is not None
+        ):
+            req.disagg_kv_sender.abort()
+        if not any(pending is req for pending in self.disagg_prefill_inflight_queue):
+            self.disagg_prefill_inflight_queue.append(req)
+        return True
+
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
         self.clear_pending_chunk_send(req)
@@ -1304,6 +1435,9 @@ class SchedulerDisaggregationPrefillMixin:
         )
         if not owns_resources:
             # A bootstrap failure or earlier abort already retired it.
+            return False
+
+        if self._defer_prefill_offload_release(req, "_retire_aborted_prefill_result"):
             return False
 
         sender = req.disagg_kv_sender
@@ -1325,6 +1459,8 @@ class SchedulerDisaggregationPrefillMixin:
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        if self._defer_prefill_offload_release(req, "handle_bootstrap_failure"):
+            return
         self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
@@ -1719,6 +1855,8 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
+        if self._defer_prefill_offload_release(req, "optimistic_release_and_requeue"):
+            return
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
         if not uses_write_through_cache:

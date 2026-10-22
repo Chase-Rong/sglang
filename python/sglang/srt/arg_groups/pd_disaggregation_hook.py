@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -97,7 +97,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
-            if cfg.enable_hisparse:
+            if cfg.enable_hisparse and not get_platform().is_npu:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
@@ -122,7 +122,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             declare_resolution(
                 server_args,
                 "handle_pd_disaggregation",
-                disable_radix_cache=True,
+                disable_radix_cache=not (cfg.enable_hisparse and get_platform().is_npu),
             )
             logger.warning("Radix cache is disabled for decode server")
 

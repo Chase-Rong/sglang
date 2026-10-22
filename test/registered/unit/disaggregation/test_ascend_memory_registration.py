@@ -29,6 +29,8 @@ class TestAscendMemoryRegistration(CustomTestCase):
         manager = AscendKVManager.__new__(AscendKVManager)
         manager.kv_args = SimpleNamespace(**args)
         manager.engine = Mock()
+        manager.engine.batch_register.return_value = 0
+        manager.engine.batch_deregister.return_value = 0
         return manager
 
     def test_register_filters_placeholders_without_changing_wire_metadata(self):
