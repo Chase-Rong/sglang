@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 def binding_for_test():
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.hicache_offload import OffloadPageBinding
+    from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
 
     torch.npu.set_device(0)
     torch.npu.set_per_process_memory_fraction(
@@ -68,7 +68,7 @@ def test_draft_host_table_prepare_and_consumer_benchmark(batch):
     destination = os.environ.get("SGLANG_LIM_COMPONENT_BENCHMARK")
     if not destination:
         pytest.skip("Benchmark output directory required")
-    from sglang.srt.hardware_backend.npu.hicache_offload import DraftHostTableScope
+    from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import DraftHostTableScope
 
     binding = binding_for_test()
     source = torch.arange(1, batch * 1024 + 1, dtype=torch.int32, device="npu").view(

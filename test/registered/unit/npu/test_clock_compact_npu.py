@@ -17,7 +17,7 @@ def device():
     import torch_npu
 
     index = int(os.environ["SGLANG_FSA_TEST_DEVICE_ID"])
-    torch.npu.set_device(index)
+    torch_npu.npu.set_device(index)
     return torch.device(f"npu:{index}")
 
 
@@ -27,7 +27,7 @@ def device():
     ids=["capacity1", "small", "single", "verify", "capacity32767"],
 )
 def test_compact_matches_legacy_across_graphs(device, monkeypatch, rows, width, capacity):
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import NativeSparsePlanner
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import NativeSparsePlanner
 
     monkeypatch.setenv("SGLANG_NPU_FSA_PLANNER_POLICY", "clock")
     planners, graphs = [], []
@@ -96,7 +96,7 @@ def test_compact_matches_legacy_across_graphs(device, monkeypatch, rows, width, 
 
 @pytest.mark.parametrize("kind", ["float", "int32", "strided", "shape"])
 def test_clock_rejects_invalid_workspace_before_launch(device, monkeypatch, kind):
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import NativeSparsePlanner
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import NativeSparsePlanner
 
     monkeypatch.setenv("SGLANG_NPU_FSA_PLANNER_POLICY", "clock")
     planner = NativeSparsePlanner(device, rows=1, topk=7, capacity=8)

@@ -1,5 +1,6 @@
 """Execute production sizing methods without importing accelerator dependencies."""
 
+from npu_test_paths import npu_module_name
 import ast
 import sys
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from test_decode_memory_budget import MODULE, SOURCE, budget
 
 @pytest.fixture
 def runtime(monkeypatch):
-    source = SOURCE.parents[2] / "mem_cache/kv_cache_configurator.py"
+    source = SOURCE.parents[3] / "mem_cache/kv_cache_configurator.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     methods = {"_handle_max_mamba_cache", "_resolve_joint_dsa_kda_budget",
                "config_from_budget", "resolve_max_num_reqs"}
@@ -59,9 +60,9 @@ def runtime(monkeypatch):
     instance.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     instance._calculate_mamba_ratio = lambda: 1
     instance._apply_token_constraints = lambda tokens: tokens // 64 * 64
-    monkeypatch.setitem(sys.modules, "sglang.srt.model_executor.pool_configurator",
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.model_executor.pool_configurator"),
                         SimpleNamespace(create_memory_pool_configurator=create_pool))
-    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.decode_memory_budget", MODULE)
+    monkeypatch.setitem(sys.modules, npu_module_name("sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget"), MODULE)
     return SimpleNamespace(instance=instance, schedule=schedule, memory=memory,
                            calls=calls, warnings=warnings, pool=pool, model=model)
 

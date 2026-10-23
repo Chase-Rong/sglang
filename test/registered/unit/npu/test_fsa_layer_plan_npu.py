@@ -23,9 +23,9 @@ def device():
 
 
 def fused():
-    name = "sglang.srt.hardware_backend.npu.fsa_layer_plan"
+    name = "sglang.srt.hardware_backend.npu.hisparse.fsa_layer_plan"
     assert importlib.util.find_spec(name) is not None, "fused layer plan is missing"
-    from sglang.srt.hardware_backend.npu.fsa_layer_plan import build_layer_plan
+    from sglang.srt.hardware_backend.npu.hisparse.fsa_layer_plan import build_layer_plan
 
     return build_layer_plan
 
@@ -62,7 +62,7 @@ def test_plan_literal_encoding_and_clamped_invalid_slots(device):
 @pytest.mark.parametrize("inference", [False, True])
 def test_plan_eager_and_graph_match_cpu(device, rows, width, capacity, masked, inference):
     build = fused()
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import materialize_layer_plan
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import materialize_layer_plan
 
     torch.manual_seed(372)
     cache = state(rows, capacity)
@@ -121,7 +121,7 @@ def test_plan_eager_and_graph_match_cpu(device, rows, width, capacity, masked, i
 
 def test_plan_per_layer_commit_and_mutable_tail(device):
     fused()
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import commit_layer_plan, materialize_layer_plan
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import commit_layer_plan, materialize_layer_plan
 
     cache, other = state(2, 8, device), state(2, 8, device)
     keys = torch.tensor([[7, 7, 8, -1], [17, 17, 18, -1]], device=device)
@@ -139,7 +139,7 @@ def test_plan_per_layer_commit_and_mutable_tail(device):
 
 def test_plan_transposed_keys_and_slots(device):
     build = fused()
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import materialize_layer_plan
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import materialize_layer_plan
 
     rows, width, capacity = 3, 7, 8
     keys = torch.arange(rows * width, dtype=torch.int64).reshape(width, rows).t()
@@ -190,7 +190,7 @@ def test_plan_transposed_keys_and_slots(device):
 
 def test_plan_graph_commit_order_and_layer_isolation(device):
     fused()
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import commit_layer_plan, materialize_layer_plan
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import commit_layer_plan, materialize_layer_plan
 
     cache, other = state(2, 8), state(2, 8)
     gpu_cache, gpu_other = state(2, 8, device), state(2, 8, device)

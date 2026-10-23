@@ -1,3 +1,4 @@
+from npu_test_paths import npu_module_name, npu_source_path
 import ast
 import importlib.util
 import sys
@@ -15,7 +16,7 @@ NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
 
 
 def load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(path))
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -32,15 +33,15 @@ def modules(monkeypatch):
     ):
         module = types.ModuleType(package)
         module.__path__ = []
-        monkeypatch.setitem(sys.modules, package, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(package), module)
     prefix = "sglang.srt.hardware_backend.npu"
-    for name in (f"{prefix}.prefill_offload", f"{prefix}.layer_transfer"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    protocol = load_module(f"{prefix}.prefill_offload", NPU / "prefill_offload.py")
-    transfer = load_module(f"{prefix}.layer_transfer", NPU / "layer_transfer.py")
-    name = f"{prefix}.layer_protocol"
-    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    load_module(name, NPU / "layer_protocol.py")
+    for name in (f"{prefix}.hisparse.prefill_offload", f"{prefix}.hisparse.layer_transfer"):
+        monkeypatch.setitem(sys.modules, npu_module_name(name), types.ModuleType(name))
+    protocol = load_module(f"{prefix}.hisparse.prefill_offload", NPU / "hisparse/prefill_offload.py")
+    transfer = load_module(f"{prefix}.hisparse.layer_transfer", NPU / "hisparse/layer_transfer.py")
+    name = f"{prefix}.hisparse.layer_protocol"
+    monkeypatch.setitem(sys.modules, npu_module_name(name), types.ModuleType(name))
+    load_module(name, NPU / "hisparse/layer_protocol.py")
     return protocol, transfer
 
 
@@ -205,9 +206,13 @@ def sender_methods():
 
 
 def manager(**kwargs):
-    defaults = dict(_layer_send_lock=threading.RLock(), _layer_operations={},
-                    check_status=lambda room: "transferring",
-                    update_status=lambda *args: None)
+    defaults = dict(
+        kv_args=SimpleNamespace(),
+        _layer_send_lock=threading.RLock(),
+        _layer_operations={},
+        check_status=lambda room: "transferring",
+        update_status=lambda *args: None,
+    )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
 

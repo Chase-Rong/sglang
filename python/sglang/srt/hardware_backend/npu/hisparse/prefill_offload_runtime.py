@@ -2,11 +2,12 @@
 
 import contextlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import torch
 
-from sglang.srt.hardware_backend.npu.prefill_offload import (
+from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
     HostKvPagePool,
     KvPageRange,
     LayerSlotToken,
@@ -45,6 +46,8 @@ class PrefillBatchLayer:
     published: bool = False
     transfers: list = field(default_factory=list)
     failed: bool = False
+    publication: object = None
+    restore_event: object = None
 
 
 class NpuPrefillOffloadRuntime:
@@ -76,6 +79,9 @@ class NpuPrefillOffloadRuntime:
         self.failed = False
         self.completed_layers = set()
         self.failure_event = None
+        self._publisher = None
+        self.h2d_stream = None
+        self.d2h_stream = None
 
     def register_host_layers(self):
         rows = self.host_pages.page_count * self.pool.page_size
@@ -212,6 +218,7 @@ class NpuPrefillOffloadRuntime:
                         sender,
                     )
                 )
+            self._validate_batch_identity(prepared)
         except BaseException:
             for allocation in newly_allocated:
                 self.host_pages.release(allocation)
@@ -220,8 +227,86 @@ class NpuPrefillOffloadRuntime:
         self.requests = tuple(prepared)
         self.completed_layers.clear()
         self.active = True
+        if str(self.pool.device).split(":")[0] == "npu":
+            if self.h2d_stream is None:
+                self.h2d_stream = torch.npu.Stream(device=self.pool.device)
+                self.d2h_stream = torch.npu.Stream(device=self.pool.device)
+            self.h2d_stream.wait_stream(torch.npu.current_stream())
+
+    def _validate_batch_identity(self, requests):
+        """Validate shared ownership before rank-local asynchronous prefetch."""
+        shared_group = getattr(self.adapter.host_pool, "shared_group", None)
+        if shared_group is None:
+            return
+        shared_group.validate_identity((
+            "prefill_batch",
+            self.batch_id + 1,
+            self.pool.start_layer,
+            self.pool.layer_num,
+            self.pool.prefill_layer_slots,
+            self.pool.page_size,
+            tuple(
+                (
+                    request.allocation.request_id,
+                    request.allocation.generation,
+                    tuple(request.allocation.page_ids),
+                    request.prefix_length,
+                    request.sequence_length,
+                    request.source_pages,
+                )
+                for request in requests
+            ),
+        ))
 
     def prepare_layer(self, layer_id):
+        self._prepare_layer(layer_id)
+        layer = self.layers[layer_id]
+        if layer.restore_event is not None:
+            torch.npu.current_stream().wait_event(layer.restore_event)
+        self._prefetch_next_layer(layer_id)
+
+    def _prefetch_next_layer(self, layer_id):
+        next_layer = layer_id + 1
+        if (
+            self.h2d_stream is None
+            or self.pool.prefill_layer_slots < 2
+            or next_layer >= self.pool.start_layer + self.pool.layer_num
+            or next_layer in self.layers
+            or next_layer in self.completed_layers
+        ):
+            return
+        slot_id = self.slots.preferred_slot(next_layer - self.pool.start_layer)
+        if self.slots.owner(slot_id) is not None:
+            previous_id, previous = next(
+                (layer, state)
+                for layer, state in self.layers.items()
+                if state.slot_token.slot_id == slot_id
+            )
+            if (
+                not previous.finished
+                or previous.failed
+                or previous.publication is not None
+                and not previous.publication.done()
+            ):
+                return
+            self._finish_publication(previous, time.monotonic() + self.timeout_s)
+            if any(
+                operation.state != "acknowledged" for operation in previous.transfers
+            ):
+                return
+            try:
+                for work in previous.works:
+                    self.adapter.validate_layer_release(work)
+            except SlotBusyError:
+                return
+            self.drain_layer(previous_id)
+        with torch.npu.stream(self.h2d_stream):
+            self._prepare_layer(next_layer)
+            event = torch.npu.Event()
+            event.record(self.h2d_stream)
+            self.layers[next_layer].restore_event = event
+
+    def _prepare_layer(self, layer_id):
         if not self.active or self.failed:
             raise RuntimeError("KV access has no active healthy Prefill batch")
         if layer_id in self.completed_layers:
@@ -280,9 +365,41 @@ class NpuPrefillOffloadRuntime:
         for work in layer.works:
             work.kv_written = True
             self.adapter.record_attention_done(work)
-            work.host_save_started = True
-            self.adapter.save_layer(work)
+        if self._publisher is None:
+            self._publisher = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="npu-pd-staging"
+            )
+        layer.published = True
+        layer.publication = self._publisher.submit(
+            self._publish_layer, layer, tuple(self.requests)
+        )
+        context = contextlib.nullcontext()
+        if self.d2h_stream is not None:
+            for work in layer.works:
+                self.d2h_stream.wait_event(self.adapter.attention_ready_event(work))
+            context = torch.npu.stream(self.d2h_stream)
+        with context:
+            for work in layer.works:
+                work.host_save_started = True
+                self.adapter.save_layer(work)
         layer.finished = True
+
+    def _publish_layer(self, layer, requests):
+        if str(self.pool.device).split(":")[0] == "npu":
+            torch.npu.set_device(self.pool.device)
+        deadline = time.monotonic() + self.timeout_s
+        for request, work in zip(requests, layer.works):
+            event = self.adapter.attention_ready_event(work)
+            self._wait(event.query, deadline, "Prefill KV-ready event timed out")
+            layer.transfers.extend(
+                self.publish(request.sender, work, self.adapter.binding(work), event)
+            )
+
+    def _finish_publication(self, layer, deadline):
+        if layer.publication is not None:
+            layer.publication.result(timeout=max(0, deadline - time.monotonic()))
+            layer.publication = None
+            self.slots.set_pd_readers(layer.slot_token, len(layer.transfers))
 
     def _wait(self, predicate, deadline, reason):
         while not predicate():
@@ -297,24 +414,13 @@ class NpuPrefillOffloadRuntime:
                 "cannot reuse a layer before successful attention completion"
             )
         deadline = time.monotonic() + self.timeout_s
+        self._finish_publication(layer, deadline)
         for work in layer.works:
             self.adapter.wait_local_completion(work, deadline=deadline)
             self.adapter.complete_host_save(work)
             self.adapter.complete_attention(work)
         self.slots.mark_host_saved(layer.slot_token)
         self.slots.mark_attention_done(layer.slot_token)
-        if not layer.published:
-            layer.published = True
-            for request, work in zip(self.requests, layer.works):
-                operations = self.publish(
-                    request.sender,
-                    work,
-                    self.adapter.binding(work),
-                    self.adapter.source_ready_event(work),
-                )
-                layer.transfers.extend(operations)
-            self.slots.set_pd_readers(layer.slot_token, len(layer.transfers))
-
         def acknowledged():
             if any(
                 operation.state in ("failed", "drained")
@@ -355,6 +461,42 @@ class NpuPrefillOffloadRuntime:
                    for layer in self.layers.values() for work in layer.works)
         )
 
+    def drain_for_shutdown(self):
+        if self.active or self.layers or self.failed:
+            self.failed = True
+            if self.failure_event is None:
+                self.failure_event = self.adapter.record_event()
+            for request in self.requests:
+                request.sender.abort()
+            deadline = time.monotonic() + self.timeout_s
+            for layer in self.layers.values():
+                if layer.publication is not None:
+                    self._wait(
+                        layer.publication.done, deadline,
+                        "Prefill publication has not drained during shutdown",
+                    )
+            operations = [operation for layer in self.layers.values() for operation in layer.transfers]
+            for request in self.requests:
+                operations.extend(request.sender.prefill_layer_operations())
+            self._wait(
+                lambda: all(
+                    operation.state in ("acknowledged", "drained")
+                    or getattr(operation, "transport_drained", False)
+                    for operation in operations
+                ),
+                deadline, "Prefill transport has not drained during shutdown",
+            )
+            for operation in operations:
+                if operation.state not in ("acknowledged", "drained"):
+                    operation.state = "drained"
+            self.drain_failed_batch()
+        if self._publisher is not None:
+            self._publisher.shutdown(wait=True)
+            self._publisher = None
+        for stream in (self.h2d_stream, self.d2h_stream):
+            if stream is not None:
+                stream.synchronize()
+
     def release_request(self, request_id):
         if not self.can_release_request(request_id):
             raise SlotBusyError("request release requires its Prefill work to drain")
@@ -374,6 +516,13 @@ class NpuPrefillOffloadRuntime:
             deadline,
             "failed Prefill device work has not drained",
         )
+        for layer in self.layers.values():
+            if layer.publication is not None:
+                if not layer.publication.done():
+                    raise SlotBusyError("failed Prefill publication has not drained")
+                layer.publication.exception()
+                layer.publication = None
+                self.slots.set_pd_readers(layer.slot_token, len(layer.transfers))
         offset = getattr(self.pool, "fsa_transfer_layer_offset", 0)
         tokens = {replace(work.token, logical_layer=work.token.logical_layer + offset)
                   for layer in self.layers.values() for work in layer.works}

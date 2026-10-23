@@ -268,6 +268,29 @@ class AscendKVManager(MooncakeKVManager):
             or st in _DSV4_KVCACHE_STATE_TYPES
         )
 
+    def _send_kvcache_generic(
+        self, *, src_data_ptrs, dst_data_ptrs, item_lens, state_type=None, **arguments
+    ):
+        if state_type == StateType.DSA and getattr(
+            self.kv_args, "prefill_layerwise_aux_kv", False
+        ):
+            ordinary = set(self.kv_args.kv_data_ptrs)
+            entries = [
+                entry
+                for entry in zip(src_data_ptrs, dst_data_ptrs, item_lens)
+                if entry[0] not in ordinary
+            ]
+            if not entries:
+                return 0
+            src_data_ptrs, dst_data_ptrs, item_lens = map(list, zip(*entries))
+        return super()._send_kvcache_generic(
+            src_data_ptrs=src_data_ptrs,
+            dst_data_ptrs=dst_data_ptrs,
+            item_lens=item_lens,
+            state_type=state_type,
+            **arguments,
+        )
+
 
 class AscendKVSender(MooncakeKVSender):
     pass

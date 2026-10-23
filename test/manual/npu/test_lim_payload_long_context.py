@@ -21,8 +21,8 @@ pytestmark = pytest.mark.skipif(
 def test_fused_lim_long_context_slot_payload(context, batch, routes, heads):
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeIndexerManager,
         NativeUnionPlanner,
     )

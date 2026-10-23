@@ -1,6 +1,16 @@
 """Admission contracts for the separate Ascend sparse offload lifecycle."""
 
 
+def layer_staging_bytes(configured, *, role, host_offload, integrated=False):
+    if type(configured) is not int or configured < 0 or configured % 32:
+        raise ValueError(
+            "NPU layer staging bytes must be nonnegative and 32-byte aligned"
+        )
+    if integrated or role != "decode" or not host_offload:
+        return 0
+    return configured or 64 * 1024 * 1024
+
+
 def validate_offload_service(server_args, role, *, integrated=False):
     if integrated and role != "null":
         raise ValueError("integrated offload requires one non-disaggregated service")
@@ -26,17 +36,23 @@ def validate_offload_service(server_args, role, *, integrated=False):
                 "Integrated offload requires HiCache and enabled radix cache"
             )
     if (
-        (
-            not integrated
-            and server_args.disaggregation_transfer_backend
-            not in ("ascend", "mooncake")
-        )
-        or (not integrated and not server_args.disable_radix_cache)
-        or server_args.enable_hisparse
-    ):
+        not integrated
+        and server_args.disaggregation_transfer_backend not in ("ascend", "mooncake")
+    ) or (not integrated and role == "prefill" and not server_args.disable_radix_cache):
         raise ValueError(
-            "NPU sparse offload requires Ascend/Mooncake transport, disabled radix cache and no HiSparse coordinator"
+            "NPU sparse offload requires Ascend/Mooncake transport and disabled Prefill radix cache"
         )
+    if not integrated and server_args.disaggregation_transfer_backend != "ascend":
+        raise ValueError("NPU PD offload requires the Ascend MemFabric backend")
+    if (
+        role == "decode"
+        and not integrated
+        and (
+            server_args.disable_radix_cache
+            or not getattr(server_args, "enable_hierarchical_cache", False)
+        )
+    ):
+        raise ValueError("PD offload Decode requires HiCache and enabled radix cache")
     if role == "prefill" and server_args.optimistic_prefill_attempts:
         raise ValueError(
             "bounded Prefill must finish layer bootstrap before forward; disable optimistic Prefill"
@@ -116,6 +132,7 @@ def validate_prefill_overlap(
 def fsa_pool_options(kvc, layer_count):
     import torch
 
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
     from sglang.srt.hardware_backend.npu.shared_host_kv import (
@@ -141,9 +158,13 @@ def fsa_pool_options(kvc, layer_count):
     role = get_disagg().disaggregation_mode
     if str(kvc.device).split(":")[0] != "npu" or not kvc.use_mla_backend:
         raise ValueError("FSA Host offload requires an NPU MLA pool")
-    validate_offload_service(kvc.server_args, role, integrated=integrated)
+    validate_offload_service(resolved_view(kvc.server_args), role, integrated=integrated)
     if kvc.kv_cache_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("FSA Host KV requires FP16 or BF16 storage")
+    if role != "prefill" and envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa":
+        from sglang.srt.hardware_backend.npu.hisparse.config import validate_lim_dtypes
+
+        validate_lim_dtypes(kvc.kv_cache_dtype, kvc.model_dtype)
     native_ops()
     if integrated:
         if (
@@ -184,9 +205,9 @@ def fsa_pool_options(kvc, layer_count):
         return {"prefill_layer_slots": slots}
     if role != "decode" or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
         raise ValueError("Decode Host backing requires the fused/reference FSA path")
-    if envs.SGLANG_NPU_LAYER_STAGING_BYTES.get() <= 0:
-        raise ValueError("Decode Host receive requires a bounded NPU staging window")
+    host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
     return {
+        "decode_host_token_capacity": host_tokens,
         "decode_host_budget": host_budget,
         "shared_host_group": shared_host_group_from_runtime(torch.npu.current_device()),
     }

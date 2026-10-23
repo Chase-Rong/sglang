@@ -24,8 +24,8 @@ def test_native_fused_attention_chain(batch, routes):
 def test_fused_native_indexer_and_manager(batch, routes):
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeIndexerManager,
     )
 

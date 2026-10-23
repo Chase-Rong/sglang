@@ -6,6 +6,7 @@ only MemFabric allocation/registration is simulated with CPU storage. These
 tests do not qualify NPU DMA, TP visibility or controller completion.
 """
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -19,9 +20,9 @@ SRT = Path(__file__).parents[4] / "python/sglang/srt"
 
 
 def load_module(monkeypatch, name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(path))
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     spec.loader.exec_module(module)
     return module
 
@@ -36,7 +37,7 @@ def runtime(monkeypatch):
     ):
         package = ModuleType(name)
         package.__path__ = []
-        monkeypatch.setitem(sys.modules, name, package)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), package)
 
     def unexpected(*args, **kwargs):
         raise AssertionError(
@@ -56,7 +57,7 @@ def runtime(monkeypatch):
     for name, attributes in dependencies.items():
         module = ModuleType(name)
         module.__dict__.update(attributes)
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     base = load_module(
         monkeypatch,
         "sglang.srt.mem_cache.pool_host.base",
@@ -64,13 +65,13 @@ def runtime(monkeypatch):
     )
     host = load_module(
         monkeypatch,
-        "sglang.srt.hardware_backend.npu.hicache_host_pool",
-        SRT / "hardware_backend/npu/hicache_host_pool.py",
+        "sglang.srt.hardware_backend.npu.hisparse.hicache_host_pool",
+        SRT / "hardware_backend/npu/hisparse/hicache_host_pool.py",
     )
     binding = load_module(
         monkeypatch,
-        "sglang.srt.hardware_backend.npu.hicache_offload",
-        SRT / "hardware_backend/npu/hicache_offload.py",
+        "sglang.srt.hardware_backend.npu.hisparse.hicache_offload",
+        SRT / "hardware_backend/npu/hisparse/hicache_offload.py",
     )
     allocations = {}
     device_events = []

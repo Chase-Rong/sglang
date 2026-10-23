@@ -1,5 +1,6 @@
 """GLM-5.3 NoPE contracts at the fused runtime boundary, without NPU allocation."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_hicache_memfabric_pool import runtime as runtime
 
 ROOT = Path(__file__).parents[4]
 NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
@@ -14,9 +16,9 @@ NPU = ROOT / "python/sglang/srt/hardware_backend/npu"
 
 def load_module(name):
     qualified = f"sglang.srt.hardware_backend.npu.{name}"
-    spec = importlib.util.spec_from_file_location(qualified, NPU / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(npu_module_name(qualified), npu_source_path(NPU / f"{name}.py"))
     module = importlib.util.module_from_spec(spec)
-    sys.modules[qualified] = module
+    sys.modules[npu_module_name(qualified)] = module
     spec.loader.exec_module(module)
     return module
 
@@ -86,46 +88,27 @@ def test_external_plan_2051_rows_preserves_reshuffled_hits_and_layer_isolation()
     assert other.miss_mask.all()
 
 
-def test_host_nope_allocates_only_latent_and_overwrites_current_token(monkeypatch):
-    registered = load_module("registered_host_kv")
-    backing_module = load_module("decode_host_kv")
-
-    class HostPool:
-        def __init__(self, device_id):
-            self.components = {}
-
-        def allocate_component(self, name, shape, dtype, **kwargs):
-            tensor = torch.full(shape, -99, dtype=dtype)
-            region = SimpleNamespace(
-                tensor=tensor, nbytes=tensor.nbytes, view=tensor.view
-            )
-            self.components[name] = region
-            return SimpleNamespace(region=region)
-
-        def copy_to_host(self, name, src, src_index, dst_index, valid):
-            self.components[name].tensor[dst_index[valid]] = src[src_index[valid]]
-
-    monkeypatch.setattr(backing_module, "NpuRegisteredHostKvPool", HostPool)
-    backing = backing_module.DecodeHostKvBacking(
-        layers=2,
-        pages=3,
-        page_size=128,
-        latent_dim=512,
-        rope_dim=0,
-        dtype=torch.bfloat16,
-        device_id=1,
-        host_budget=2 * 384 * 512 * 2,
-    )
-    assert len(backing.pool.components) == 2
+def test_host_nope_allocates_only_latent_and_overwrites_current_token(runtime):
+    backing, pool = runtime.make(layers=2, rope_dim=0)
+    backing.bind_hicache(pool)
+    backing.page_binding.ensure_pages(torch.tensor([1]))
+    assert len(backing.regions) == 2
     assert backing.regions[0][1] is None
-    assert backing.layer_views(0)[1].shape == (3, 128, 1, 0)
-    locations = torch.tensor([0, 128, 383, 384, -1])
-    values = torch.randn(5, 1, 512).bfloat16()
-    backing.write_current(1, locations, values, torch.empty(5, 1, 0))
-    torch.testing.assert_close(backing.regions[1][0].tensor[128], values[1, 0])
-    assert torch.all(backing.regions[0][0].tensor == -99)
-    backing.write_current(1, locations, values + 1, torch.empty(5, 1, 0))
-    torch.testing.assert_close(backing.regions[1][0].tensor[128], values[1, 0] + 1)
+    backing.regions[0][0].tensor.zero_()
+    def copy_to_host(name, source, source_rows, destination_rows, valid):
+        destination = backing.pool._components[name].region.tensor
+        destination[destination_rows[valid]] = source[source_rows[valid]]
+
+    backing.pool.copy_to_host = copy_to_host
+    locations = torch.tensor([0, 4, 5, -1])
+    values = torch.randn(4, 1, 8).bfloat16()
+    backing.write_current(1, locations, values, torch.empty(4, 1, 0))
+    host_rows = backing.page_binding.host_rows(locations)
+    torch.testing.assert_close(backing.regions[1][0].tensor[host_rows[1]], values[1, 0])
+    before = backing.regions[0][0].tensor.clone()
+    backing.write_current(1, locations, values + 1, torch.empty(4, 1, 0))
+    torch.testing.assert_close(backing.regions[1][0].tensor[host_rows[1]], values[1, 0] + 1)
+    torch.testing.assert_close(backing.regions[0][0].tensor, before)
 
 
 def test_nope_budget_includes_2051_tail_columns():
@@ -204,7 +187,8 @@ def test_actual_backend_adapter_preserves_hybrid_host_mapping_and_mtp_causality(
         kv_lora_rank=512,
         qk_rope_head_dim=0,
         forward_metadata=SimpleNamespace(
-            real_page_table=table, cache_seqlens_int32=torch.tensor([6, 6], dtype=torch.int32)
+            real_page_table=table, host_page_table=table,
+            cache_seqlens_int32=torch.tensor([6, 6], dtype=torch.int32)
         ),
         _query_lens_device=lambda batch: torch.tensor([2, 2], dtype=torch.int32),
     )

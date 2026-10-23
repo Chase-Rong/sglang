@@ -115,8 +115,8 @@ def test_native_indexer_matches_installed_op_and_scores(rows, heads):
 def test_native_pooled_adapter_causal_expansion_and_replay():
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import NativePooledIndexer
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import NativePooledIndexer
 
     torch.npu.set_device(0)
     torch.npu.set_per_process_memory_fraction(
@@ -171,8 +171,8 @@ def test_native_pooled_adapter_causal_expansion_and_replay():
 def test_native_indexer_keeps_high_pooled_ids_at_one_million_tokens():
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import NativePooledIndexer
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import NativePooledIndexer
 
     torch.npu.set_device(0)
     torch.npu.set_per_process_memory_fraction(

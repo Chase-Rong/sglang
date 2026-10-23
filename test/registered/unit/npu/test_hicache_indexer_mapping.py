@@ -415,7 +415,8 @@ def test_constructor_copies_tree_params_before_components_and_kda_grid(monkeypat
     assert runtime.mamba_track_grid(cache.tree_core.page_size) == 1536
 
 
-def test_restore_plan_uses_radix_ancestors_and_registers_before_enqueue():
+def test_restore_plan_uses_radix_ancestors_and_registers_before_enqueue(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sglang.srt.hardware_backend.npu.hicache_indexer_mapping", MAPPING)
     mapping = make_mapping()
     mapping.update_request_pages(torch.tensor([3, 5]))
     allocator = compressed_allocator(mapping, page_size=8, index_kpool=2)

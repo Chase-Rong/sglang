@@ -262,7 +262,7 @@ class PrefillBootstrapQueue:
         num_draft_entries = 0
         if draft_kv_pool is not None:
             if kv_args.prefill_layerwise_offload:
-                from sglang.srt.hardware_backend.npu.offload_config import validate_mtp_pool_pair
+                from sglang.srt.hardware_backend.npu.hisparse.offload_config import validate_mtp_pool_pair
 
                 if getattr(draft_kv_pool, "prefill_layer_slots", None) is None:
                     raise ValueError("bounded target Prefill requires bounded draft KV")
@@ -928,10 +928,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         release_polls = [KVPoll.Success] * len(polls)
         draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
-        runtimes = [runtime for pool in (self.token_to_kv_pool, draft_pool)
-                    if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None]
+        target_pool = self.disagg_prefill_bootstrap_queue.token_to_kv_pool
+        runtimes = [
+            runtime
+            for pool in (target_pool, draft_pool)
+            if (runtime := getattr(pool, "prefill_offload_runtime", None)) is not None
+        ]
         if runtimes:
-            from sglang.srt.hardware_backend.npu.prefill_offload_runtime import PrefillReleaseCheck
+            from sglang.srt.hardware_backend.npu.hisparse.prefill_offload_runtime import PrefillReleaseCheck
 
             release_polls = poll_and_all_reduce_attn_cp_tp_group(
                 [PrefillReleaseCheck(runtimes, req.rid, req.disagg_kv_sender)

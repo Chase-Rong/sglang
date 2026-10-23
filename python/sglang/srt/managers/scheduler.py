@@ -112,7 +112,10 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hisparse_factory import (
+    release_hisparse_resources,
+    uses_hisparse_staging,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1224,7 +1227,7 @@ class Scheduler(
         )
 
     def init_hisparse_coordinator(self) -> None:
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hisparse_coordinator = None
         if not self.enable_hisparse:
             return
 
@@ -1819,9 +1822,7 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.destroy()
-        self.tree_cache.release_host_resources()
+        release_hisparse_resources(self)
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
         destroy_global_experts_capturer()
@@ -2049,8 +2050,9 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            if is_health_check_generate_req(recv_req) and (
+                not self.is_fully_idle(for_health_check=True)
+                or envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -3409,6 +3411,7 @@ class Scheduler(
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
         req_pool_indices = [r.kv.req_pool_idx for r in reqs]
@@ -3481,7 +3484,7 @@ class Scheduler(
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        if uses_hisparse_staging(self.hisparse_coordinator):
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -3494,7 +3497,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not uses_hisparse_staging(self.hisparse_coordinator)
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
@@ -3907,6 +3910,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
         new_batch.contains_last_prefill_chunk = (
@@ -4653,7 +4657,7 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
-        if not self.enable_hisparse and not deferred_pending:
+        if not uses_hisparse_staging(self.hisparse_coordinator) and not deferred_pending:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )

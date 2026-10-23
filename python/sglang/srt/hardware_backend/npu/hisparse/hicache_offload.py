@@ -191,7 +191,7 @@ class OffloadPageBinding:
                 "Host page-table output must cover the input on the same device and dtype"
             )
         if device_table.device.type == "npu":
-            from sglang.srt.hardware_backend.npu.hicache_page_table import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_page_table import (
                 fill_host_page_table,
             )
 
@@ -215,6 +215,20 @@ class OffloadPageBinding:
             return self.device_to_host_cpu[
                 rows // self.page_size
             ] * self.page_size + rows.remainder(self.page_size)
+
+    def pin_transfer_pages(self, device_pages):
+        with self.lock:
+            pages = torch.as_tensor(device_pages, dtype=torch.int64, device="cpu")
+            self._validate_device_pages(pages)
+            host_pages = self.device_to_host_cpu[pages].clone()
+            if (host_pages <= 0).any():
+                raise RuntimeError("PD transfer requires allocated Host pages")
+            self.references.index_add_(0, host_pages, torch.ones_like(host_pages))
+            return host_pages
+
+    def unpin_transfer_pages(self, host_pages):
+        with self.lock:
+            self._release(host_pages)
 
     def _release(self, pages):
         if not pages.numel():
@@ -304,8 +318,29 @@ class OffloadPageBinding:
 
 def get_offload_backing(kv_pool):
     pool = getattr(kv_pool, "full_kv_pool", kv_pool)
-    return (
-        getattr(pool, "decode_host_backing", None)
-        if getattr(pool, "integrated_offload", False)
-        else None
-    )
+    return getattr(pool, "decode_host_backing", None)
+
+
+def publish_received_host_kv(layer_pool):
+    """Record local readiness after the TP receive-success consensus.
+
+    Staging ACKs already wait for Host writes and receiver visibility, and
+    the scheduler MIN-reduces lease readiness across TP before calling here.
+    Another HCCL broadcast on the scheduling stream can interleave with
+    model collectives replayed on the forward stream.
+    """
+    backings = getattr(layer_pool, "host_backings", None)
+    if backings is None:
+        pool = getattr(layer_pool, "full_kv_pool", layer_pool)
+        backings = (pool.decode_host_backing,)
+    seen = set()
+    for backing in backings:
+        binding = backing.page_binding
+        if binding is None:
+            raise RuntimeError("PD receive requires HiCache page ownership")
+        if id(binding) in seen:
+            continue
+        seen.add(id(binding))
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        binding.ready_event = event

@@ -1176,7 +1176,7 @@ class AscendAttnBackend(AttentionBackend):
                 runtime = getattr(self.token_to_kv_pool, "prefill_offload_runtime", None)
                 start_hook = getattr(runtime, "on_compute_start", None)
                 if start_hook is not None:
-                    from sglang.srt.hardware_backend.npu.fsa_backend import sparse_pool_and_layer
+                    from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import sparse_pool_and_layer
 
                     pool, local_layer = sparse_pool_and_layer(self.token_to_kv_pool, layer.layer_id)
                     start_hook(pool.start_layer + local_layer)

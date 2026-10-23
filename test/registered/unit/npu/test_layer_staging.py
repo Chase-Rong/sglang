@@ -14,16 +14,16 @@ import test_prefill_layer_transfer as transfer_tests
 @pytest.fixture
 def modules(monkeypatch):
     loaded = transfer_tests.modules.__wrapped__(monkeypatch)
-    name = "sglang.srt.hardware_backend.npu.layer_staging"
+    name = "sglang.srt.hardware_backend.npu.hisparse.layer_staging"
     monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    transfer_tests.load_module(name, transfer_tests.NPU / "layer_staging.py")
+    transfer_tests.load_module(name, transfer_tests.NPU / "hisparse/layer_staging.py")
     return loaded
 
 
 def case(modules):
     protocol, transfer = modules
-    wire = importlib.import_module("sglang.srt.hardware_backend.npu.layer_protocol")
-    staging = importlib.import_module("sglang.srt.hardware_backend.npu.layer_staging")
+    wire = importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_protocol")
+    staging = importlib.import_module("sglang.srt.hardware_backend.npu.hisparse.layer_staging")
     record, sources, destinations = transfer_tests.inputs(*modules)
     record = replace(record, components=tuple(replace(item, bytes_per_page=256) for item in record.components))
     for index, component in enumerate(protocol.KvComponent):
@@ -65,6 +65,97 @@ def chunk(context, **overrides):
         **context.payload, "component": "latent_k", "offset": 0, "bytes": 32,
         "chunk": "chunk-0", "staging_registration": context.receiver.registration, **overrides,
     }
+
+
+def test_batched_staging_copies_discrete_pages_and_components_without_extra_window(
+    modules,
+):
+    context = case(modules)
+    context.window[:] = bytes(1024)
+    context.receiver.window_bytes = 1024
+    copied = []
+
+    def copy_batch(entries):
+        def complete():
+            for region, destination, count, source in entries:
+                region.owner[destination : destination + count] = context.window[
+                    source : source + count
+                ]
+            copied.append(len(entries))
+
+        return SimpleNamespace(synchronize=complete, query=lambda: True)
+
+    context.receiver.copy_batch = copy_batch
+    context.lease.staging = context.receiver.manifest()
+    rpc_calls = []
+    transfer_calls = []
+
+    def rpc(header, payload, timeout):
+        rpc_calls.append(header)
+        if header == b"FSA_STAGE_ACQUIRE":
+            return context.receiver.acquire(context.lease, payload)
+        result = context.receiver.commit(context.lease, payload)
+        assert context.receiver.commit(context.lease, payload) == result
+        return result
+
+    def transfer(blocks):
+        transfer_calls.append(blocks)
+        for source, destination, count in blocks:
+            region = next(
+                region
+                for region in context.sources.values()
+                if region.address <= source < region.address + region.nbytes
+            )
+            offset = source - region.address
+            target = destination - context.receiver.address
+            context.window[target : target + count] = region.owner[
+                offset : offset + count
+            ]
+        return 0
+
+    context.staging.execute_staged_layer(
+        context.operation,
+        context.spans,
+        context.receiver.manifest(),
+        context.payload,
+        rpc=rpc,
+        transfer=transfer,
+        timeout_s=1,
+    )
+    context.lease.receive(context.payload)
+    assert len(transfer_calls) == 1
+    assert rpc_calls == [b"FSA_STAGE_ACQUIRE", b"FSA_STAGE_COMMIT"]
+    assert copied == [len(context.spans)]
+    for span in context.spans:
+        source = context.sources[span.component]
+        destination = context.destinations[span.component]
+        source_offset = span.source_address - source.address
+        assert (
+            destination.owner[
+                span.destination_offset : span.destination_offset + span.nbytes
+            ]
+            == (source.owner[source_offset : source_offset + span.nbytes])
+        )
+
+
+def test_failed_staged_write_keeps_transport_undrained(modules):
+    context = case(modules)
+    with pytest.raises(RuntimeError, match="status"):
+        context.staging.execute_staged_layer(
+            context.operation,
+            context.spans,
+            context.receiver.manifest(),
+            context.payload,
+            rpc=lambda header, payload, timeout: context.receiver.acquire(
+                context.lease, payload
+            ),
+            transfer=lambda block: -1,
+            timeout_s=1,
+        )
+    assert context.operation.state == "failed"
+    assert not context.operation.transport_drained
+    with pytest.raises(RuntimeError, match="writers drain"):
+        context.receiver.abort(context.lease, transport_drained=False)
 
 
 def test_staged_client_transfers_three_components_through_one_fixed_window(modules):

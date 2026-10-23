@@ -2,7 +2,7 @@
 
 import torch
 
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import native_indexer_ops
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import native_indexer_ops
 
 
 class NativeCopySparseAttention:

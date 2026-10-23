@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from sglang.srt.hardware_backend.npu.fused_sparse_attention import (
+from sglang.srt.hardware_backend.npu.hisparse.fused_sparse_attention import (
     FusedSparseAttentionState,
     paged_kv_view,
     run_fused_sparse_attention,
@@ -26,14 +26,19 @@ def initialize_fsa_backend(backend, model_runner):
     from sglang.srt.configs.model_config import dsa_layer_skips_topk
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-    from sglang.srt.hardware_backend.npu.speculative_sparse import (
+    from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
         sparse_mtp_rows,
         sparse_mtp_tail,
     )
-    from sglang.srt.runtime_context import get_exec, get_spec
+    from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 
     backend.fused_sparse_state = None
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import (
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+    ):
+        return
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import (
         resolve_dsa_offload_backend,
     )
 
@@ -51,6 +56,10 @@ def initialize_fsa_backend(backend, model_runner):
         return
     if offload_backend == "external_plan":
         native_ops()
+    else:
+        from sglang.srt.hardware_backend.npu.hisparse.config import validate_lim_dtypes
+
+        validate_lim_dtypes(model_runner.kv_cache_dtype, model_runner.dtype)
     if backend.kv_lora_rank != 512 or backend.qk_rope_head_dim not in (0, 64):
         raise ValueError("FSA requires absorbed MLA latent=512 and RoPE=0 or 64")
     backend.fused_sparse_mode = envs.SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE.get()
@@ -92,7 +101,7 @@ def initialize_fsa_backend(backend, model_runner):
             model_runner.spec_algorithm, get_spec(), model_runner.model_config
         )
         if offload_backend == "lim_copy_sfa":
-            from sglang.srt.hardware_backend.npu.lim_copy_sfa_backend import (
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
                 LimCopySfaState,
             )
 
@@ -100,14 +109,17 @@ def initialize_fsa_backend(backend, model_runner):
                 model_runner.spec_algorithm, get_spec(), model_runner.model_config
             )
             if (
-                not envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+                getattr(
+                    getattr(owner, "full_kv_pool", owner), "decode_host_backing", None
+                )
+                is None
                 or backend.qk_rope_head_dim != 0
                 or backend.page_size != 128
                 or int(getattr(config, "index_kpool", 1)) != 4
                 or backend.fused_sparse_mode != "fused"
             ):
                 raise ValueError(
-                    "lim_copy_sfa requires GLM5Next NoPE KPool4 integrated offload"
+                    "lim_copy_sfa requires GLM5Next NoPE KPool4 Host offload"
                 )
             source_tokens = (
                 (model_runner.model_config.context_len + 128 + 511) // 512 * 512
@@ -179,13 +191,13 @@ def forward_fsa(
     pool, local_layer = sparse_pool_and_layer(backend.token_to_kv_pool, layer.layer_id)
     backing = getattr(pool, "decode_host_backing", None)
     full_table = metadata.real_page_table
-    if backing is not None and backing.integrated:
+    if backing is not None:
         full_table = metadata.host_page_table
         if full_table is None:
             raise RuntimeError("Integrated FSA requires the HiCache Host page table")
     if getattr(backend.fused_sparse_state, "backend_name", None) == "lim_copy_sfa":
-        if backing is None or not backing.integrated:
-            raise RuntimeError("LIM CopySFA requires integrated Host KV backing")
+        if backing is None or backing.page_binding is None:
+            raise RuntimeError("LIM CopySFA requires mapped Host KV backing")
         return backend.fused_sparse_state.forward(
             backend,
             q,
@@ -218,7 +230,6 @@ def forward_fsa(
             and getattr(forward_batch, "reuse_dsa_topk_indices", False)
             and forward_batch.forward_mode.is_decode()
             and backing is not None
-            and backing.integrated
             else None
         ),
     )

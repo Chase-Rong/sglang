@@ -19,7 +19,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu import hicache_mamba_pool
-from sglang.srt.hardware_backend.npu.hicache_offload import OffloadPageBinding
+from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
 from sglang.srt.managers import cache_controller as controller_module
 from sglang.srt.mem_cache import l2_transfer, memory_pool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -95,6 +95,7 @@ class CpuAdoptedHost(CpuHostSlots):
         self.device_pool = device_pool
         self.device_module = device
         self.layer_num = device_pool.layer_num
+        self.target_layer_num = device_pool.layer_num
         self.payload = torch.zeros(self.layer_num, self.size, 2)
         self.size_per_token = self.layer_num * 2 * self.payload.element_size()
         self.backing = SimpleNamespace(pool=SimpleNamespace(shared_group=None))
@@ -291,6 +292,10 @@ def unified_offload(monkeypatch):
             return CpuStateHost([state.temporal, *state.conv], device, device_pool.size)
 
         monkeypatch.setattr(hicache_mamba_pool, "NpuMambaPoolHost", mamba_host_factory)
+        monkeypatch.setattr(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.MambaPoolHost",
+            mamba_host_factory,
+        )
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=requests,

@@ -17,7 +17,7 @@ def device():
     import torch_npu
 
     device_id = int(os.environ["SGLANG_FSA_TEST_DEVICE_ID"])
-    torch.npu.set_device(device_id)
+    torch_npu.npu.set_device(device_id)
     return torch.device(f"npu:{device_id}")
 
 
@@ -60,7 +60,7 @@ def test_registered_host_copy_roundtrip_and_graph(device, dtype):
 
 
 def test_native_planner_expanded_topk_and_graph_replay(device):
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import NativeSparsePlanner
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import NativeSparsePlanner
 
     planner = NativeSparsePlanner(device, rows=1, topk=2051, capacity=4096)
     keys = torch.arange(2051, dtype=torch.int64, device=device).view(1, -1) + 128
@@ -92,7 +92,7 @@ def test_native_planner_expanded_topk_and_graph_replay(device):
 
 
 def test_clock_state_shared_by_two_graphs_and_eager(device, monkeypatch):
-    from sglang.srt.hardware_backend.npu.external_sparse_planner import NativeSparsePlanner
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import NativeSparsePlanner
 
     monkeypatch.setenv("SGLANG_NPU_FSA_PLANNER_POLICY", "clock")
     planner = NativeSparsePlanner(device, rows=6, topk=7, capacity=8)

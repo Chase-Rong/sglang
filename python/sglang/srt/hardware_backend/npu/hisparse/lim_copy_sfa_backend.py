@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_attention import (
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_attention import (
     NativeCopySparseAttention,
 )
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer import NativePooledIndexer
-from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer import NativePooledIndexer
+from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
     NativeIndexerManager,
 )
 
@@ -122,11 +122,11 @@ class LimCopySfaState:
         lengths = torch.where(active, lengths, 0)
         table = backend.forward_metadata.host_page_table
         if table is None:
-            raise RuntimeError("LIM requires integrated HiCache Host page mapping")
+            raise RuntimeError("LIM requires HiCache Host page mapping")
         return ends, lengths, requests, table
 
     def select(self, backend, batch, layer_id, query, key, weights, pool_table):
-        from sglang.srt.hardware_backend.npu.fsa_backend import sparse_pool_and_layer
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import sparse_pool_and_layer
 
         ends, lengths, requests, table = self.metadata(backend, batch, query.shape[0])
         pool, local_layer = sparse_pool_and_layer(backend.token_to_kv_pool, layer_id)
@@ -180,7 +180,7 @@ class LimCopySfaState:
         key = None
         identity = None
         if cache is not None:
-            from sglang.srt.hardware_backend.npu.fsa_backend import (
+            from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import (
                 sparse_pool_and_layer,
             )
 
@@ -232,7 +232,7 @@ class LimCopySfaState:
             reuse_plan=reuse_plan,
         )
         if cache is not None and not reuse_plan:
-            from sglang.srt.hardware_backend.npu.lim_copy_sfa_reuse import (
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_reuse import (
                 publish_draft_plan,
             )
 

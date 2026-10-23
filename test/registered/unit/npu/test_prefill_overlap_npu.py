@@ -76,7 +76,7 @@ def _request_rows(device):
 
 def bind_hicache_rows(pool, rows):
     """Bind real borrowed Host pages in reverse order before any forward."""
-    from sglang.srt.hardware_backend.npu.hicache_host_pool import MemFabricHiCachePool
+    from sglang.srt.hardware_backend.npu.hisparse.hicache_host_pool import MemFabricHiCachePool
 
     backing = pool.decode_host_backing
     host_pool = backing.bind_hicache(pool)
@@ -349,7 +349,7 @@ def _exercise_pipelined_overlap(
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.hardware_backend.npu.prefill_overlap import (
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_overlap import (
         PipelinedIntegratedOffloadRuntime,
     )
 

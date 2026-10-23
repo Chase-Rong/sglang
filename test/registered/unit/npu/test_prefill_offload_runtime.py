@@ -1,10 +1,13 @@
 """Production NPU pool methods and batched layer lifetime with CPU copy oracles."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import ast
 import contextlib
 import importlib.util
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +25,7 @@ def modules(monkeypatch):
     for name in ("sglang", "sglang.srt", "sglang.srt.hardware_backend", prefix):
         module = types.ModuleType(name)
         module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     modules = {}
     for name in (
         "prefill_offload",
@@ -31,9 +34,9 @@ def modules(monkeypatch):
         "prefill_offload_runtime",
     ):
         qualified = f"{prefix}.{name}"
-        spec = importlib.util.spec_from_file_location(qualified, NPU / f"{name}.py")
+        spec = importlib.util.spec_from_file_location(npu_module_name(qualified), npu_source_path(NPU / f"{name}.py"))
         module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, qualified, module)
+        monkeypatch.setitem(sys.modules, npu_module_name(qualified), module)
         spec.loader.exec_module(module)
         modules[name] = module
     return modules
@@ -137,7 +140,7 @@ def make_runtime(modules, *, layers=4, physical_slots=2, publish=None, start_lay
         request_pool,
         adapter,
         publish=publish or (lambda *args: [SimpleNamespace(state="acknowledged")]),
-        timeout_s=0.001,
+        timeout_s=0.1,
     )
     runtime.register_host_layers()
     pool.prefill_offload_runtime = runtime
@@ -236,6 +239,157 @@ def test_receiver_ack_timeout_retains_the_whole_batch_slot(modules):
     runtime.release_request("req-1")
 
 
+@pytest.mark.parametrize("transport_drained", [False, True])
+def test_shutdown_retains_slots_until_transport_drains(modules, transport_drained):
+    operation = SimpleNamespace(state="transferred", transport_drained=transport_drained)
+    runtime, pool, _ = make_runtime(
+        modules, layers=1, physical_slots=1, publish=lambda *args: [operation]
+    )
+    batch = make_batch(2, 0)
+    for sender in batch.prefill_offload_senders:
+        sender.abort = lambda: None
+    with pytest.raises(TimeoutError, match="ACK"):
+        with runtime.forward(batch):
+            pool.get_index_k_buffer(0)
+            runtime.finish_layer(0)
+    if not transport_drained:
+        with pytest.raises(TimeoutError, match="transport"):
+            runtime.drain_for_shutdown()
+        assert runtime.layers and runtime.slots.active_tokens()
+        operation.transport_drained = True
+    runtime.drain_for_shutdown()
+    runtime.drain_for_shutdown()
+    assert not runtime.layers and not runtime.slots.active_tokens()
+    assert runtime._publisher is None
+    assert operation.state == "drained"
+
+
+def test_staging_publication_overlaps_following_layer_and_retains_source_slot(modules):
+    started = threading.Event()
+    proceed = threading.Event()
+    operations = []
+
+    def publish(sender, work, binding, ready):
+        assert ready.query()
+        started.set()
+        assert proceed.wait(2)
+        operation = SimpleNamespace(state="acknowledged")
+        operations.append(operation)
+        return [operation]
+
+    runtime, pool, _ = make_runtime(modules, publish=publish)
+    runtime.timeout_s = 2
+    try:
+        runtime.begin_batch(make_batch(2, 0, request_count=1))
+        pool.get_kv_buffer(0)
+        runtime.finish_layer(0)
+        assert started.wait(1)
+        pool.get_kv_buffer(1)
+        assert runtime.slots.owner(0) is not None
+        assert not runtime.can_release_request("req-0")
+        proceed.set()
+        runtime.finish_layer(1)
+        for layer in (2, 3):
+            pool.get_kv_buffer(layer)
+            runtime.finish_layer(layer)
+        runtime.finish_batch()
+        assert len(operations) == 4
+        assert runtime.slots.active_tokens() == ()
+    finally:
+        proceed.set()
+        if runtime._publisher is not None:
+            runtime._publisher.shutdown(wait=True)
+
+
+def test_separate_prefill_uses_copy_streams_and_waits_for_prefetched_layer(
+    modules, monkeypatch
+):
+    runtime, pool, _ = make_runtime(modules)
+    pool.device = "npu:0"
+    trace = []
+    current = [None]
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            trace.append((self.name, "wait_stream", other.name))
+
+        def wait_event(self, event):
+            trace.append((self.name, "wait_event", event.stream.name))
+
+    class Event:
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return True
+
+    current[0] = Stream("compute")
+    streams = []
+
+    def create_stream(**kwargs):
+        stream = Stream(f"copy-{len(streams)}")
+        streams.append(stream)
+        return stream
+
+    @contextlib.contextmanager
+    def use_stream(stream):
+        previous = current[0]
+        current[0] = stream
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            Stream=create_stream,
+            Event=Event,
+            current_stream=lambda: current[0],
+            stream=use_stream,
+            set_device=lambda device: None,
+        ),
+        raising=False,
+    )
+
+    def record_event():
+        event = Event()
+        event.record(current[0])
+        return event
+
+    runtime.adapter.record_event = record_event
+    restore = runtime.adapter.restore_layer
+    save = runtime.adapter.save_layer
+
+    def restore_layer(work):
+        trace.append(("restore", work.token.logical_layer, current[0].name))
+        restore(work)
+
+    def save_layer(work):
+        trace.append(("save", work.token.logical_layer, current[0].name))
+        save(work)
+
+    runtime.adapter.restore_layer = restore_layer
+    runtime.adapter.save_layer = save_layer
+    try:
+        with runtime.forward(make_batch(2, 0, request_count=1)):
+            for layer in range(4):
+                pool.get_kv_buffer(layer)
+                trace.append(("compute", layer))
+                runtime.finish_layer(layer)
+        assert trace.index(("restore", 1, "copy-0")) < trace.index(("compute", 0))
+        assert ("save", 0, "copy-1") in trace
+        assert ("compute", "wait_event", "copy-0") in trace
+        assert ("copy-1", "wait_event", "compute") in trace
+    finally:
+        if runtime._publisher is not None:
+            runtime._publisher.shutdown(wait=True)
+
+
 def test_layer_access_after_attention_completion_is_rejected(modules):
     runtime, pool, host = make_runtime(modules, layers=1, physical_slots=1)
     runtime.begin_batch(make_batch(2, 0))
@@ -244,6 +398,103 @@ def test_layer_access_after_attention_completion_is_rejected(modules):
     with pytest.raises(RuntimeError, match="after attention"):
         pool.get_index_k_buffer(0)
     runtime.finish_batch()
+
+
+def test_rank_local_prefetch_does_not_require_collective_participation(
+    modules, monkeypatch
+):
+    identity_barrier = threading.Barrier(2, timeout=2)
+    compute_barrier = threading.Barrier(2, timeout=2)
+    publication_gate = threading.Event()
+    publication_started = threading.Event()
+    identities = [[], []]
+    prefetched = [None, None]
+
+    def writer_publish(sender, work, binding, ready):
+        publication_started.set()
+        assert publication_gate.wait(5)
+        return [SimpleNamespace(state="acknowledged")]
+
+    runtimes = [
+        make_runtime(modules, publish=writer_publish)[0],
+        make_runtime(modules)[0],
+    ]
+    stream = SimpleNamespace(wait_event=lambda event: None)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            stream=lambda stream: contextlib.nullcontext(),
+            current_stream=lambda: stream,
+            Event=lambda: SimpleNamespace(
+                record=lambda stream: None, query=lambda: True
+            ),
+        ),
+        raising=False,
+    )
+
+    def run_rank(rank):
+        runtime = runtimes[rank]
+
+        def validate_identity(identity):
+            identities[rank].append(identity)
+            identity_barrier.wait()
+            assert identities[0][-1] == identities[1][-1]
+            identity_barrier.wait()
+
+        runtime.adapter.host_pool.shared_group = SimpleNamespace(
+            validate_identity=validate_identity
+        )
+        runtime.h2d_stream = stream
+        runtime.timeout_s = 5
+        try:
+            runtime.begin_batch(make_batch(2, 0, request_count=1))
+            runtime.prepare_layer(0)
+            runtime.finish_layer(0)
+            if rank == 0:
+                assert publication_started.wait(2)
+            else:
+                runtime.layers[0].publication.result(timeout=2)
+            compute_barrier.wait()
+            runtime.prepare_layer(1)
+            prefetched[rank] = 2 in runtime.layers
+            compute_barrier.wait()
+            publication_gate.set()
+            runtime.finish_layer(1)
+            for layer_id in (2, 3):
+                runtime.prepare_layer(layer_id)
+                runtime.finish_layer(layer_id)
+            runtime.finish_batch()
+        finally:
+            publication_gate.set()
+            if runtime._publisher is not None:
+                runtime._publisher.shutdown(wait=True)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(run_rank, rank) for rank in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+    assert prefetched == [False, True]
+    assert len(identities[0]) == len(identities[1]) == 1
+    assert all(not runtime.layers for runtime in runtimes)
+
+
+def test_shared_batch_identity_failure_rolls_back_before_layer_work(modules):
+    runtime, pool, host = make_runtime(modules)
+
+    def reject_identity(identity):
+        raise ValueError("shared Host ranks disagree")
+
+    host.shared_group = SimpleNamespace(validate_identity=reject_identity)
+    with pytest.raises(ValueError, match="ranks disagree"):
+        runtime.begin_batch(make_batch(2, 0))
+    assert not runtime.active
+    assert not runtime.layers
+    assert not runtime.adapter.bindings
+    assert runtime.batch_id == 0
+    for request_id in ("req-0", "req-1"):
+        with pytest.raises(KeyError):
+            runtime.host_pages.allocation(request_id)
 
 
 def test_prefill_memory_budget_counts_physical_device_layers_and_all_host_layers(
@@ -318,7 +569,7 @@ def test_completed_request_can_release_while_an_unrelated_batch_is_active(module
 def test_release_poll_waits_for_target_draft_and_transport_drain(modules, monkeypatch):
     connection = types.ModuleType("sglang.srt.disaggregation.base.conn")
     connection.KVPoll = SimpleNamespace(WaitingForInput=1, Success=2)
-    monkeypatch.setitem(sys.modules, connection.__name__, connection)
+    monkeypatch.setitem(sys.modules, npu_module_name(connection.__name__), connection)
     ready = [True, False]
     runtimes = [SimpleNamespace(can_release_request=lambda request, index=index: ready[index])
                 for index in range(2)]

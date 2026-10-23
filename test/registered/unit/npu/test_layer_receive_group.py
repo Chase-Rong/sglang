@@ -1,5 +1,6 @@
 """Target/draft lease namespaces and shared staging inventory."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from types import SimpleNamespace
@@ -13,16 +14,16 @@ import test_layer_receive_protocol as protocol_tests
 def inputs(monkeypatch):
     modules = protocol_tests.modules.__wrapped__(monkeypatch)
     wire = protocol_tests.wire_module()
-    source = protocol_tests.transfer_tests.ROOT / "python/sglang/srt/hardware_backend/npu/layer_receive_group.py"
-    config_name = "sglang.srt.hardware_backend.npu.offload_config"
-    config_spec = importlib.util.spec_from_file_location(config_name, source.with_name("offload_config.py"))
+    source = protocol_tests.transfer_tests.ROOT / "python/sglang/srt/hardware_backend/npu/hisparse/layer_receive_group.py"
+    config_name = "sglang.srt.hardware_backend.npu.hisparse.offload_config"
+    config_spec = importlib.util.spec_from_file_location(npu_module_name(config_name), npu_source_path(source.with_name("offload_config.py")))
     config_module = importlib.util.module_from_spec(config_spec)
-    monkeypatch.setitem(sys.modules, config_name, config_module)
+    monkeypatch.setitem(sys.modules, npu_module_name(config_name), config_module)
     config_spec.loader.exec_module(config_module)
-    name = "sglang.srt.hardware_backend.npu.layer_receive_group"
-    spec = importlib.util.spec_from_file_location(name, source)
+    name = "sglang.srt.hardware_backend.npu.hisparse.layer_receive_group"
+    spec = importlib.util.spec_from_file_location(npu_module_name(name), npu_source_path(source))
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, npu_module_name(name), module)
     spec.loader.exec_module(module)
     lease, _, _, _, _ = protocol_tests.lease_inputs(modules)
     events = []

@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_factory import uses_native_hisparse
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
@@ -274,12 +275,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         if envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get():
-            from sglang.srt.hardware_backend.npu.decode_memory_budget import budget_from_config
+            from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import budget_from_config
 
             self._decode_budget = budget_from_config(kvc, num_layers)
             return self._decode_budget.device_bytes_per_token
         if envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get():
-            from sglang.srt.hardware_backend.npu.prefill_offload import (
+            from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
                 PrefillKvMemoryBudget,
             )
 
@@ -299,7 +300,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 + kvc.model_config.qk_rope_head_dim
                 + kvc.model_config.index_head_dim
             ) * torch._utils._element_size(kvc.kv_cache_dtype)
-            from sglang.srt.hardware_backend.npu.speculative_sparse import sparse_mtp_draft_layers
+            from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import sparse_mtp_draft_layers
 
             draft_layers = sparse_mtp_draft_layers(kvc)
             pooled_index = getattr(kvc.model_config.hf_text_config, "index_kpool", 1) > 1
@@ -326,7 +327,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if uses_native_hisparse()
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -447,9 +448,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
-        memory_config = get_memory()
         indexer_ratio = 1
-        if memory_config.enable_hisparse:
+        if uses_native_hisparse():
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
@@ -460,7 +460,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or kvc.server_args.enable_hisparse
+            or uses_native_hisparse()
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
@@ -966,7 +966,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if get_memory().enable_hisparse:
+        if uses_native_hisparse():
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio

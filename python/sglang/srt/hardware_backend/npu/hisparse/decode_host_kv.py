@@ -2,8 +2,6 @@
 
 import torch
 
-from sglang.srt.hardware_backend.npu.registered_host_kv import NpuRegisteredHostKvPool
-
 
 class DecodeHostKvBacking:
     def __init__(
@@ -31,8 +29,6 @@ class DecodeHostKvBacking:
             or host_token_capacity % page_size
         ):
             raise ValueError("Host token capacity must be nonnegative and page aligned")
-        if host_token_capacity and not integrated:
-            raise ValueError("Independent Host capacity requires integrated offload")
         pages = max(pages, host_token_capacity // page_size + 1)
         required = layers * pages * page_size * (latent_dim + rope_dim)
         required *= torch.empty((), dtype=dtype).element_size()
@@ -40,21 +36,16 @@ class DecodeHostKvBacking:
             raise ValueError(
                 f"Decode Host KV requires {required} bytes, budget is {host_budget}"
             )
-        if integrated:
-            from sglang.srt.hardware_backend.npu.memfabric_host_kv import (
-                MemFabricHostKvPool,
-            )
+        from sglang.srt.hardware_backend.npu.memfabric_host_kv import (
+            MemFabricHostKvPool,
+        )
 
-            self.pool = MemFabricHostKvPool(
-                device_id,
-                required_bytes=required,
-                reserve_bytes=host_budget,
-                shared_group=shared_group,
-            )
-        elif shared_group is None:
-            self.pool = NpuRegisteredHostKvPool(device_id)
-        else:
-            self.pool = NpuRegisteredHostKvPool(device_id, shared_group=shared_group)
+        self.pool = MemFabricHostKvPool(
+            device_id,
+            required_bytes=required,
+            reserve_bytes=host_budget,
+            shared_group=shared_group,
+        )
         self.page_size = page_size
         self.pages = pages
         self.regions = []
@@ -99,13 +90,11 @@ class DecodeHostKvBacking:
         )
 
     def bind_hicache(self, device_pool):
-        if not self.integrated:
-            raise ValueError("HiCache binding requires integrated Host offload")
         if self.hicache_pool is None:
-            from sglang.srt.hardware_backend.npu.hicache_host_pool import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_host_pool import (
                 MemFabricHiCachePool,
             )
-            from sglang.srt.hardware_backend.npu.hicache_offload import (
+            from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
                 OffloadPageBinding,
             )
 
@@ -119,10 +108,9 @@ class DecodeHostKvBacking:
 
     def write_current(self, layer_id, locations, latent, rope):
         destinations = locations.reshape(-1).to(dtype=torch.int64).contiguous()
-        if self.integrated:
-            if self.page_binding is None:
-                raise RuntimeError("Integrated offload requires HiCache page ownership")
-            destinations = self.page_binding.host_rows(destinations)
+        if self.page_binding is None:
+            raise RuntimeError("Host offload requires HiCache page ownership")
+        destinations = self.page_binding.host_rows(destinations)
         source_rows = torch.arange(
             destinations.numel(), device=locations.device, dtype=torch.int64
         )

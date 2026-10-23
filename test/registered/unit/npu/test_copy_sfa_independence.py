@@ -1,5 +1,6 @@
 """CopySFA source ownership and device-capacity allocation contracts."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import ast
 import re
@@ -37,7 +38,7 @@ def test_copy_sfa_workspace_uses_device_core_capacity(monkeypatch):
     calls = []
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.hardware_backend.npu.lim_copy_sfa_indexer",
+        npu_module_name("sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_indexer"),
         SimpleNamespace(native_indexer_ops=lambda: object()),
     )
     monkeypatch.setattr(
@@ -51,8 +52,8 @@ def test_copy_sfa_workspace_uses_device_core_capacity(monkeypatch):
     monkeypatch.setattr(
         torch, "empty", lambda size, **kwargs: calls.append((size, kwargs))
     )
-    path = ROOT / "python/sglang/srt/hardware_backend/npu/lim_copy_sfa_attention.py"
-    spec = importlib.util.spec_from_file_location("copy_sfa_allocation", path)
+    path = ROOT / "python/sglang/srt/hardware_backend/npu/hisparse/lim_copy_sfa_attention.py"
+    spec = importlib.util.spec_from_file_location(npu_module_name("copy_sfa_allocation"), npu_source_path(path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     operator = module.NativeCopySparseAttention("npu:0", row_capacity=60)
@@ -66,7 +67,7 @@ def test_copy_sfa_workspace_uses_device_core_capacity(monkeypatch):
 
 
 def test_copy_sfa_serving_adapter_does_not_import_fsa_implementation():
-    directory = ROOT / "python/sglang/srt/hardware_backend/npu"
+    directory = ROOT / "python/sglang/srt/hardware_backend/npu/hisparse"
     for filename in ("lim_copy_sfa_attention.py", "lim_copy_sfa_backend.py"):
         tree = ast.parse((directory / filename).read_text(encoding="utf-8"))
         for node in ast.walk(tree):

@@ -1,5 +1,6 @@
 """Serving dispatch, seed semantics and memory accounting without NPU allocation."""
 
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 from dataclasses import replace
@@ -15,9 +16,9 @@ PREFIX = "sglang.srt.hardware_backend.npu."
 
 
 def load(name, monkeypatch):
-    spec = importlib.util.spec_from_file_location(PREFIX + name, NPU / (name + ".py"))
+    spec = importlib.util.spec_from_file_location(npu_module_name(PREFIX + name), npu_source_path(NPU / (name + ".py")))
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, PREFIX + name, module)
+    monkeypatch.setitem(sys.modules, npu_module_name(PREFIX + name), module)
     spec.loader.exec_module(module)
     return module
 
@@ -58,7 +59,7 @@ def fixture(monkeypatch):
         "lim_copy_sfa_native_plan": {"NativeIndexerManager": Planner},
         "lim_copy_sfa_attention": {"NativeCopySparseAttention": Copy},
     }.items():
-        monkeypatch.setitem(sys.modules, PREFIX + name, SimpleNamespace(**members))
+        monkeypatch.setitem(sys.modules, npu_module_name(PREFIX + name), SimpleNamespace(**members))
     module = load("lim_copy_sfa_backend", monkeypatch)
     adapter = load("fsa_backend", monkeypatch)
     pool = SimpleNamespace(
@@ -76,7 +77,11 @@ def fixture(monkeypatch):
     )
     host = torch.empty(4096, 512, dtype=torch.bfloat16)
     region = SimpleNamespace(tensor=host)
-    backing = SimpleNamespace(integrated=True, regions=[(region, None), (region, None)])
+    backing = SimpleNamespace(
+        integrated=True,
+        regions=[(region, None), (region, None)],
+        page_binding=SimpleNamespace(mapping_epoch=0),
+    )
     sparse_pool = SimpleNamespace(start_layer=0, decode_host_backing=backing)
     kv_pool = SimpleNamespace(
         full_kv_pool=sparse_pool,
@@ -175,7 +180,7 @@ def test_seeded_draft_chain_publishes_once_then_reuses(fixture, monkeypatch):
     batch.draft_sparse_plan_cache = {}
     monkeypatch.setitem(
         sys.modules,
-        PREFIX + "lim_copy_sfa_reuse",
+        npu_module_name(PREFIX + "lim_copy_sfa_reuse"),
         SimpleNamespace(
             publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
         ),
@@ -210,7 +215,7 @@ def test_draft_cache_cannot_reuse_an_older_seed_after_replanning(fixture, monkey
     batch.draft_sparse_plan_cache = {}
     monkeypatch.setitem(
         sys.modules,
-        PREFIX + "lim_copy_sfa_reuse",
+        npu_module_name(PREFIX + "lim_copy_sfa_reuse"),
         SimpleNamespace(
             publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
         ),
@@ -237,7 +242,7 @@ def test_draft_template_invalidates_on_identity_changes(fixture, monkeypatch, ch
     backend.token_to_kv_pool.full_kv_pool.decode_host_backing.page_binding = binding
     monkeypatch.setitem(
         sys.modules,
-        PREFIX + "lim_copy_sfa_reuse",
+        npu_module_name(PREFIX + "lim_copy_sfa_reuse"),
         SimpleNamespace(
             publish_draft_plan=lambda *args, **kwargs: calls.append("publish")
         ),
@@ -347,7 +352,7 @@ def test_lim_budget_counts_device_map_and_request_shared_payload(monkeypatch):
 @pytest.mark.parametrize("configured", [None, "external_plan", "lim_copy_sfa"])
 def test_backend_default_and_explicit_override(monkeypatch, configured):
     spec = importlib.util.spec_from_file_location(
-        "lim_test_environ", ROOT / "python/sglang/srt/environ.py"
+        npu_module_name("lim_test_environ"), npu_source_path(ROOT / "python/sglang/srt/environ.py")
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -366,7 +371,7 @@ def test_disabled_fusion_accepts_implicit_default_only(fixture, monkeypatch, exp
     _, adapter, _, _, _, _, _, _ = fixture
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.environ",
+        npu_module_name("sglang.srt.environ"),
         SimpleNamespace(
             envs=SimpleNamespace(
                 SGLANG_NPU_DSA_OFFLOAD_BACKEND=SimpleNamespace(
@@ -382,11 +387,14 @@ def test_disabled_fusion_accepts_implicit_default_only(fixture, monkeypatch, exp
         "sglang.srt.configs.model_config": ("dsa_layer_skips_topk",),
         PREFIX + "fsa_native": ("native_ops",),
         PREFIX + "speculative_sparse": ("sparse_mtp_rows", "sparse_mtp_tail"),
-        "sglang.srt.runtime_context": ("get_exec", "get_spec"),
+        "sglang.srt.runtime_context": ("get_disagg", "get_exec", "get_spec"),
     }.items():
         monkeypatch.setitem(
-            sys.modules, name, SimpleNamespace(**dict.fromkeys(symbols))
+            sys.modules, npu_module_name(name), SimpleNamespace(**dict.fromkeys(symbols))
         )
+    sys.modules[npu_module_name("sglang.srt.runtime_context")].get_disagg = (
+        lambda: SimpleNamespace(disaggregation_mode="null")
+    )
     backend = SimpleNamespace()
     if explicit:
         with pytest.raises(ValueError, match="requires fused sparse attention"):

@@ -50,7 +50,21 @@ def set_default_server_args(args: "ServerArgs"):
 
     cfg = resolving_view(args)
 
-    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get():
+    from sglang.srt.hardware_backend.npu.hisparse.config import (
+        resolve_npu_hisparse_config,
+    )
+
+    hisparse = resolve_npu_hisparse_config(cfg)
+    if hisparse is not None:
+        hisparse.apply_environment()
+        declare_resolution(args, "npu_hisparse", enable_hisparse=True)
+        if hisparse.role == "prefill":
+            declare_resolution(args, "npu_hisparse_prefill", disable_radix_cache=True)
+
+    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get() or (
+        cfg.disaggregation_mode == "decode"
+        and envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get() > 0
+    ):
         if (
             cfg.enable_unified_cache_external_linker
             or cfg.hicache_storage_backend is not None

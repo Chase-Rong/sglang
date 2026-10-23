@@ -17,8 +17,8 @@ pytestmark = pytest.mark.skipif(
 def test_native_commit_ignores_poisoned_union_suffix(valid_tokens):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeUnionPlanner,
     )
 
@@ -54,7 +54,7 @@ def test_native_commit_ignores_poisoned_union_suffix(valid_tokens):
 
 @pytest.mark.parametrize("batch,routes", [(1, 1), (1, 6), (10, 1), (10, 6)])
 def test_native_plan_matches_reference(batch, routes):
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeUnionPlanner,
     )
 
@@ -70,8 +70,8 @@ def test_native_plan_eviction_generation_remap_rollback_and_padding(
 ):
     import torch_npu  # noqa: F401
 
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_contract import LimCopySfaSpec
-    from sglang.srt.hardware_backend.npu.lim_copy_sfa_native_plan import (
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_contract import LimCopySfaSpec
+    from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_native_plan import (
         NativeUnionPlanner,
     )
 

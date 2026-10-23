@@ -1,3 +1,4 @@
+from npu_test_paths import npu_module_name, npu_source_path
 import importlib.util
 import sys
 import types
@@ -15,7 +16,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 def load(name):
     spec = importlib.util.spec_from_file_location(
-        name, PATH / f"{name.rsplit('.', 1)[-1]}.py"
+        npu_module_name(name), npu_source_path(PATH / f"{name.rsplit('.', 1)[-1]}.py")
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -34,9 +35,9 @@ for package in (
     module.__path__ = []
     sys.modules[package] = module
 
-protocol = load("sglang.srt.hardware_backend.npu.prefill_offload")
+protocol = load("sglang.srt.hardware_backend.npu.hisparse.prefill_offload")
 load("sglang.srt.hardware_backend.npu.registered_host_kv")
-adapter_module = load("sglang.srt.hardware_backend.npu.prefill_offload_adapter")
+adapter_module = load("sglang.srt.hardware_backend.npu.hisparse.prefill_offload_adapter")
 
 
 def test_adapter_builds_component_descriptors_without_cpu_pointers():

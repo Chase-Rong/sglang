@@ -142,7 +142,7 @@ def build_kv_host_pool(
     pool_label: str = "kv",
     npu_resident_hicache: bool = False,
 ):
-    if getattr(kv_pool, "integrated_offload", False):
+    if getattr(kv_pool, "decode_host_backing", None) is not None:
         _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
         backing = getattr(kv_pool, "decode_host_backing", None)
         host_pool = getattr(backing, "hicache_pool", None)
@@ -219,7 +219,7 @@ def _validate_npu_hicache_parallel(kv_pool: Any, draft_pools: tuple) -> None:
         or getattr(kv_pool, "layer_shard_enabled", False)
     ):
         raise NotImplementedError("NPU integrated/indexer HiCache CP is unsupported")
-    if draft_pools and getattr(kv_pool, "integrated_offload", False):
+    if draft_pools and (getattr(kv_pool, "decode_host_backing", None) is not None):
         backing = getattr(kv_pool, "decode_host_backing", None)
         host = getattr(backing, "hicache_pool", None)
         binding = getattr(backing, "page_binding", None)
@@ -233,7 +233,9 @@ def _validate_npu_hicache_parallel(kv_pool: Any, draft_pools: tuple) -> None:
                 for index, pool in enumerate(draft_pools)
             )
         ):
-            raise ValueError("NPU HiCache MTP requires shared target/draft page ownership")
+            raise ValueError(
+                "NPU HiCache MTP requires shared target/draft page ownership"
+            )
 
 
 def _split_hicache_size(
@@ -872,7 +874,9 @@ def build_hybrid_mamba_stack(
     has_npu_indexer = _has_npu_compressed_indexer(kv_pool)
     if has_npu_indexer:
         _validate_npu_hicache_parallel(kv_pool, mtp_draft_device_pools)
-        if getattr(kv_pool, "integrated_offload", False) and get_memory().hicache_size > 0:
+        if (
+            getattr(kv_pool, "decode_host_backing", None) is not None
+        ) and get_memory().hicache_size > 0:
             raise ValueError(
                 "NPU compressed-indexer HiCache does not support --hicache-size: "
                 "the existing KV backing, compressed indexer and Mamba have separate "
@@ -1924,7 +1928,8 @@ def _apply_stack_result(
         cache.register_sidecar_pool(sidecar)
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
-    if getattr(getattr(kvcache, "full_kv_pool", kvcache), "integrated_offload", False):
+    offload_pool = getattr(kvcache, "full_kv_pool", kvcache)
+    if getattr(offload_pool, "decode_host_backing", None) is not None:
         # Packed single-layer drafts restore in transfer stage 0. Register on
         # the outer pool too: HybridLinearKVPool supplies global-layer waits.
         for draft_pool in params.mtp_draft_device_pools:

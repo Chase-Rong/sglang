@@ -115,7 +115,7 @@ class DecodeKvMemoryBudget:
             self.layers * layer_bytes + self.planner_groups * planner_device
         )
         host = self.planner_groups * (rows * planner_host + scratch)
-        staging = self.staging_bytes + 9 if self.staging_bytes else 0
+        staging = self.staging_bytes
         return host, device + self.shared_fence_bytes + staging
 
     def _lim_fixed_bytes(self, request_rows, page_size):
@@ -139,7 +139,7 @@ class DecodeKvMemoryBudget:
         shared = (rows * (12 + 512 * 4 + 2051 * 4 + pools * 12 + pools // 128 * 4)
                   + 64 * 4 * pools * 4 + 64 * 3 * 128 * 576 * 2 + owners * 8
                   + rows * 512 * 512 * 2 + 32)
-        staging = self.staging_bytes + 9 if self.staging_bytes else 0
+        staging = self.staging_bytes
         return 0, (self.layers * per_layer + self.lim_runtime_instances * shared
                    + self.shared_fence_bytes + staging)
 
@@ -278,7 +278,8 @@ def budget_from_config(kvc, layers):
 
     from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
     from sglang.srt.environ import envs
-    from sglang.srt.hardware_backend.npu.speculative_sparse import (
+    from sglang.srt.hardware_backend.npu.hisparse.offload_config import layer_staging_bytes
+    from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
         sparse_mtp_draft_layers,
         sparse_mtp_rows,
     )
@@ -337,16 +338,20 @@ def budget_from_config(kvc, layers):
         )
         + 1,
         shared_fence_bytes=4 if envs.SGLANG_NPU_SHARED_HOST_KV.get() else 0,
-        staging_bytes=envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
+        staging_bytes=layer_staging_bytes(
+            envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
+            role=get_disagg().disaggregation_mode,
+            host_offload=envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get() > 0,
+            integrated=envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get(),
+        ),
         rows_per_request=rows_per_request,
         prefill_layer_slots=prefill_slots,
-        host_token_capacity=(
-            envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
-            if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+        host_token_capacity=(envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()),
+        backend=envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get(),
+        lim_source_tokens=(
+            model.context_len + 128
+            if envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
             else 0
         ),
-        backend=envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get(),
-        lim_source_tokens=(model.context_len + 128
-                           if envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa" else 0),
         lim_runtime_instances=1 + int(draft_layers > 0),
     )

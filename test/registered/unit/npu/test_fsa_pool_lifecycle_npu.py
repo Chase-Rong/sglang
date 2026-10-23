@@ -19,7 +19,7 @@ def test_integrated_prefill_decode_share_host_and_reuse_slots(dtype):
 
 def exercise_integrated_slots(dtype, device_id, shared_group=None):
     import torch_npu
-    from sglang.srt.hardware_backend.npu.prefill_overlap import (
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_overlap import (
         PipelinedIntegratedOffloadRuntime,
     )
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -152,10 +152,10 @@ def test_real_prefill_slots_restore_prefix_and_keep_kpool_resident(dtype):
 def exercise_prefill_slots(dtype, device_id, shared_group=None):
     import torch_npu
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.hardware_backend.npu.prefill_offload_adapter import (
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_offload_adapter import (
         NpuPrefillOffloadAdapter,
     )
-    from sglang.srt.hardware_backend.npu.prefill_offload_runtime import (
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_offload_runtime import (
         NpuPrefillOffloadRuntime,
     )
     from sglang.srt.hardware_backend.npu.registered_host_kv import (
@@ -264,8 +264,8 @@ def exercise_prefill_slots(dtype, device_id, shared_group=None):
 def test_real_decode_current_write_graph_and_large_staging_copy(dtype):
     import torch_npu
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.hardware_backend.npu.layer_staging import create_npu_layer_staging
-    from sglang.srt.hardware_backend.npu.prefill_offload import KvComponent
+    from sglang.srt.hardware_backend.npu.hisparse.layer_staging import create_npu_layer_staging
+    from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import KvComponent
 
     device_id = int(os.environ["SGLANG_FSA_TEST_DEVICE_ID"])
     torch_npu.npu.set_device(device_id)

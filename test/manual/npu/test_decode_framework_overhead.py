@@ -252,7 +252,7 @@ def test_replay_profile_range_is_visible():
 
 
 def test_host_page_table_replay_clears_padding_and_follows_remapping():
-    from sglang.srt.hardware_backend.npu.hicache_offload import OffloadPageBinding
+    from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
 
     backend, forward = metadata_case(ROOT, 10, 129)
     binding = OffloadPageBinding.__new__(OffloadPageBinding)
