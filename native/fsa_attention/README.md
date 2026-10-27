@@ -39,6 +39,16 @@ therefore avoid re-reading token IDs and full-KV block tables. Padding, causal
 limits and mutable MTP tails remain part of the framework plan and attention
 mask. No host synchronization or planner ABI change is introduced.
 
+Within one kernel launch, each AIV reads and validates a query row's external
+plan control header once. Later 128-column tiles reuse that row's addressing
+fields, while every tile still loads its current signed plan slice. Changing
+the query row reloads the header; every launch and Graph replay starts with
+an empty header cache. An invalid marker, plan range or short plan disables
+the external plan for that tile and retains the original Host fallback.
+For a full 2051-column query this removes 16 control-header transfers and
+their MTE2-to-scalar waits per AIV. It adds two scalar fields, with no extra
+HBM workspace, UB allocation or cross-core events.
+
 This is an A5 adaptation, not a replacement with the donor's A2 kernel. The
 128-token attention tile, 16-row UB windows, three workspace buffers and A5
 cross-core events are retained. The donor's workspace readback optimizations
@@ -47,11 +57,22 @@ from UB. Its idle-core helper/credit-ring scheduler is not part of this port;
 it requires a separate A5 scheduling and synchronization implementation. The
 donor's disabled split-KV, removed wave scheduler and debug probes are not used.
 
-Build only this OPP against the installed CANN9.1 template:
+Build only this OPP against the installed CANN template. The qualified offload
+image provides the preparation helpers below; this checkout does not contain
+the historical `scripts/npu` build tools. Copy those helpers together with the
+current sources into a new isolated work directory before building:
 
 ```bash
-export SGLANG_FSA_WORK_DIR=/home/j00628475/fsa_glm53_a5_20260915
-bash scripts/npu/build_fsa_attention_opp.sh "$SGLANG_FSA_WORK_DIR/attention-opp-new"
+source /opt/sglang-offload/set_env.sh
+export SGLANG_FSA_WORK_DIR=/home/j00628475/fsa-build-new
+mkdir -p "$SGLANG_FSA_WORK_DIR/source/scripts/npu"
+mkdir -p "$SGLANG_FSA_WORK_DIR/source/native"
+cp -a native/fsa_attention "$SGLANG_FSA_WORK_DIR/source/native/"
+cp /opt/sglang-offload/source/scripts/npu/build_fsa_attention_opp.sh \
+    /opt/sglang-offload/source/scripts/npu/prepare_fsa_opp.py \
+    "$SGLANG_FSA_WORK_DIR/source/scripts/npu/"
+bash "$SGLANG_FSA_WORK_DIR/source/scripts/npu/build_fsa_attention_opp.sh" \
+    "$SGLANG_FSA_WORK_DIR/attention-opp-new"
 ```
 
 The build directory must be new. Nothing is installed into the global CANN
@@ -59,20 +80,22 @@ tree. The vendor is under `install/packages/vendors/sgl_fsa_a5`. The separate
 `native/fsa` Torch extension is also required; the installed sgl-kernel-npu
 wheel remains unchanged.
 
-After verifying a healthy idle physical card, run:
+The registered original-FSA regression has an independent CPU attention oracle
+and checks all selection-cache payloads exactly, including untouched slots:
 
 ```bash
-export SGLANG_FSA_OPP_VENDOR="$SGLANG_FSA_WORK_DIR/attention-opp-v8/install/packages/vendors/sgl_fsa_a5"
-export SGLANG_NPU_FSA_EXTENSION="$SGLANG_FSA_WORK_DIR/native-build-v5/libsgl_fsa_extension.so"
-export SGLANG_FSA_TEST_DEVICE_ID=1
-bash scripts/npu/run_fsa_attention_ut.sh -x -vv
+export SGLANG_NPU_OFFLOAD_TEST=1
+export SGLANG_FSA_TEST_DEVICE_ID=7
+export SGLANG_FSA_OPP_VENDOR=/path/to/opp/install/packages/vendors/sgl_fsa_a5
+export ASCEND_CUSTOM_OPP_PATH="$SGLANG_FSA_OPP_VENDOR"
+export SGLANG_NPU_FSA_EXTENSION=/path/to/libsgl_fsa_extension.so
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest -q test/registered/kernels/ops/attention/test_fsa_attention_npu.py
 ```
 
-The runner rechecks device occupancy and preserves existing OPP paths. There
-is no atomic reservation against other sessions starting jobs concurrently.
-Do not run while another task owns the selected NPU.
-
-Build and54 hardware tests passed on34, including attention precision,
-external-plan reuse, Graph, MTP and local Prefill/Decode Host-copy lifecycle.
-See `FSA_OFFLOAD_MIGRATION.md` for coverage and logs. Whole-model1M execution,
-real P/D transport and throughput are separate end-to-end gates.
+Select a card with available resources before running. The tests cap their CPU
+and NPU tensor budgets at 512 MiB each; runtime/library allocations are outside
+that bound. Coverage includes 0/80/99/100% hits, MTP query counts, short causal
+masks, direct/paged selection, header relocation/fallback and mutable Graph
+inputs. Component precision and Graph timing do not establish model accuracy,
+MTP acceptance, P/D correctness or end-to-end TPOT.
