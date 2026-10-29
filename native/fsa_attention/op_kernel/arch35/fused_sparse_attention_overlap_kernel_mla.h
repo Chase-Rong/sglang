@@ -48,7 +48,7 @@ public:
                                 __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
                                 __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
                                 __gm__ uint8_t *selectionMembershipMap, __gm__ uint8_t *attentionOut,
-                                __gm__ uint8_t *selectionKvActualSeq, __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *selectionKvActualSeq, __gm__ uint8_t *sharedRowUnion, __gm__ uint8_t *sharedUnionKeys, __gm__ uint8_t *sharedUnionCount, __gm__ uint8_t *sharedReady, __gm__ uint8_t *sharedCounters, __gm__ uint8_t *sharedRequestSlots, __gm__ uint8_t *sharedUnionSlots, __gm__ uint8_t *workspace,
                                 const FusedSparseAttentionOverlapTilingDataMla *__restrict tiling,
                                 __gm__ uint8_t *gmTiling, TPipe *tPipe);
     __aicore__ inline void Process();
@@ -118,6 +118,7 @@ private:
     CubeBlockType cubeBlock;
     VecBlockType vecBlock;
 
+    uint32_t sharedRequestBegin=0,sharedRequestEnd=0;
     uint32_t crossCoreSyncBufId = 0;
 };
 
@@ -130,7 +131,7 @@ template <typename CubeBlockType, typename VecBlockType>
     __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
     __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
     __gm__ uint8_t *selectionMembershipMap, __gm__ uint8_t *attentionOut,
-    __gm__ uint8_t *selectionKvActualSeq,
+    __gm__ uint8_t *selectionKvActualSeq, __gm__ uint8_t *sharedRowUnion, __gm__ uint8_t *sharedUnionKeys, __gm__ uint8_t *sharedUnionCount, __gm__ uint8_t *sharedReady, __gm__ uint8_t *sharedCounters, __gm__ uint8_t *sharedRequestSlots, __gm__ uint8_t *sharedUnionSlots,
     __gm__ uint8_t *workspace, const FusedSparseAttentionOverlapTilingDataMla *__restrict tiling,
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -178,6 +179,7 @@ template <typename CubeBlockType, typename VecBlockType>
         blockTable, actualSeqLengthsQ, actualSeqLengths, selectionKRope, selectionKvCache, \
         selectionKvBlockTable, selectionKvBlockStatus, selectionMembershipMap, selectionKvActualSeq, \
         workspace, tiling, tPipe); // Configure GM
+    vecBlock.InitSharedV3(sharedRowUnion, sharedUnionKeys, sharedUnionCount, sharedReady, sharedCounters, sharedRequestSlots, sharedUnionSlots);
     this->InitCalcParamsEach();
     this->InitLocalBuffer();
 }
@@ -185,94 +187,18 @@ template <typename CubeBlockType, typename VecBlockType>
 template <typename CubeBlockType, typename VecBlockType> __aicore__ inline
 void FusedSparseAttentionOverlapKernelMla<CubeBlockType, VecBlockType>::InitCalcParamsEach()
 {
-    // Calculate the total number of base blocks.
-    maxS2LoopCnt = 0; // Maximum accumulated s2Loop count across all cores
-    uint32_t totalBaseNum = 0;
-    uint32_t s1GBaseSize = constInfo.gSize;
-    uint32_t actBatchS2 = 1;
-    uint32_t coreNum = GetBlockNum(); // For G=128, two adjacent Cube cores process one S1, so halve coreNum
-    uint32_t currCoreIdx = aicIdx;
-    if constexpr (IS_SPLIT_G) {
-        coreNum = coreNum >> 1;
-        currCoreIdx = currCoreIdx >> 1;
-    }
-    uint32_t actBatchS1 = 1;
-    for (uint32_t bIdx = 0; bIdx < constInfo.bSize; bIdx++) {
-        actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx); // S2 is not split; only S1 is considered
-        if (actBatchS1 < constInfo.s1Size) {
-            constInfo.needInit = true;
-        }
-        totalBaseNum += actBatchS1 * actBatchS2;
-    }
-    uint32_t avgBaseNum = 1;
-    if (totalBaseNum > coreNum) {
-        avgBaseNum = (totalBaseNum + coreNum - 1) / coreNum;
-        if constexpr (IS_SPLIT_G) {
-            usedCoreNum = (totalBaseNum + avgBaseNum - 1) / avgBaseNum << 1;
-        }
-    } else {
-        if constexpr (IS_SPLIT_G) {
-            usedCoreNum = totalBaseNum << 1;
-        } else {
-            usedCoreNum = totalBaseNum;
-        }
-    }
+    // Contiguous request ranges, never split one request across AIC groups.
+    uint32_t cores=GetBlockNum();
+    uint32_t first=constInfo.bSize*aicIdx/cores;
+    uint32_t end=constInfo.bSize*(aicIdx+1)/cores;
+    sharedRequestBegin=first;sharedRequestEnd=end;
+    usedCoreNum=cores;
+    constInfo.bN2Start=first;constInfo.gS1Start=0;
+    if(first<end) {
+        constInfo.bN2End=end-1;
+        constInfo.gS1End=GetBalanceActualSeqLengths(actualSeqLengthsQGm,end-1)>0?GetBalanceActualSeqLengths(actualSeqLengthsQGm,end-1)-1:0;
+    }else {constInfo.bN2End=first;constInfo.gS1End=0;}
 
-    if constexpr (IS_SPLIT_G) {
-        maxS2LoopCnt = avgBaseNum * (constInfo.sparseBlockCount + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-    }
-
-    if (aicIdx >= usedCoreNum) {
-        return;
-    }
-	// Calculate the base blocks assigned to the current core.
-    uint32_t accumBaseNum = 0; // Number of base blocks accumulated so far
-    uint32_t targetBaseNum = 0;
-    uint32_t lastValidBIdx = 0;
-    uint32_t lastValidactBatchS1 = 0;
-    bool setStart = false;
-    targetBaseNum = (currCoreIdx + 1) * avgBaseNum; // Calculate the target workload for the current core
-    uint32_t targetStartBaseNum = targetBaseNum - avgBaseNum;
-    for (uint32_t bN2Idx = 0; bN2Idx < constInfo.bSize * constInfo.n2Size; bN2Idx++) {
-        uint32_t bIdx = bN2Idx / constInfo.n2Size;
-        actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx);
-        for (uint32_t s1GIdx = 0; s1GIdx < actBatchS1; s1GIdx++) {
-            accumBaseNum += 1;
-            if (!setStart && accumBaseNum >= targetStartBaseNum) {
-                constInfo.bN2Start = bN2Idx;
-                constInfo.gS1Start = s1GIdx;
-                setStart = true;
-            }
-            if (accumBaseNum >= targetBaseNum) {
-                // Update the end position in the current core partition.
-                constInfo.bN2End = bN2Idx;
-                constInfo.gS1End = s1GIdx;
-                constInfo.s2End = 0;
-                if (currCoreIdx != 0) {
-                    GetAxisStartIdx(constInfo.bN2Start, constInfo.gS1Start, 0);
-                }
-                return;
-            }
-        }
-        if ((actBatchS1 > 0) && (actBatchS2 > 0)) {
-            lastValidBIdx = bIdx;
-            lastValidactBatchS1 = actBatchS1;
-        }
-    }
-    if (!setStart) {
-        constInfo.bN2Start = lastValidBIdx;
-        constInfo.gS1Start = lastValidactBatchS1 - 1;
-    }
-    if (accumBaseNum < targetBaseNum) {
-		// Update the end position in the final core partition.
-        constInfo.bN2End = lastValidBIdx;
-        constInfo.gS1End = lastValidactBatchS1 - 1;
-        constInfo.s2End = 0;
-        if (currCoreIdx != 0) {
-            GetAxisStartIdx(constInfo.bN2Start, constInfo.gS1Start, 0);
-        }
-        return;
-    }
 }
 
 template <typename CubeBlockType, typename VecBlockType>
@@ -490,12 +416,13 @@ __aicore__ inline void FusedSparseAttentionOverlapKernelMla<CubeBlockType, VecBl
     }
 
     ProcessMainLoop();
+    if ASCEND_IS_AIV {vecBlock.FlushSharedV3(sharedRequestBegin,sharedRequestEnd);}
 }
 
 template <typename CubeBlockType, typename VecBlockType>
 __aicore__ inline void FusedSparseAttentionOverlapKernelMla<CubeBlockType, VecBlockType>::ProcessMainLoop()
 {
-    bool hasLoad = aicIdx < usedCoreNum;
+    bool hasLoad = sharedRequestBegin < sharedRequestEnd;
     if (!hasLoad) {
         if ASCEND_IS_AIV {
             if constexpr (IS_SPLIT_G) {

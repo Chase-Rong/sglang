@@ -231,9 +231,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
-            "a reused row must carry allocated KV"
-        )
+        assert all(
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -2252,9 +2252,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2726,9 +2726,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask and not replayed_boundary:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             num_logprobs = (
                 sampling_mask_len
@@ -2924,7 +2924,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     )
 
                     publish_received_host_kv(layer_pool)
+                received_committed_length = None
+                record = None
+                if layer_pool is not None:
+                    coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+                    snapshot = getattr(
+                        coordinator, "warmup_publication_committed_length", None
+                    )
+                    record = getattr(coordinator, "record_warmup_publication", None)
+                    if snapshot is not None and record is not None:
+                        received_committed_length = snapshot(decode_req.req)
                 self._commit_transfer_to_req(decode_req)
+                if (
+                    received_committed_length is not None
+                    and not decode_req.req.finished()
+                ):
+                    record(decode_req.req, received_committed_length)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -2986,12 +3001,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         readiness = torch.tensor(
             [
-                KVPoll.Failed
-                if dr.hicache_restore_status == HiCacheRestoreResult.FAILED
-                or dr.kv_receiver.poll() == KVPoll.Failed
-                else KVPoll.Success
-                if dr.hicache_restore_status == HiCacheRestoreResult.READY
-                else KVPoll.Transferring
+                (
+                    KVPoll.Failed
+                    if dr.hicache_restore_status == HiCacheRestoreResult.FAILED
+                    or dr.kv_receiver.poll() == KVPoll.Failed
+                    else (
+                        KVPoll.Success
+                        if dr.hicache_restore_status == HiCacheRestoreResult.READY
+                        else KVPoll.Transferring
+                    )
+                )
                 for dr in pending_reqs
             ],
             dtype=torch.int32,
@@ -3089,10 +3108,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         host_ready = torch.tensor(
             [
-                req.kv_receiver.is_abort_release_safe()
-                if self.enable_host_receive and req.host_staged
-                else req.kv_receiver.kv_mgr.is_abort_release_safe(
-                    req.req.bootstrap_room, required_acks
+                (
+                    req.kv_receiver.is_abort_release_safe()
+                    if self.enable_host_receive and req.host_staged
+                    else req.kv_receiver.kv_mgr.is_abort_release_safe(
+                        req.req.bootstrap_room, required_acks
+                    )
                 )
                 for req, _, _, _, required_acks in self._deferred_releases
                 if (self.enable_host_receive and req.host_staged)

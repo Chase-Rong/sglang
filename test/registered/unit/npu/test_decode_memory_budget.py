@@ -27,14 +27,15 @@ SPEC.loader.exec_module(MODULE)
 
 def budget(**overrides):
     values = dict(
+        execution_abi="shared_v3",
         layers=4,
         planner_groups=1,
         latent_dim=512,
-        rope_dim=64,
+        rope_dim=0,
         index_dim=128,
         element_bytes=2,
-        topk=2048,
-        resident_capacity=4096,
+        topk=4,
+        resident_capacity=128,
         host_bytes=1 << 34,
     )
     values.update(overrides)
@@ -45,7 +46,12 @@ def test_mtp_sizes_query_rows_instead_of_request_count():
     ordinary = budget()
     mtp = budget(rows_per_request=4)
     assert mtp.row_capacity(2) == 8
-    assert mtp.fixed_bytes(2, 64) == ordinary.fixed_bytes(8, 64)
+    mtp_host, mtp_device = mtp.fixed_bytes(2, 128)
+    ordinary_host, ordinary_device = ordinary.fixed_bytes(8, 128)
+    assert mtp_host < ordinary_host  # CPU generation snapshots are request-owned.
+    # Row payload storage stays proportional to query rows, while device
+    # planner resident-sort workspaces are allocated per active request.
+    assert mtp_device < ordinary_device
     graph = budget(rows_per_request=4, graph_rows=8)
     assert graph.row_capacity(1) == 32
     assert graph.row_capacity(9) == 36
@@ -56,14 +62,14 @@ def test_target_and_draft_budget_includes_both_backings_and_selection():
     combined = budget(layers=5, planner_groups=2, rows_per_request=4)
     assert combined.host_bytes_per_token == target.host_bytes_per_token * 5 // 4
     assert combined.device_bytes_per_token == target.device_bytes_per_token * 5 // 4
-    assert combined.fixed_bytes(2, 64)[1] > target.fixed_bytes(8, 64)[1]
+    assert combined.fixed_bytes(2, 128)[1] > target.fixed_bytes(2, 128)[1]
 
 
 def test_full_kv_scales_host_while_indexer_scales_npu():
     model = budget()
-    before = model.required_bytes(8192, 4, 64)
-    after = model.required_bytes(16384, 4, 64)
-    assert after[0] - before[0] == 8192 * 4 * 576 * 2
+    before = model.required_bytes(8192, 4, 128)
+    after = model.required_bytes(16384, 4, 128)
+    assert after[0] - before[0] == 8192 * 4 * 512 * 2
     assert after[1] - before[1] == 8192 * 4 * 128 * 2
 
 
@@ -72,7 +78,7 @@ def test_independent_host_capacity_does_not_consume_device_kv_budget():
     expanded = budget(prefill_layer_slots=2, host_token_capacity=131072)
     before = ordinary.required_bytes(8192, 4, 128)
     after = expanded.required_bytes(8192, 4, 128)
-    assert after[0] - before[0] == 122880 * 4 * 576 * 2
+    assert after[0] - before[0] == 122880 * 4 * 512 * 2
     assert after[1] == before[1]
     assert expanded.max_tokens(before[1], 128, lambda _: 4) == 8192
     # This is a minimum Host capacity, not a cap on the device solver.
@@ -84,7 +90,7 @@ def test_independent_host_capacity_does_not_consume_device_kv_budget():
 def test_independent_host_budget_includes_target_draft_and_reserved_page():
     model = budget(layers=5, host_token_capacity=131072)
     host_fixed, _ = model.fixed_bytes(4, 128)
-    assert model.required_bytes(8192, 4, 128)[0] == host_fixed + 131200 * 5 * 576 * 2
+    assert model.required_bytes(8192, 4, 128)[0] == host_fixed + 131200 * 5 * 512 * 2
     required, device_bytes = model.required_bytes(8192, 4, 128)
     too_small = replace(model, host_bytes=required - 1)
     with pytest.raises(MemoryError, match="Host"):
@@ -105,7 +111,7 @@ def test_integrated_slots_add_device_capacity_without_duplicating_host():
     before = ordinary.required_bytes(8192, 1, 128)
     after = integrated.required_bytes(8192, 1, 128)
     assert after[0] == before[0]
-    assert after[1] - before[1] == (8192 + 128) * 2 * 576 * 2
+    assert after[1] - before[1] == (8192 + 128) * 2 * 512 * 2
     assert integrated.max_tokens(after[1], 128, lambda tokens: 1) == 8192
 
 
@@ -113,8 +119,8 @@ def test_staging_reserves_one_fixed_window_and_copy_metadata():
     baseline = budget()
     staged = budget(staging_bytes=4096)
     for rows in (1, 8):
-        before = baseline.required_bytes(8192, rows, 64)
-        after = staged.required_bytes(8192, rows, 64)
+        before = baseline.required_bytes(8192, rows, 128)
+        after = staged.required_bytes(8192, rows, 128)
         assert after[0] == before[0]
         assert after[1] - before[1] == 4096
     with pytest.raises(ValueError, match="staging"):
@@ -123,25 +129,27 @@ def test_staging_reserves_one_fixed_window_and_copy_metadata():
 
 def test_solver_reserves_padding_page_and_fixed_selection_storage():
     model = budget()
-    _, device_bytes = model.required_bytes(8192, 4, 64)
-    assert model.max_tokens(device_bytes, 64, lambda tokens: 4) == 8192
-    assert model.max_tokens(device_bytes - 1, 64, lambda tokens: 4) == 8128
+    _, device_bytes = model.required_bytes(8192, 4, 128)
+    assert model.max_tokens(device_bytes, 128, lambda tokens: 4) == 8192
+    assert model.max_tokens(device_bytes - 1, 128, lambda tokens: 4) == 8064
 
 
 def test_host_limit_includes_planner_and_padding():
     model = budget()
-    host_required, device_required = model.required_bytes(8192, 4, 64)
+    host_required, device_required = model.required_bytes(8192, 4, 128)
     constrained = replace(model, host_bytes=host_required)
-    assert constrained.max_tokens(device_required * 100, 64, lambda tokens: 4) == 8192
+    assert constrained.max_tokens(device_required * 100, 128, lambda tokens: 4) == 8192
     with pytest.raises(MemoryError, match="Host"):
-        constrained.validate(8256, 4, 64)
+        constrained.validate(8320, 4, 128)
 
 
 def test_graph_reservation_exceeds_real_request_count():
     model = budget(graph_rows=8)
-    assert model.fixed_bytes(1, 64) == model.fixed_bytes(8, 64)
-    assert model.fixed_bytes(9, 64)[1] > model.fixed_bytes(8, 64)[1]
-    assert model.fixed_bytes(1, 64)[1] > budget().fixed_bytes(1, 64)[1]
+    assert model.fixed_bytes(1, 128)[0] < model.fixed_bytes(8, 128)[0]
+    assert model.row_capacity(1) == model.row_capacity(8)
+    assert model.fixed_bytes(1, 128)[1] < model.fixed_bytes(8, 128)[1]
+    assert model.fixed_bytes(9, 128)[1] > model.fixed_bytes(8, 128)[1]
+    assert model.fixed_bytes(1, 128)[1] > budget().fixed_bytes(1, 128)[1]
 
 
 def test_joint_solver_handles_request_count_threshold():
@@ -150,21 +158,21 @@ def test_joint_solver_handles_request_count_threshold():
     def row_count(tokens):
         return 2 if tokens <= 8192 else 4
 
-    _, device_bytes = model.required_bytes(8192, 2, 64)
-    result = model.max_tokens(device_bytes, 64, row_count)
+    _, device_bytes = model.required_bytes(8192, 2, 128)
+    result = model.max_tokens(device_bytes, 128, row_count)
     assert result == 8192
-    model.validate(result, row_count(result), 64, device_bytes)
+    model.validate(result, row_count(result), 128, device_bytes)
     with pytest.raises(MemoryError, match="Indexer"):
-        model.validate(result + 64, row_count(result + 64), 64, device_bytes)
+        model.validate(result + 128, row_count(result + 128), 128, device_bytes)
 
 
 def test_shared_group_reduces_planner_storage_only():
     shared = budget()
     unshared = budget(planner_groups=4)
-    shared_host, shared_device = shared.fixed_bytes(4, 64)
-    unshared_host, unshared_device = unshared.fixed_bytes(4, 64)
-    assert unshared_host > shared_host
-    assert unshared_device - shared_device == 3 * 4 * (2048 * 8 + 9)
+    shared_host, shared_device = shared.fixed_bytes(4, 128)
+    unshared_host, unshared_device = unshared.fixed_bytes(4, 128)
+    assert unshared_host == shared_host
+    assert unshared_device == shared_device  # No CPU planner group allocations remain.
 
 
 @pytest.mark.parametrize("page_size", [0, -1])
@@ -174,13 +182,13 @@ def test_invalid_page_size_rejected(page_size):
 
 
 def test_alignment_cannot_overflow_native_slot_encoding():
-    with pytest.raises(ValueError, match="aligned"):
-        budget(resident_capacity=32767).fixed_bytes(4, 64)
+    with pytest.raises(ValueError, match="C<=16384"):
+        budget(resident_capacity=32767).fixed_bytes(4, 128)
 
 
 def test_insufficient_npu_space_returns_no_capacity():
-    _, fixed = budget().fixed_bytes(4, 64)
-    assert budget().max_tokens(fixed, 64, lambda tokens: 4) == 0
+    _, fixed = budget().fixed_bytes(4, 128)
+    assert budget().max_tokens(fixed, 128, lambda tokens: 4) == 0
 
 
 def solve_request_priority(**overrides):
@@ -188,7 +196,7 @@ def solve_request_priority(**overrides):
         budget=budget(prefill_layer_slots=2),
         available_bytes=1 << 30,
         token_limit=1048576,
-        page_size=64,
+        page_size=128,
         requests=8,
         state_bytes_per_slot=1 << 20,
         request_bytes_per_row=32768,
@@ -200,10 +208,10 @@ def solve_request_priority(**overrides):
 def test_request_priority_shrinks_tokens_before_concurrency():
     result = solve_request_priority()
     assert result.requests == result.state_slots == 8
-    assert 8 * 64 <= result.target_tokens < 1048576
-    assert result.target_tokens % 64 == 0
+    assert 8 * 128 <= result.target_tokens < 1048576
+    assert result.target_tokens % 128 == 0
     assert (
-        result.unused_bytes < 64 * budget(prefill_layer_slots=2).device_bytes_per_token
+        result.unused_bytes < 128 * budget(prefill_layer_slots=2).device_bytes_per_token
     )
     assert (
         result.dsa_bytes + result.kda_bytes + result.request_bytes + result.unused_bytes
@@ -228,7 +236,7 @@ def test_request_priority_token_cap_is_shared_and_not_multiplied_or_divided():
 
 def test_request_priority_host_limit_also_reduces_tokens():
     model = budget(prefill_layer_slots=2)
-    host_bytes = model.required_bytes(8192, 8, 64)[0]
+    host_bytes = model.required_bytes(8192, 8, 128)[0]
     result = solve_request_priority(budget=replace(model, host_bytes=host_bytes))
     assert result.target_tokens == 8192
     assert result.requests == 8
@@ -263,32 +271,36 @@ def test_request_priority_charges_extra_kda_slots_and_speculative_storage():
 def test_request_priority_keeps_graph_row_floor():
     model = budget(prefill_layer_slots=2, graph_rows=16)
     result = solve_request_priority(budget=model)
-    assert result.dsa_bytes == model.required_bytes(result.target_tokens, 16, 64)[1]
+    assert model.row_capacity(result.requests) == 16
+    assert (
+        result.dsa_bytes
+        == model.required_bytes(result.target_tokens, result.requests, 128)[1]
+    )
 
 
 @pytest.mark.parametrize("capacity", [1, 3, 7])
 def test_request_priority_finds_largest_concurrency_that_fits_hbm(capacity):
     model = budget(prefill_layer_slots=2)
-    device = model.required_bytes(capacity * 64, capacity, 64)[1]
+    device = model.required_bytes(capacity * 128, capacity, 128)[1]
     available = device + (capacity + 1) * ((1 << 20) + 32768)
     result = solve_request_priority(available_bytes=available)
     assert result.requests == result.state_slots == capacity
-    assert result.target_tokens == capacity * 64
+    assert result.target_tokens == capacity * 128
     assert result.unused_bytes == 0
 
 
 def test_request_priority_reduces_concurrency_for_host_budget():
     model = budget(prefill_layer_slots=2)
-    host_bytes = model.required_bytes(3 * 64, 3, 64)[0]
+    host_bytes = model.required_bytes(3 * 128, 3, 128)[0]
     result = solve_request_priority(budget=replace(model, host_bytes=host_bytes))
     assert result.requests == 3
-    assert result.target_tokens == 3 * 64
+    assert result.target_tokens == 3 * 128
 
 
 def test_request_priority_can_run_one_request_under_small_token_cap():
-    result = solve_request_priority(token_limit=64)
+    result = solve_request_priority(token_limit=128)
     assert result.requests == 1
-    assert result.target_tokens == 64
+    assert result.target_tokens == 128
 
 
 def test_request_priority_kda_ratio_limits_effective_requests():
@@ -302,18 +314,17 @@ def test_request_priority_does_not_exceed_native_query_row_limit():
     result = solve_request_priority(
         budget=model, available_bytes=1 << 42, requests=10000, token_limit=1 << 30
     )
-    assert result.requests == 32767 // 4
+    assert result.requests == 1024
 
 
-def test_request_priority_page_one_retains_two_tokens_per_request():
-    result = solve_request_priority(page_size=1, token_limit=3)
-    assert result.requests == 1
-    assert result.target_tokens == 3
+def test_external_plan_rejects_non_native_page_size():
+    with pytest.raises(ValueError, match="geometry"):
+        solve_request_priority(page_size=1, token_limit=3)
 
 
 def test_request_priority_cannot_remove_graph_reservation_to_fit_one_request():
     model = budget(graph_rows=16)
-    available = model.required_bytes(64, 1, 64)[1] + 2 * ((1 << 20) + 32768) - 1
+    available = model.required_bytes(128, 1, 128)[1] + 2 * ((1 << 20) + 32768) - 1
     with pytest.raises(MemoryError, match="cannot fit one request"):
         solve_request_priority(budget=model, available_bytes=available)
 
@@ -331,7 +342,14 @@ def test_compact_indexer_and_scales_charge_physical_layers_only():
 
 def test_tail_slots_follow_requests_while_selection_follows_graph_routes():
     model = budget(graph_rows=8, rows_per_request=6, index_tail_bytes_per_request=4096)
-    assert model.fixed_bytes(2, 128)[1] - model.fixed_bytes(1, 128)[1] == 4096
+    metadata_growth = model.external_metadata_bytes(
+        2, 128
+    ) - model.external_metadata_bytes(1, 128)
+    assert model.fixed_bytes(2, 128)[1] - model.fixed_bytes(1, 128)[1] == (
+        4096 + model.layers * (model.resident_capacity * (512 * 2 + 11) + 12)
+        + 34 * model.external_resident_instances
+        + 34 * model.layers * model.callback_instances
+    )
     assert model.row_capacity(2) == 48
     one_route = replace(model, rows_per_request=1)
     assert model.fixed_bytes(1, 128)[1] > one_route.fixed_bytes(1, 128)[1]
@@ -353,9 +371,9 @@ def test_kda_extra_per_slot_and_fixed_replay_storage_count_once():
 
 def test_prefill_physical_slots_do_not_reduce_logical_host_payload():
     model = MODULE.PrefillKvMemoryBudget(
-        host_bytes_per_token=10 * 576 * 2,
-        device_bytes_per_token=2 * 576 * 2 + 7 * 128 * 2,
-        host_bytes=(8192 + 128) * 10 * 576 * 2,
+        host_bytes_per_token=10 * 512 * 2,
+        device_bytes_per_token=2 * 512 * 2 + 7 * 128 * 2,
+        host_bytes=(8192 + 128) * 10 * 512 * 2,
         device_fixed_bytes=4096,
     )
     device_bytes = (8192 + 128) * model.device_bytes_per_token + 4096
@@ -371,9 +389,11 @@ def test_dense_decode_can_use_joint_request_priority_without_kda_allocation():
     assert result.requests == 8
 
 
-def test_budget_builder_prices_allocated_index_layers_separately_from_planner_groups(
-    monkeypatch,
-):
+def _startup_budget_config(monkeypatch, *, backend="lim_copy_sfa", extra_slots=0):
+    import sglang.srt.hardware_backend.npu.fsa_native as native
+    monkeypatch.setattr(native, "shared_v3_workspace_bytes", lambda: 4096)
+    monkeypatch.setenv("SGLANG_NPU_FSA_EXECUTION_ABI", "shared_v3")
+
     def install(name, **values):
         monkeypatch.setitem(sys.modules, name, SimpleNamespace(**values))
 
@@ -385,7 +405,7 @@ def test_budget_builder_prices_allocated_index_layers_separately_from_planner_gr
         SGLANG_NPU_SHARED_HOST_KV=True,
         SGLANG_NPU_LAYER_STAGING_BYTES=0,
         SGLANG_NPU_HICACHE_HOST_TOKENS=0,
-        SGLANG_NPU_DSA_OFFLOAD_BACKEND="lim_copy_sfa",
+        SGLANG_NPU_DSA_OFFLOAD_BACKEND=backend,
     )
     install(
         "sglang.srt.environ",
@@ -422,7 +442,11 @@ def test_budget_builder_prices_allocated_index_layers_separately_from_planner_gr
     graph = SimpleNamespace(backend="npu", bs=[1, 2, 8], max_bs=8)
     install(
         "sglang.srt.runtime_context",
-        get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
+        get_disagg=lambda: SimpleNamespace(
+            disaggregation_mode="null",
+            enable_pd_role_switch=extra_slots > 0,
+            disaggregation_decode_extra_slots=extra_slots,
+        ),
         get_exec=lambda: SimpleNamespace(
             graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=graph))
         ),
@@ -448,7 +472,13 @@ def test_budget_builder_prices_allocated_index_layers_separately_from_planner_gr
         is_draft_worker=False,
         spec_algorithm=SimpleNamespace(is_none=lambda: False),
     )
-    result = MODULE.budget_from_config(kvc, 4)
+    return kvc
+
+
+def test_budget_builder_prices_allocated_index_layers_separately_from_planner_groups(
+    monkeypatch,
+):
+    result = MODULE.budget_from_config(_startup_budget_config(monkeypatch), 4)
     assert result.layers == result.index_layers == 5
     assert result.planner_groups == 3
     assert result.prefill_layer_slots == 3
@@ -457,6 +487,103 @@ def test_budget_builder_prices_allocated_index_layers_separately_from_planner_gr
     assert result.index_tail_bytes_per_request == 3 * 10 * 128 * 4
     assert result.device_bytes_per_token == (5 * 128 + 3 * 512) * 2
     assert result.fixed_bytes(2, 128)[1] > result.fixed_bytes(1, 128)[1]
+
+
+def _allocated_external_metadata_bytes(result, request_capacity):
+    """Measure real target + draft metadata tensors, without NPU allocation."""
+    from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
+        ExternalPlanResidentState,
+    )
+    import torch
+
+    total = 0
+    for layer_count in (result.layers - 1, 1):
+        resident = ExternalPlanResidentState(
+            "cpu",
+            request_capacity,
+            result.resident_capacity,
+            max_routes=result.rows_per_request,
+            expanded_topk=result.topk,
+            page_size=128,
+        )
+        for layer_id in range(layer_count):
+            resident.ensure_layer(layer_id)
+        tensors = [v for v in vars(resident).values() if isinstance(v, torch.Tensor)]
+        tensors += [v for layer in resident.layers.values() for v in layer.values()]
+        total += sum(t.numel() * t.element_size() for t in tensors)
+    return (total + 7) // 8 * 8
+
+
+@pytest.mark.parametrize("extra_slots", [0, 3])
+@pytest.mark.parametrize("requests", [1, 2, 7])
+def test_startup_solver_prices_candidate_resident_before_request_pool_exists(
+    monkeypatch,
+    requests,
+    extra_slots,
+):
+    kvc = _startup_budget_config(
+        monkeypatch,
+        backend="external_plan",
+        extra_slots=extra_slots,
+    )
+    assert not hasattr(kvc, "req_to_token_pool")
+    result = MODULE.budget_from_config(kvc, 4)
+    # The graph floor fixes row payload/planner geometry at eight requests.
+    # Below it, resident storage must still grow with the real request pool.
+    before = result.fixed_bytes(requests, 128)[1]
+    after = result.fixed_bytes(requests + 1, 128)[1]
+    qcap = requests + extra_slots + 1
+    metadata_growth = _allocated_external_metadata_bytes(
+        result, qcap + 1
+    ) - _allocated_external_metadata_bytes(result, qcap)
+    # Below the graph floor, only request-owned payload/metadata and per-
+    # invocation lease snapshots grow; planner Bcap/Tcap stay fixed.
+    payload_growth = result.layers * result.resident_capacity * 512 * 2
+    epoch_generation_growth = 8 * result.external_resident_instances
+    lease_growth = 34 * result.layers * len(result.shared_graph_executions)
+    assert after - before == (
+        metadata_growth + payload_growth + epoch_generation_growth
+        + lease_growth + result.index_tail_bytes_per_request
+    )
+
+
+@pytest.mark.parametrize("requests", [1, 3, 8])
+def test_startup_metadata_matches_actual_allocation_and_reserved_slot(
+    monkeypatch,
+    requests,
+):
+    result = MODULE.budget_from_config(
+        _startup_budget_config(monkeypatch, backend="external_plan"),
+        4,
+    )
+    measured = _allocated_external_metadata_bytes(result, requests + 1)
+    assert result.external_metadata_bytes(requests, 128) == measured
+    graph_larger = replace(result, graph_rows=32)
+    assert graph_larger.external_metadata_bytes(requests, 128) == measured
+
+
+def test_existing_request_pool_capacity_is_charged_when_solver_shrinks(monkeypatch):
+    import torch
+
+    kvc = _startup_budget_config(monkeypatch, backend="external_plan")
+    kvc.req_to_token_pool = SimpleNamespace(req_generation=torch.zeros(12))
+    result = MODULE.budget_from_config(kvc, 4)
+    assert result.external_metadata_bytes(2, 128) == (
+        _allocated_external_metadata_bytes(result, 12)
+    )
+
+
+def test_joint_solver_reduces_requests_for_resident_metadata_under_graph_floor():
+    model = budget(layers=1, planner_groups=1, graph_rows=4, native_workspace_bytes=0)
+    available = model.required_bytes(3 * 128, 3, 128)[1]
+    assert model.required_bytes(4 * 128, 4, 128)[1] > available
+    result = MODULE.solve_joint_dsa_kda_tokens(
+        budget=model, available_bytes=available, token_limit=1024, page_size=128,
+        requests=4, state_bytes_per_slot=0)
+    assert result.requests == 3
+    assert result.target_tokens == 3 * 128
+    assert result.dsa_bytes == available
+    assert result.unused_bytes == 0
 
 
 def test_shared_domain_rounds_once_and_private_sidecars_are_never_shared():
@@ -484,10 +611,10 @@ def test_host_sidecar_pressure_reduces_concurrency_before_hbm_runs_out():
         host_bytes=1 << 30, host_index_sidecar=True, host_index_kpool=4, index_layers=3
     )
     requests = 3
-    tokens = requests * 64
-    planner, _ = base.fixed_bytes(requests, 64)
+    tokens = requests * 128
+    planner, _ = base.fixed_bytes(requests, 128)
     checkpoints = (requests * 2 + 1) * (1 << 20)
-    private = planner + base.host_indexer_bytes(tokens, 64) + checkpoints
+    private = planner + base.host_indexer_bytes(tokens, 128) + checkpoints
     plan = MODULE.HostMemoryBudgetPlan(1 << 30, (1 << 30) + 4 * private, shared_ranks=4)
     model = replace(base, host_memory_plan=plan)
     result = solve_request_priority(
@@ -498,8 +625,8 @@ def test_host_sidecar_pressure_reduces_concurrency_before_hbm_runs_out():
     )
     assert result.requests == requests
     assert result.target_tokens == tokens
-    assert model.host_scope_fits(tokens, requests, 64, checkpoints)
-    assert not model.host_scope_fits(tokens + 64, requests, 64, checkpoints)
+    assert model.host_scope_fits(tokens, requests, 128, checkpoints)
+    assert not model.host_scope_fits(tokens + 128, requests, 128, checkpoints)
 
 
 def test_private_indexer_scales_and_independent_host_capacity_count_per_rank():

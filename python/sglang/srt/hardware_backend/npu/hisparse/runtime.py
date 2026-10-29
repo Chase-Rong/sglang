@@ -109,6 +109,186 @@ class NpuHiSparseCoordinator:
     def admit_request_into_staging(self, req) -> None:
         self.admit_request_direct(req)
 
+    def warmup_publication_committed_length(self, req):
+        """Read committed authority only for an enabled, supported owner.
+
+        Disabled PD receive keeps its existing request interface. Unknown
+        committed metadata cannot authorize a warmup publication snapshot.
+        """
+        state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
+        if (
+            state is None
+            or getattr(state, "execution_abi", None) != "shared_v3"
+            or not getattr(state, "warmup_threshold", 0)
+        ):
+            return None
+        kv = getattr(req, "kv", None)
+        committed = getattr(kv, "kv_committed_len", None)
+        return committed if type(committed) is int and committed >= 0 else None
+
+    def record_local_warmup_publication(self, requests):
+        """Consume a successful integrated Prefill all-layer coverage snapshot."""
+        state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
+        if state is None or not getattr(state, "warmup_threshold", 0):
+            return
+        publication = getattr(self.prefill_offload_runtime, "warmup_publication", None)
+        if publication is None:
+            return
+        slots, generations, lengths, epoch, event = publication
+        binding = getattr(self._backing, "page_binding", None)
+        if binding is None or binding.mapping_epoch != epoch:
+            return
+        coverage = {
+            slot: (generation, length)
+            for slot, generation, length in zip(slots, generations, lengths)
+        }
+        for req in requests:
+            owner = req.kv.req_pool_idx
+            if owner not in coverage or req.finished():
+                continue
+            generation, length = coverage[owner]
+            if int(self.req_to_token_pool.req_generation[owner]) != generation:
+                continue
+            committed = int(req.kv.kv_committed_len)
+            if 0 < committed <= length:
+                self.record_warmup_publication(req, committed, publication_event=event)
+
+    def record_warmup_publication(
+        self, req, received_committed_length, *, publication_event=None
+    ):
+        """Bind a successful PD receive publication to its exact owned prefix.
+
+        Local Prefill without this per-request coverage proof remains lazy.
+        The existing receive-success consensus covers all physical layers.
+        """
+        state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
+        binding = getattr(self._backing, "page_binding", None)
+        if (
+            state is None
+            or not getattr(state, "warmup_threshold", 0)
+            or binding is None
+            or binding.ready_event is None
+        ):
+            return
+        owner = req.kv.req_pool_idx
+        if owner is None or not 0 < owner < state.generations.numel():
+            return
+        if not hasattr(self, "_warmup_publications"):
+            self._warmup_publications = torch.full(
+                (state.generations.numel(), 4), -1, dtype=torch.int64, device="cpu"
+            )
+            self._warmup_publication_events = {}
+        state.refresh_generations()
+        self._warmup_publications[owner] = torch.tensor(
+            [
+                int(state.generations[owner]),
+                binding.mapping_epoch,
+                received_committed_length,
+                id(req.kv),
+            ],
+            dtype=torch.int64,
+        )
+        self._warmup_publication_events[owner] = (
+            publication_event if publication_event is not None else binding.ready_event
+        )
+
+    def warmup_committed_requests(self, requests):
+        """Scheduler-only eager boundary using authoritative Req KV snapshots.
+
+        Warm one owner per microbatch on the actual forward stream. Admission
+        can precede publication; no work is submitted until ordinary Decode.
+        """
+        state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
+        if state is None or not getattr(state, "warmup_threshold", 0):
+            return 0
+        binding = getattr(self._backing, "page_binding", None)
+        if binding is None or binding.ready_event is None:
+            return 0
+        from .shared_warmup import warm_committed_prefix
+        from .fused_sparse_attention import paged_kv_view
+        from .fsa_backend import sparse_layer_ids, sparse_pool_and_layer
+
+        warmed = 0
+        for req in requests:
+            if req.finished() or req.kv.req_pool_idx is None:
+                continue
+            owner = int(req.kv.req_pool_idx)
+            # Never substitute batch.seq_lens, allocated_len or verify width.
+            committed = int(req.kv.kv_committed_len)
+            if not 0 < committed <= state.warmup_threshold:
+                continue
+            if not 0 < owner < self.req_to_token_pool.req_generation.numel():
+                continue
+            state.refresh_generations()
+            generation = int(state.generations[owner])
+            epoch = binding.mapping_epoch
+            publications = getattr(self, "_warmup_publications", None)
+            if publications is None:
+                continue
+            published = publications[owner]
+            if (
+                int(published[0]) != generation
+                or int(published[1]) != epoch
+                or int(published[2]) < committed
+                or int(published[3]) != id(req.kv)
+            ):
+                continue
+            # Keep the event attached to this exact snapshot; a later unrelated
+            # binding.ready_event alone cannot extend its coverage.
+            publication_event = self._warmup_publication_events.get(owner)
+            if publication_event is None:
+                continue
+            if state.device.type == "npu":
+                torch.npu.current_stream().wait_event(publication_event)
+            # Read only complete logical prefix pages, with explicit invalid
+            # mapping rejection instead of the ordinary padding-to-zero helper.
+            tokens = self.req_to_token_pool.req_to_token[owner, :committed:128].long()
+            device_pages = tokens // 128
+            mapping = binding.device_to_host
+            if bool(
+                (
+                    (tokens < 0)
+                    | (device_pages <= 0)
+                    | (device_pages >= mapping.numel())
+                ).any()
+            ):
+                continue
+            host_pages = mapping[device_pages]
+            if host_pages.dtype not in (torch.int32, torch.int64) or bool(
+                ((host_pages <= 0) | (host_pages > torch.iinfo(torch.int32).max)).any()
+            ):
+                continue
+            table = host_pages.to(torch.int32).reshape(1, -1).contiguous()
+            for layer_id in sparse_layer_ids(self.mem_pool_device):
+                pool, local = sparse_pool_and_layer(self.mem_pool_device, layer_id)
+                backing = pool.decode_host_backing
+                if backing.page_binding is not binding:
+                    # Heterogeneous backings require their own proven snapshot.
+                    continue
+                full, rope = backing.layer_views(local)
+                full = paged_kv_view(full, 128, 512)
+                rope = paged_kv_view(rope, 128, 0)
+                if layer_id not in state.layers:
+                    topk = getattr(state, "shared_topk", None)
+                    if topk is None:
+                        continue
+                    state.reserve(layer_id, state.row_capacity, topk, rope, full)
+                warmed += warm_committed_prefix(
+                    state,
+                    layer_id,
+                    owner=owner,
+                    generation=generation,
+                    committed_length=committed,
+                    mapping_epoch=epoch,
+                    block_table=table,
+                    full_kv=full,
+                    region=backing.regions[local][0],
+                    binding=binding,
+                    publication_length=int(published[2]),
+                    publication_event=publication_event,
+                )
+        return warmed
+
     def collect_ready_reqs(self):
         return []
 
@@ -192,6 +372,38 @@ class NpuHiSparseCoordinator:
         if runtime is not None and hasattr(runtime, "can_release_request"):
             if not runtime.can_release_request(req.rid):
                 raise RuntimeError("NPU Prefill request still has in-flight work")
+        fsa_state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
+        external_resident = getattr(fsa_state, "external_resident", None)
+        if external_resident is not None:
+            if self.decode_producer_stream is not None and str(self.device).startswith(
+                "npu"
+            ):
+                # Scheduler normally binds the FSA work to this producer
+                # stream; order retirement on the current stream before reuse.
+                torch.npu.current_stream().wait_stream(self.decode_producer_stream)
+            elif str(self.device).startswith("npu"):
+                # A missing producer binding is abnormal, so conservatively
+                # drain the device rather than release a live resident slot.
+                torch.npu.synchronize()
+            validate = getattr(external_resident, "validate_lifecycle", None)
+            if validate is not None:
+                # The producer stream has been ordered/drained above, so a
+                # sticky device lifecycle error can be consumed outside graph
+                # capture before the request slot is reused.
+                validate()
+            slot_tensor = torch.tensor(
+                [slot], dtype=torch.int64, device=external_resident.device
+            )
+            external_resident.retire(slot_tensor)
+        if fsa_state is not None:
+            for layer in fsa_state.layers.values():
+                if hasattr(layer, "warmup"):
+                    layer.warmup.invalidate(
+                        torch.tensor([slot], device=fsa_state.device)
+                    )
+        if hasattr(self, "_warmup_publications"):
+            self._warmup_publications[slot] = -1
+            self._warmup_publication_events.pop(slot, None)
         generations[slot] += 1
         retired = _RetiredRequest(
             req.kv,

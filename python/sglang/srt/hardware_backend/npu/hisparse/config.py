@@ -20,6 +20,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 ENV_FIELDS = {
+    "fsa_load_mode": ("SGLANG_NPU_FSA_LOAD_MODE", "FUSED"),
+    "fsa_warmup_threshold": ("SGLANG_NPU_FSA_WARMUP_THRESHOLD", 0),
+    "fsa_execution_abi": ("SGLANG_NPU_FSA_EXECUTION_ABI", "shared_v3"),
     "dsa_offload_backend": ("SGLANG_NPU_DSA_OFFLOAD_BACKEND", "lim_copy_sfa"),
     "device_buffer_size": ("SGLANG_NPU_FSA_RESIDENT_CAPACITY", 4096),
     "shared_host_kv": ("SGLANG_NPU_SHARED_HOST_KV", True),
@@ -53,6 +56,9 @@ class NPUHiSparseConfig:
     hicache_host_tokens: int
     fused_sparse_attention: bool
     fused_sparse_attention_mode: str
+    fsa_execution_abi: str
+    fsa_load_mode: str
+    fsa_warmup_threshold: int
 
     @property
     def backend(self):
@@ -209,6 +215,16 @@ def resolve_npu_hisparse_config(server_args, environ=None):
         and values["fused_sparse_attention_mode"] != "fused"
     ):
         raise ValueError("lim_copy_sfa requires fused_sparse_attention_mode=fused")
+    if values["dsa_offload_backend"] == "external_plan":
+        values["fsa_execution_abi"] = resolve_fsa_execution_abi(values["fsa_execution_abi"])
+        values["fsa_load_mode"] = resolve_shared_load_mode(values["fsa_load_mode"])
+    values["fsa_warmup_threshold"] = resolve_shared_warmup_threshold(
+        values["fsa_warmup_threshold"]
+    )
+    if values["fsa_warmup_threshold"] and values["dsa_offload_backend"] != "external_plan":
+        raise ValueError("prefix warmup requires external_plan")
+    if values["dsa_offload_backend"] == "external_plan" and values["fused_sparse_attention_mode"] != "fused":
+        raise ValueError("external_plan only supports fused execution; reference execution was removed")
     budget = "prefill_host_kv_bytes" if role == "prefill" else "decode_host_kv_bytes"
     if values[budget] <= 0:
         raise ValueError(
@@ -361,3 +377,101 @@ def validate_npu_hisparse(server_args, config, hf_config, *, is_dsa, is_v4):
         raise ValueError(
             "lim_copy_sfa requires TopK2048, KPool4, NoPE512, page128 and one to six query routes"
         )
+
+
+def resolve_fsa_execution_abi(value=None):
+    """Validate the sole supported external_plan ABI before owner creation."""
+    value = os.environ.get("SGLANG_NPU_FSA_EXECUTION_ABI", "shared_v3") if value is None else value
+    if value != "shared_v3":
+        raise ValueError("legacy FSA execution ABIs were removed; use SGLANG_NPU_FSA_EXECUTION_ABI=shared_v3")
+    return value
+
+
+def register_shared_geometry(
+    pool,
+    *,
+    topk,
+    routes,
+    capacity,
+    page_size,
+    dtype,
+    qcap,
+    bcap,
+    tcap,
+    graph_reservation=(),
+    abi="shared_v3",
+):
+    """Enforce the common geometry assumed by target+draft startup sizing.
+
+    Target initializes the shared request pool before constructing the draft
+    worker. Its budgeted geometry becomes the pool contract; a draft with a
+    different model/index TopK cannot allocate under the target's aggregate
+    layer budget. Heterogeneous shared owners need separate exact budgeting.
+    """
+    geometry = (
+        abi,
+        int(topk),
+        int(routes),
+        int(capacity),
+        int(page_size),
+        str(dtype),
+        int(qcap),
+        int(bcap),
+        int(tcap),
+        tuple(graph_reservation),
+    )
+    existing = getattr(pool, "_shared_fsa_budget_geometry", None)
+    if existing is not None and existing != geometry:
+        raise ValueError(
+            "external_plan target/draft geometry differs from target sizing; "
+            "heterogeneous owners require separate budgets"
+        )
+    if existing is None:
+        pool._shared_fsa_budget_geometry = geometry
+    return geometry
+
+
+def shared_union_width(routes, topk):
+    """Fixed ABI3 planner capacity, including native cache-line padding."""
+    if not 0 < routes <= 6 or not 0 < topk <= 2051:
+        raise ValueError("external_plan union width requires routes<=6 and K<=2051")
+    width = max(16, 1 << (routes * topk - 1).bit_length())
+    if width > 16384:
+        raise ValueError("external_plan union width exceeds native W<=16384")
+    return width
+
+
+def resolve_shared_load_mode(value=None):
+    """A validation shim for deployments with the former selector configured."""
+    value = os.environ.get("SGLANG_NPU_FSA_LOAD_MODE", "FUSED") if value is None else value
+    if value != "FUSED":
+        raise ValueError("legacy FSA load modes were removed; use SGLANG_NPU_FSA_LOAD_MODE=FUSED")
+    return value
+
+
+def resolve_shared_warmup_threshold(value=None):
+    value = (
+        os.environ.get("SGLANG_NPU_FSA_WARMUP_THRESHOLD", "0")
+        if value is None
+        else value
+    )
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("FSA warmup threshold must be an integer") from error
+    if not 0 <= threshold <= 32767:
+        raise ValueError(
+            "FSA warmup threshold must be in [0,32767]; zero disables warmup"
+        )
+    return threshold
+
+
+def register_shared_execution(pool, load_mode, warmup_threshold):
+    execution = (load_mode, warmup_threshold)
+    existing = getattr(pool, "_shared_fsa_execution_geometry", None)
+    if existing is not None and existing != execution:
+        raise ValueError(
+            "shared target/draft load mode or warmup reservation differs from target sizing"
+        )
+    pool._shared_fsa_execution_geometry = execution
+    return execution

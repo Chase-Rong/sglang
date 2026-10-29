@@ -1,117 +1,118 @@
-# Standalone FSA extension
+# external_plan native extension
 
-This target builds a small `sgl_fsa` Torch extension against the installed Torch
-and Torch NPU. It does not build or install an sgl-kernel-npu wheel and does not
-replace the `npu` operator namespace. It contains the FSA ACLNN binding, native
-external cache planner, Host registration and unidex copy.
+`external_plan` has one decode path: the independent protected-hash SIMT planner
+emits final metadata, then the existing SFA performs unique Host loads/resident
+writes and Attention, followed by checked completion. `lim_copy_sfa` has its own
+unchanged source and state. Old row, CPU CLOCK/LRU, union-fill and staged-overlap
+implementations are archived outside the production tree.
 
-The external planner defaults to CLOCK replacement with a persistent hash index.
-Rebuild the extension with the Python adapter: it requires the new
-`fsa_enqueue_clock_plan` binding. Set `SGLANG_NPU_FSA_PLANNER_POLICY=lru` before
-constructing planners to select the legacy sorting implementation for comparisons
-or rollback; other values are rejected. Do not switch policy on a live planner.
+The operator retains the established `fused_sparse_attention_overlap` name.
+Its input contract is ABI3; versioned capability helper names describe that contract.
+The normal path keeps its existing 30-argument schema, ABI 3, eight counters per
+request and exact capability checks. The SFA OPP is built from the single
+committed implementation in `native/fsa_attention/op_host` and `op_kernel`.
 
-CLOCK protects all requested hits before selecting victims and retains distinct
-slots for duplicate keys. It changes replacement order, not attention's selected
-keys or mutable-tail validity. Each query row still has its own cache. Hash links,
-reference bits and the CLOCK hand live in CPU tensors owned by the planner and
-shared by all captured graphs and eager calls. They reset with owner changes,
-length rollback and epoch rollover. At capacity 4096 the workspace adds 163848
-CPU bytes per reserved row. The callback performs no sorting, device operation,
-or scratch allocation; the existing metadata transfers remain.
+## Build
 
-The optional `FusedSparseAttentionState(mapped_host_plan=True)` uses registered
-Host external plans. Production backend defaults are unchanged pending TP
-qualification. The CPU cache
-planner retains slot placement on Host, and `fsa_host_plan` encodes the per-layer
-hit/miss plan using separate applied-key state. An ordered callback commits that
-state after attention. Above 16 query rows, independent CPU rows use up to four
-OpenMP workers. Indexer keys, request identities, lengths and mutable-tail
-validity still travel from NPU to Host. The reference attention route retains
-device plans for its explicit gather implementation.
+Use the exact SoC from the target runtime. The validated development platform
+is Ascend950DT_9582 with CANN 9.3, BF16 TND H32, latent dimension512, RoPE0,
+page128. This does not qualify other shapes or platforms.
 
-Up to 16 query rows, attention reads the encoded Host plan through a validated
-registered address. Larger batches stage the completed plan to HBM to avoid
-repeated remote metadata reads. This removes the full int64 slots return and
-device plan construction; it does not eliminate all metadata transfer. Captured
-callback arguments remain alive until graph destruction. Plan state is ordered
-on the execution stream; concurrent use of the same selection state on unrelated
-streams is unsupported. Destroy graphs and drain streams before closing planners.
-
-Rebuild this extension when updating the mapped-plan Python adapter; the new
-`fsa_host_plan` and `npu_fused_sparse_attention_overlap_mapped` bindings are
-required. The original FSA binding remains available. Current-token Host
-writeback keeps its existing synchronous indexed-copy path; Decode DMA staging
-is not enabled by this change.
-
-For A5 Graph replay with TopK 2051, 16 query heads and 4096 resident slots,
-single-device ABBA measured complete planner/attention/commit reductions of
-2.5%, 12.7%, 2.2% and 0.4% at 1, 4, 16 and 64 query rows respectively. With
-approximately 80% hits, reductions were 7.8%, 12.9%, 1.8% and 0.5%. The 64-row
-result is effectively parity. These measurements do not establish TP8 or
-end-to-end TPOT improvement. Hardware regression tests cover changing TopK
-order, mutable tails, request generations, graph reservation and layer reuse.
-
-The attention device binary and host tiling must be built separately as an
-isolated OPP vendor. Both that vendor and this extension must match the target
-SoC. An Ascend910_93 binary is not an A5 binary.
-
-The source donor for the wrapper/helpers is sgl-kernel-npu commit `539e7c9`.
-Export its `csrc` tree into the assigned work directory and pass that directory
-as `FSA_SOURCE_ROOT`. For full-KV tensors larger than4GiB, also apply the current
-sgl-kernel-npu `unidex_copy` host/kernel changes:64-bit global extents and byte
-offsets, including queued destination offsets. The original donor rejects
-these tensors; removing only its host check would leave overflowing offsets.
-`scripts/npu/remote_fsa_native_capacity.py` exports the donor and overlays these
-two files from the sibling checkout for an isolated build and hardware tests.
-Device attention adaptation to arch35/NoPE/2051 external
-plan is provided separately in `native/fsa_attention`; do not use the donor's
-arch22 attention binary on A5. The wrapper in this directory overrides the
-donor's one-query-per-request assumption and preserves MTP cumulative lengths.
+The exported donor bundle must contain the shared Host allocator, unidex_copy,
+ACL adapter helpers and `fused_sparse_attention_overlap/registered_acl_tensor.h`.
+No donor LRU planner or row Attention wrapper is compiled.
 
 ```bash
-cmake -S native/fsa -B "$SGLANG_FSA_WORK_DIR/native-build" \
-  -DFSA_SOURCE_ROOT="$SGLANG_FSA_WORK_DIR/kernel-source" \
+source /usr/local/Ascend/cann-9.3.0/set_env.sh
+FSA_BUILD=/tmp/external-plan-build
+cmake -S native/fsa -B "$FSA_BUILD/extension" \
+  -DFSA_SOURCE_ROOT=/path/to/exported/kernel-source \
   -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH" \
-  -DSOC_VERSION="$SOC_VERSION"
-cmake --build "$SGLANG_FSA_WORK_DIR/native-build" -j2
-export SGLANG_NPU_FSA_EXTENSION="$SGLANG_FSA_WORK_DIR/native-build/libsgl_fsa_extension.so"
+  -DSOC_VERSION=Ascend950DT_9582
+cmake --build "$FSA_BUILD/extension" -j4
+python native/fsa_attention/build_fused_sparse_attention_overlap.py \
+  --cann "$ASCEND_HOME_PATH" --source "$PWD/native/fsa_attention" \
+  --output "$FSA_BUILD/opp"
+cmake -S "$FSA_BUILD/opp" -B "$FSA_BUILD/opp/build" \
+  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH" \
+  -DASCEND_COMPUTE_UNIT=ascend950 -Dvendor_name=sgl_fsa_overlap \
+  -DENABLE_BINARY_PACKAGE=ON -DENABLE_SOURCE_PACKAGE=ON -DENABLE_TEST=OFF \
+  -DCMAKE_INSTALL_PREFIX="$FSA_BUILD/install"
+cmake --build "$FSA_BUILD/opp/build" -j4
+cmake --build "$FSA_BUILD/opp/build" --target binary -j4
+cmake --install "$FSA_BUILD/opp/build"
+export SGLANG_NPU_FSA_EXTENSION="$FSA_BUILD/extension/libsgl_fsa_extension.so"
+FSA_VENDOR="$FSA_BUILD/install/packages/vendors/sgl_fsa_overlap"
+export ASCEND_CUSTOM_OPP_PATH="$FSA_VENDOR${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="$FSA_VENDOR/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-Add the matching isolated vendor to `ASCEND_CUSTOM_OPP_PATH` and its `op_api/lib`
-to `LD_LIBRARY_PATH`, preserving the container's existing vendor paths. The
-Python source path remains the selected SGLang checkout. Compilation and
-hardware qualification must be evaluated separately: the A5 helper build/load
-and three registered-copy/planner tests passed. The separately built arch35
-attention vendor and corrected wrapper passed54 attention/lifecycle cases. See
-`FSA_OFFLOAD_MIGRATION.md` for exact logs and limitations.
+Build into fresh paths and load matching binaries. Device `.o` identity is
+separate from the Host `op_api` library. The latter may remain byte-identical
+when the device implementation changes without an ABI change.
 
-## HiCache-managed integrated offload
+## Exported execution operations
 
-Integrated offload uses HiCache page ownership over the existing MemFabric
-regions. It does not allocate a second complete Host KV payload. The default
-UnifiedRadix FULL/MAMBA stack owns prefix matching, cache references and
-eviction; the offload runtime retains Prefill slot reuse and direct Host reads
-in fused Decode attention. There is no switch selecting the previous private
-integrated memory-management path.
+| Operation | Purpose |
+|---|---|
+| `external_plan_prepare` | One SIMT planner and final metadata kernel, ABI3 |
+| `npu_fused_sparse_attention_overlap` | Unique loading, original Attention, then finish |
+| `shared_v3_capabilities`, `shared_v3_workspace_bytes` | Exact normal-consumer contract and caller-owned workspace |
+| `external_plan_fill_only` | Independent committed-prefix warmup helper, no query/output |
+| `external_plan_warmup_capabilities` | Exact helper contract, independent ABI1 |
 
-Device KV page IDs and Host page IDs can differ. Prefill DMA accepts CPU int64
-`[source_row, destination_row, count]` runs, coalescing only when both ends are
-contiguous. Rebuild this extension before using the HiCache Python adapter.
-The older two-column native copy contract remains available to other callers.
-Decode keeps its current-token writeback operation and maps its destination to
-the HiCache Host slot. Attention consumes a separate Host page table; the
-compressed Indexer keeps its device addressing.
+Host mapping/registration, shm allocator, prefill DMA and unidex_copy remain
+shared utilities. `shared_last_workspace_bytes` reports the last actual ACL
+workspace requirement; it is not an allocation or performance guarantee.
 
-Backing allocation precedes graph capture. HiCache adopts completed pages
-without repeating their D2H copy. Indexer and KDA checkpoint sidecars have
-separate Host allocations and completion events. Page recycling waits for
-outstanding readers; shared TP backing also requires agreement across ranks
-before reuse. Closing the backing requires all graphs and streams to be drained.
+The warmup capability vector is
+`[1,1,512,0,128,16384,32767,1024,9,1]`: helper ABI, BF16, latent dimensions,
+RoPE dimensions, page size, maximum resident capacity, maximum request capacity,
+maximum batch, identity columns, unique-copy support. The normal consumer's ABI3
+and this helper's ABI1 are independent contracts. The helper is independent of the Attention OPP.
+Warmup requires a complete committed prefix, sorted unique physical keys,
+corresponding logical owners, unique destination slots and exact identity.
+Its two counters count actual completed Host loads and resident writes.
+`delay_cycles` and `fail_request` are bounded fault-injection parameters and
+normally remain 0 and -1. An error never publishes successful completion.
 
-This integration targets the single-service, non-speculative CP1/DCP1 path.
-L3 storage, external linkers and speculative state restoration are not included.
-Existing integrated-offload configuration enables the required HiCache/radix
-settings automatically. Non-offload allocation remains unchanged. Compilation
-and CPU contract tests alone do not qualify NPU, TP8, prefix-hit model accuracy,
-or end-to-end performance; each requires its corresponding hardware validation.
+## Ownership and error handling
+
+`fused_sparse_attention_overlap.cpp` is the single adapter translation unit because the donor
+ACL helpers contain non-inline definitions. `shared_runtime.cpp` contains only
+common launch, validation, workspace and scoped descriptor/TLS cleanup; no old
+Attention path is hidden there. Do not compile those included implementation
+fragments independently.
+
+Workspace is owned by the caller for the full eager/Graph lifetime. Queued
+callbacks retain raw launch arguments, not the final Tensor owner. Descriptor
+and HugeMem cleanup belongs to the active caller or queued-handler scope;
+it must not be deferred to an unrelated final destructor. Enqueue errors
+propagate before dependent work is submitted. Python retains the execution
+lease and Host readers through completion, or drains before cancellation and
+quarantines resources when completion cannot be established.
+
+Portable lifecycle checks can be compiled with:
+
+```bash
+c++ -std=c++17 -I native/fsa native/fsa/tests/shared_lifetime_test.cpp \
+  -o /tmp/external-plan-lifetime-test
+/tmp/external-plan-lifetime-test
+```
+
+The source cleanup does not close Phase4 F06 overlap evidence or establish
+serving/TPOT performance. Source, local tests, new native build and actual device
+validation are reported separately in the cleanup review artifacts.
+
+## Same-name legacy library rejection
+
+The current OPP exports the application-owned
+`sglangFusedSparseAttentionOverlapAbi` marker from the same `libcust_opapi` as
+its ACL entry points. Capability checks and the execution entry validate the
+marker value and require `GetWorkspaceSize`, launch and marker addresses to have
+the same DSO base via `dladdr`. The verified function pair is the pair actually
+used for descriptor/workspace preparation and launch. An older row OPP with the
+same operator name, a missing/wrong marker, or mixed vendor symbols is rejected
+before `GetWorkspaceSize` or device submission. This is a host contract check,
+not a new CANN operator or a substitute for source/device-binary verification.
+The marker is included in both normal shared-library and packed-object targets.

@@ -58,8 +58,41 @@ def initialize_fsa_backend(backend, model_runner):
     )
     from sglang.srt.runtime_context import get_exec, get_spec
 
+    from .config import resolve_fsa_execution_abi
+
+    execution_abi = (
+        resolve_fsa_execution_abi() if offload_backend == "external_plan" else None
+    )
     if offload_backend == "external_plan":
         native_ops()
+        from .config import (
+            resolve_shared_load_mode,
+            resolve_shared_warmup_threshold,
+            register_shared_execution,
+        )
+
+        load_mode = resolve_shared_load_mode()
+        warmup_threshold = resolve_shared_warmup_threshold()
+        if warmup_threshold:
+            from sglang.srt.runtime_context import get_parallel
+
+            if (
+                get_parallel().pp_size != 1
+                or not model_runner.spec_algorithm.is_none()
+                or getattr(model_runner, "is_draft_worker", False)
+            ):
+                raise ValueError(
+                    "automatic FSA warmup supports PP=1 target ordinary Decode without speculative/draft workers"
+                )
+        if warmup_threshold:
+            from sglang.srt.hardware_backend.npu.fsa_native import (
+                require_external_plan_warmup_capability,
+            )
+
+            require_external_plan_warmup_capability()
+        register_shared_execution(
+            backend.req_to_token_pool, load_mode, warmup_threshold
+        )
     else:
         from sglang.srt.hardware_backend.npu.hisparse.config import validate_lim_dtypes
 
@@ -69,6 +102,23 @@ def initialize_fsa_backend(backend, model_runner):
     backend.fused_sparse_mode = envs.SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE.get()
     if backend.fused_sparse_mode not in ("fused", "reference"):
         raise ValueError("FSA mode must be fused or reference")
+    if offload_backend == "external_plan":
+        from sglang.srt.hardware_backend.npu.fsa_native import (
+            require_shared_v3_capability,
+        )
+
+        if backend.fused_sparse_mode != "fused":
+            raise ValueError("external_plan requires fused mode; reference execution was removed")
+        if (
+            backend.page_size != 128
+            or backend.qk_rope_head_dim != 0
+            or backend.kv_lora_rank != 512
+            or str(model_runner.dtype) != "torch.bfloat16"
+            or str(model_runner.kv_cache_dtype) != "torch.bfloat16"
+            or getattr(backend, "tp_q_head_num", None) != 32
+        ):
+            raise ValueError("external_plan requires BF16/H32/NoPE512/RoPE0/page128")
+        require_shared_v3_capability()
     config = model_runner.model_config.hf_text_config
     backend.fused_sparse_draft_reuse = (
         getattr(model_runner, "is_draft_worker", False)
@@ -76,7 +126,26 @@ def initialize_fsa_backend(backend, model_runner):
         and getattr(config, "index_share_for_mtp_iteration", False)
     )
     backend.fused_sparse_topk = backend.dsa_index_topk + backend.dsa_index_kpool - 1
-    capacity = envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get()
+    configured_capacity = envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get()
+    capacity = configured_capacity
+    if offload_backend == "external_plan":
+        routes = sparse_mtp_rows(
+            model_runner.spec_algorithm, get_spec(), model_runner.model_config
+        )
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
+            expanded_resident_capacity,
+        )
+
+        capacity = expanded_resident_capacity(
+            configured_capacity,
+            routes,
+            backend.fused_sparse_topk,
+            backend.page_size,
+        )
+    if offload_backend == "external_plan":
+        from .config import shared_union_width
+
+        shared_union_width(routes, backend.fused_sparse_topk)
     if capacity < backend.fused_sparse_topk:
         raise ValueError(
             "FSA resident capacity must cover expanded KPool TopK and tail"
@@ -102,6 +171,28 @@ def initialize_fsa_backend(backend, model_runner):
         ) * sparse_mtp_rows(
             model_runner.spec_algorithm, get_spec(), model_runner.model_config
         )
+        if offload_backend == "external_plan":
+            from .config import register_shared_geometry
+
+            graph_reservation = (
+                graph.backend,
+                tuple(graph.bs or ()),
+                graph.max_bs or 0,
+            )
+            register_shared_geometry(
+                backend.req_to_token_pool,
+                topk=backend.fused_sparse_topk,
+                routes=routes,
+                capacity=capacity,
+                page_size=backend.page_size,
+                dtype=model_runner.kv_cache_dtype,
+                qcap=backend.req_to_token_pool.req_generation.numel(),
+                bcap=max(backend.req_to_token_pool.size, graph_requests),
+                tcap=row_capacity,
+                graph_reservation=graph_reservation,
+                abi=execution_abi,
+            )
+            backend.req_to_token_pool._shared_fsa_graph_reservation = graph_reservation
         if offload_backend == "lim_copy_sfa":
             from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
                 LimCopySfaState,
@@ -153,12 +244,22 @@ def initialize_fsa_backend(backend, model_runner):
                 mutable_tail_tokens=sparse_mtp_tail(
                     model_runner.spec_algorithm, get_spec(), model_runner.model_config
                 ),
+                max_query_routes=routes,
+                page_size=backend.page_size,
+                execution_abi=execution_abi,
+                batch_capacity=max(backend.req_to_token_pool.size, graph_requests),
+                load_mode=load_mode,
+                warmup_threshold=warmup_threshold,
             )
+        if offload_backend == "external_plan":
+            state.shared_topk = backend.fused_sparse_topk
         owner.fsa_runtime_state = state
     elif state.pool is not backend.req_to_token_pool:
         raise ValueError("FSA state belongs to a different request pool")
     if getattr(state, "backend_name", "external_plan") != offload_backend:
         raise ValueError("DSA offload backend cannot change after state allocation")
+    if offload_backend == "external_plan" and state.execution_abi != execution_abi:
+        raise ValueError("FSA execution ABI cannot change after state allocation")
     backend.fused_sparse_state = state
 
 
@@ -214,30 +315,9 @@ def forward_fsa(
     query_lengths = counts.cumsum(0).to(dtype=lengths.dtype)
     if q_rope is None:
         q_rope = q.new_empty((*q.shape[:-1], 0))
-    draft_plan_cache = (
-        getattr(forward_batch, "draft_sparse_plan_cache", None)
-        if getattr(backend, "fused_sparse_draft_reuse", False)
-        and getattr(forward_batch, "reuse_dsa_topk_indices", False)
-        and forward_batch.forward_mode.is_decode()
-        and backing is not None
-        else None
-    )
-    draft_plan_identity = None
-    if draft_plan_cache is not None:
-        requests = forward_batch.req_pool_indices
-        draft_plan_identity = (
-            id(forward_batch),
-            topk_indices.data_ptr(),
-            topk_indices.shape,
-            topk_indices.stride(),
-            None if torch.is_inference(topk_indices) else topk_indices._version,
-            requests.data_ptr(),
-            None if torch.is_inference(requests) else requests._version,
-            full_table.data_ptr(),
-            None if torch.is_inference(full_table) else full_table._version,
-            backend.fused_sparse_state._generation_version,
-            backing.page_binding.mapping_epoch,
-        )
+    mapping_epoch = 0
+    if backing is not None and backing.page_binding is not None:
+        mapping_epoch = backing.page_binding.mapping_epoch
     inputs = backend.fused_sparse_state.build_inputs(
         layer_id=layer.layer_id,
         q_nope=q,
@@ -251,12 +331,14 @@ def forward_fsa(
         request_slots=forward_batch.req_pool_indices[: counts.numel()],
         scale=layer.scaling,
         query_positions=getattr(forward_batch, "positions", None),
-        draft_plan_cache=draft_plan_cache,
-        draft_plan_identity=draft_plan_identity,
+        mapping_epoch=mapping_epoch,
     )
     if backing is not None:
         latent_region, rope_region = backing.regions[local_layer]
         inputs = replace(
-            inputs, full_kv_region=latent_region, full_rope_region=rope_region
+            inputs,
+            full_kv_region=latent_region,
+            full_rope_region=rope_region,
+            host_binding=backing.page_binding,
         )
     return run_fused_sparse_attention(inputs, mode=backend.fused_sparse_mode)

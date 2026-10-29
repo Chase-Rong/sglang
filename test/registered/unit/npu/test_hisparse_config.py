@@ -226,17 +226,18 @@ def test_invalid_legacy_values_are_errors_not_silent_defaults(name, value):
         CONFIG.resolve_npu_hisparse_config(args(npu=budget("null")), {name: value})
 
 
-def test_reference_fsa_remains_available_outside_lim():
-    validate(
-        args(
-            npu={
-                **budget("null"),
-                "dsa_offload_backend": "external_plan",
-                "fused_sparse_attention_mode": "reference",
-            }
+def test_reference_fsa_is_rejected_for_external_plan():
+    with pytest.raises(ValueError, match="removed"):
+        validate(
+            args(
+                npu={
+                    **budget("null"),
+                    "dsa_offload_backend": "external_plan",
+                    "fsa_execution_abi": "row_v0",
+                    "fused_sparse_attention_mode": "reference",
+                }
+            )
         )
-    )
-
 
 @pytest.mark.parametrize("role", ["null", "prefill", "decode"])
 def test_role_specific_cache_contracts(role):
@@ -513,3 +514,23 @@ def test_native_cuda_radix_and_dtype_checks_remain_intact(startup):
 
 if __name__ == "__main__":
     run_pytest(__file__)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("fsa_execution_abi", "row_v0"),
+    ("fsa_execution_abi", "shared_v1"),
+    ("fsa_execution_abi", "shared_v2"),
+    ("fsa_load_mode", "UNION_FILL"),
+    ("fsa_load_mode", "OVERLAP"),
+])
+def test_external_plan_rejects_retired_execution_but_lim_ignores_selector(field, value):
+    settings = {**budget("decode"), field: value}
+    with pytest.raises(ValueError, match="removed"):
+        CONFIG.resolve_npu_hisparse_config(args("decode", settings | {"dsa_offload_backend": "external_plan"}), {})
+    lim = CONFIG.resolve_npu_hisparse_config(args("decode", settings | {"dsa_offload_backend": "lim_copy_sfa"}), {})
+    assert getattr(lim, field) == value
+
+
+def test_external_plan_defaults_to_only_fused_execution():
+    result = CONFIG.resolve_npu_hisparse_config(args("decode", {**budget("decode"), "dsa_offload_backend": "external_plan"}), {})
+    assert (result.fsa_execution_abi, result.fsa_load_mode) == ("shared_v3", "FUSED")

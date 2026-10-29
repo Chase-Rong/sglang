@@ -509,9 +509,9 @@ class ModelRunner:
 
         if get_parallel().pp_size > 1:
             if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
-                assert self.support_pp, (
-                    "Pipeline Parallel is not compatible with this model."
-                )
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -1855,7 +1855,12 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        from sglang.srt.hardware_backend.npu.hisparse.shared_execution import (
+            checked_shared_forward,
+        )
+
         with (
+            checked_shared_forward(),
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(

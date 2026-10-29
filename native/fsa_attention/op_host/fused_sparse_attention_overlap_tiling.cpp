@@ -325,6 +325,12 @@ void FusedSparseAttentionOverlapMlaTiling::FillTilingBaseParamsMla()
         }
     }
     tilingData_.baseParams.set_selectionMembershipStride(selectionMembershipStride);
+    uint32_t sharedCapacity = context_->GetInputShape(11)->GetStorageShape().GetDim(1)*128;
+    tilingData_.baseParams.set_sharedCapacity(sharedCapacity);
+    tilingData_.baseParams.set_sharedWidth(context_->GetInputShape(17)->GetStorageShape().GetDim(1));
+    tilingData_.baseParams.set_sharedRequestCapacity(context_->GetInputShape(10)->GetStorageShape().GetDim(0)*128/sharedCapacity);
+    tilingData_.baseParams.set_sharedHostPages(context_->GetInputShape(1)->GetStorageShape().GetDim(0));
+    tilingData_.baseParams.set_sharedRows(context_->GetInputShape(0)->GetStorageShape().GetDim(0));
     tilingData_.baseParams.set_attentionMode(sfaInfo_->attentionMode);
     tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse);
     tilingData_.baseParams.set_isActualLenDimsNull(sfaInfo_->actualQSeqLenFlag ? 0U : 1U);

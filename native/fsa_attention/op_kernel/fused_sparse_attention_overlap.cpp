@@ -18,7 +18,7 @@ using namespace AscendC;
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
             blocktable, queryRope, keyRope, selectionKRope, selectionKvCache,                     \
             selectionKvBlockTable, selectionKvBlockStatus, selectionMembershipMap,               \
-            attentionOut, selectionKvActualSeq, user, nullptr, tiling, &tPipe);                   \
+            attentionOut, selectionKvActualSeq, sharedRowUnion, sharedUnionKeys, sharedUnionCount, sharedReady, sharedCounters, sharedRequestSlots, sharedUnionSlots, user, nullptr, tiling, &tPipe);                   \
         op.Process();                                                                             \
     } while (0)
 #else
@@ -36,7 +36,7 @@ using namespace AscendC;
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
             blocktable, queryRope, keyRope, selectionKRope, selectionKvCache,                     \
             selectionKvBlockTable, selectionKvBlockStatus, selectionMembershipMap,               \
-            attentionOut, selectionKvActualSeq, user, tiling_data, tiling, &tPipe);               \
+            attentionOut, selectionKvActualSeq, sharedRowUnion, sharedUnionKeys, sharedUnionCount, sharedReady, sharedCounters, sharedRequestSlots, sharedUnionSlots, user, tiling_data, tiling, &tPipe);               \
         op.Process();                                                                             \
     } while (0)
 #endif
@@ -50,6 +50,7 @@ __global__ __aicore__ void fused_sparse_attention_overlap(
     __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
     __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
     __gm__ uint8_t *selectionMembershipMap,
+    __gm__ uint8_t *sharedRowUnion, __gm__ uint8_t *sharedUnionKeys, __gm__ uint8_t *sharedUnionCount, __gm__ uint8_t *sharedReady, __gm__ uint8_t *sharedCounters, __gm__ uint8_t *sharedRequestSlots, __gm__ uint8_t *sharedUnionSlots,
     __gm__ uint8_t *attentionOut, __gm__ uint8_t *selectionKvActualSeq,
     __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {

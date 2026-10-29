@@ -4,6 +4,98 @@ from dataclasses import dataclass
 from math import isfinite
 
 
+def _external_resident_state_bytes(
+    request_capacity: int, layers: int, resident_capacity: int, instances: int = 1
+) -> int:
+    """Charge the request/layer metadata owned by external_plan."""
+
+    if min(request_capacity, layers, resident_capacity, instances) <= 0:
+        raise ValueError("external resident metadata geometry must be positive")
+    per_layer = resident_capacity * (8 + 1 + 1 + 1) + 4 + 8
+    global_state = 8 + 8 + 8 + 1 + 1
+    return (
+        (
+            request_capacity * (layers * per_layer + instances * global_state)
+            + instances * 4
+            + 7
+        )
+        // 8
+        * 8
+    )
+
+
+def shared_storage_bytes(
+    qcap,
+    bcap,
+    tcap,
+    layers,
+    topk,
+    capacity,
+    page_size,
+    routes,
+    *,
+    native_workspace_bytes=0,
+    load_mode="FUSED",
+    warmup_threshold=0,
+):
+    """Exact persistent tensor element bytes for one shared FSA owner.
+
+    CPU generation snapshot is separate; caller's request pool is referenced,
+    not cloned here. Graph retained snapshots and tensor-op/native/allocator
+    transient peaks are deliberately outside this equality.
+    """
+    if (
+        min(qcap, bcap, tcap, layers, topk, capacity, routes) <= 0
+        or page_size != 128
+        or qcap > 32767
+        or bcap > 1024
+        or bcap > tcap
+        or capacity > 16384
+        or capacity % page_size
+        or capacity < routes * topk
+        or topk > 2051
+        or native_workspace_bytes < 0
+    ):
+        raise ValueError("invalid external_plan persistent geometry")
+    from sglang.srt.hardware_backend.npu.hisparse.config import shared_union_width
+
+    width = shared_union_width(routes, topk)
+    if load_mode != "FUSED" or warmup_threshold < 0 or routes > 6:
+        raise ValueError("external_plan only supports FUSED and 1..6 routes")
+    stride = (topk + 8) // 8 * 8
+    per_layer = (
+        qcap * capacity * 512 * 2 + native_workspace_bytes
+        + qcap * (11 * capacity + 12)
+        + bcap * width * 22 + bcap * capacity * 8 + bcap * 145
+        + tcap * topk * 20 + tcap * 12
+        + tcap * (32800 + 4 * (capacity // page_size) + 4 * stride)
+    )
+    if warmup_threshold:
+        # Dedicated B_w=1 prefix arrays, no replacement-policy workspace.
+        per_layer += 32 * capacity + 96 + 96 * qcap
+    return {
+        "cpu_generation_snapshot": 8 * qcap + (32 * qcap if warmup_threshold else 0),
+        "device_owner_global": 34 * qcap + 12,
+        "device_layers": layers * per_layer,
+    }
+
+
+def shared_capture_storage_bytes(qcap, batch, rows, topk, *, load_mode="FUSED"):
+    """Retained output/snapshot storages of one captured layer invocation.
+
+    Allocator-owned intermediate kernel workspaces/capture peak are separate.
+    Inputs supplied by the model, its query and Attention output are not FSA
+    persistent storage. Counts apply to an actually captured bucket/step.
+    """
+    return (
+        34 * qcap
+        + 34 * rows * topk
+        + 24 * rows
+        + 80 * batch
+        + 8
+    )
+
+
 @dataclass(frozen=True)
 class HostMemoryBudgetPlan:
     domain_reserve_bytes: int
@@ -121,11 +213,71 @@ class DecodeKvMemoryBudget:
     index_scale_bytes: int = 0
     index_tail_bytes_per_request: int = 0
     device_fixed_bytes: int = 0
+    external_resident_state_bytes: int = 0
+    external_request_capacity: int = 0
+    external_request_extra_slots: int = 0
+    external_resident_instances: int = 1
     host_memory_plan: HostMemoryBudgetPlan | None = None
     host_index_kpool: int = 1
     host_index_sidecar: bool = False
+    execution_abi: str | None = None
+    shared_graph_executions: tuple = ()
+    # A5 Ascend950DT_9582, AIC32/libapi16MiB. Production factory replaces this
+    # with the queried platform value before solving capacity.
+    native_workspace_bytes: int = 30932992
+    load_mode: str | None = None
+    warmup_threshold: int | None = None
 
     def __post_init__(self):
+        from sglang.srt.hardware_backend.npu.hisparse.config import (
+            resolve_fsa_execution_abi,
+        )
+
+        object.__setattr__(
+            self,
+            "execution_abi",
+            (
+                resolve_fsa_execution_abi(self.execution_abi)
+                if self.backend == "external_plan"
+                else None
+            ),
+        )
+        if (
+            self.backend == "external_plan"
+                        and (
+                self.latent_dim != 512 or self.rope_dim != 0 or self.element_bytes != 2
+            )
+        ):
+            raise ValueError("external_plan budget requires BF16/NoPE512/RoPE0")
+        from sglang.srt.hardware_backend.npu.hisparse.config import (
+            resolve_shared_load_mode,
+            resolve_shared_warmup_threshold,
+        )
+
+        object.__setattr__(
+            self,
+            "load_mode",
+            (
+                resolve_shared_load_mode(self.load_mode)
+                if self.backend == "external_plan"
+                else None
+            ),
+        )
+        object.__setattr__(
+            self,
+            "warmup_threshold",
+            (
+                resolve_shared_warmup_threshold(self.warmup_threshold)
+                if self.backend == "external_plan"
+                else 0
+            ),
+        )
+        if self.load_mode == "FUSED" and (
+            self.resident_capacity > 16384 or self.rows_per_request > 6
+        ):
+            raise ValueError("FUSED requires C<=16384 and routes<=6")
+        if self.native_workspace_bytes < 0:
+            raise ValueError("native workspace budget must be nonnegative")
         if self.host_index_kpool <= 0:
             raise ValueError("Host Indexer compression must be positive")
         if (
@@ -140,10 +292,15 @@ class DecodeKvMemoryBudget:
                 self.index_scale_bytes,
                 self.index_tail_bytes_per_request,
                 self.device_fixed_bytes,
+                self.external_resident_state_bytes,
+                self.external_request_capacity,
+                self.external_request_extra_slots,
             )
             < 0
         ):
             raise ValueError("Index and fixed allocation bytes must be nonnegative")
+        if self.external_resident_instances <= 0:
+            raise ValueError("external resident instance count must be positive")
         if self.backend not in ("external_plan", "lim_copy_sfa"):
             raise ValueError("Unknown DSA offload backend")
         if self.backend == "lim_copy_sfa" and (
@@ -226,36 +383,88 @@ class DecodeKvMemoryBudget:
     def row_capacity(self, requests):
         return max(requests, self.graph_rows) * self.rows_per_request
 
+    def external_request_slots(self, requests):
+        """Price the candidate pool before it exists, including reserved rows."""
+        return max(
+            requests + self.external_request_extra_slots + 1,
+            self.external_request_capacity,
+        )
+
+    def external_metadata_bytes(self, requests, page_size):
+        return _external_resident_state_bytes(
+            self.external_request_slots(requests),
+            self.layers,
+            self.selection_capacity(page_size),
+            self.external_resident_instances,
+        )
+
     def fixed_bytes(self, request_rows, page_size):
         if self.backend == "lim_copy_sfa":
             return self._lim_fixed_bytes(request_rows, page_size)
-        rows = self.row_capacity(request_rows)
-        if not 0 < rows <= 32767:
-            raise ValueError("Decode request rows must fit the fused plan ABI")
+        if self.backend != "external_plan":
+            raise ValueError("unsupported offload backend")
+        return self._shared_fixed_bytes(request_rows, page_size)
+
+    def shared_persistent_bytes(self, request_rows, page_size):
+        qcap = self.external_request_slots(request_rows)
+        bcap = max(request_rows, self.graph_rows)
+        tcap = self.row_capacity(request_rows)
+        values = shared_storage_bytes(
+            qcap,
+            bcap,
+            tcap,
+            1,
+            self.topk,
+            self.selection_capacity(page_size),
+            page_size,
+            self.rows_per_request,
+            native_workspace_bytes=self.native_workspace_bytes,
+            load_mode=self.load_mode,
+            warmup_threshold=self.warmup_threshold,
+        )
+        return {
+            "cpu": values["cpu_generation_snapshot"] * self.external_resident_instances,
+            "device": values["device_owner_global"] * self.external_resident_instances
+            + values["device_layers"] * self.layers,
+        }
+
+    def _shared_fixed_bytes(self, request_rows, page_size):
+        persistent = self.shared_persistent_bytes(request_rows, page_size)
+        qcap = self.external_request_slots(request_rows)
+        bcap = max(request_rows, self.graph_rows)
+        tcap = self.row_capacity(request_rows)
         capacity = self.selection_capacity(page_size)
-        status_stride = (self.topk + 8) // 8 * 8
-        layer_bytes = (
-            capacity * (self.latent_dim + self.rope_dim) * self.element_bytes
-            + capacity // page_size * 4
-            + status_stride * 4
-            + 16400 * 2
-            + (capacity + 1) * 8
-            + 12
+        # Explicit bucket/step shapes give exact retained FSA snapshot bytes.
+        # If capture shapes are not available yet, callback_instances reserves
+        # an upper bound; this is not reported as measured persistent equality.
+        captures = self.shared_graph_executions
+        if not captures and self.graph_rows:
+            captures = ((bcap, tcap),) * self.callback_instances
+        snapshots = self.layers * sum(
+            shared_capture_storage_bytes(
+                qcap, b, t, self.topk, load_mode=self.load_mode
+            )
+            for b, t in captures
         )
-        planner_device = self.topk * 8 + 9
-        planner_host = (2 * self.topk + 2 + 2 * capacity + 3) * 8
-        scratch = capacity * 33 * self.callback_instances
-        device = rows * (
-            self.layers * layer_bytes + self.planner_groups * planner_device
+        # Tensor-operation scratch allowance, not a measurement of native ACL
+        # workspace, allocator/capture peak, or a persistent allocation.
+        width = 1 << (self.rows_per_request * self.topk - 1).bit_length()
+        temporary = self.layers * (
+            bcap * (width * 160 + capacity * 96) + tcap * self.topk * 96
         )
-        host = self.planner_groups * (rows * planner_host + scratch)
-        staging = self.staging_bytes
+        if self.warmup_threshold:
+            temporary += self.layers * capacity * (160 + 96 + 96 + 32)
+        # Native workspace is one persistent buffer per serialized physical
+        # layer, already included above. Captured bucket/step aliases add zero.
         return (
-            host,
-            device
+            persistent["cpu"],
+            persistent["device"]
+            + snapshots
+            + temporary
             + self.shared_fence_bytes
-            + staging
-            + self.allocation_overhead(request_rows),
+            + self.staging_bytes
+            + self.allocation_overhead(request_rows)
+            + self.external_resident_state_bytes,
         )
 
     def _lim_fixed_bytes(self, request_rows, page_size):
@@ -348,9 +557,11 @@ class DecodeKvMemoryBudget:
         upper = (
             min(
                 self.host_bytes // self.host_bytes_per_token,
-                device_bytes // self.device_bytes_per_token
-                if self.device_bytes_per_token
-                else self.host_bytes // self.host_bytes_per_token,
+                (
+                    device_bytes // self.device_bytes_per_token
+                    if self.device_bytes_per_token
+                    else self.host_bytes // self.host_bytes_per_token
+                ),
             )
             // page_size
         )
@@ -441,6 +652,8 @@ def solve_joint_dsa_kda_tokens(
     upper = min(
         requests, token_limit // minimum_per_request, 32767 // budget.rows_per_request
     )
+    if budget.backend == "external_plan":
+        upper = min(upper, 1024, 6144 // budget.rows_per_request)
     if explicit_state_slots is not None:
         upper = min(upper, explicit_state_slots // slots_per_request)
 
@@ -525,6 +738,9 @@ def solve_joint_dsa_kda_tokens(
 
 def budget_from_config(kvc, layers):
     import torch
+    from sglang.srt.hardware_backend.npu.hisparse.config import (
+        resolve_fsa_execution_abi,
+    )
 
     from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
     from sglang.srt.environ import envs
@@ -586,13 +802,70 @@ def budget_from_config(kvc, layers):
             configured_slots, draft_layers
         )
     rows_per_request = sparse_mtp_rows(kvc.spec_algorithm, get_spec(), model)
+    expanded_topk = int(model.hf_text_config.index_topk) + index_kpool - 1
+    configured_capacity = envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get()
+    backend = envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get()
+    resident_capacity = configured_capacity
+    if backend == "external_plan":
+        from sglang.srt.hardware_backend.npu.hisparse.external_sparse_planner import (
+            expanded_resident_capacity,
+        )
+
+        import sglang.srt.runtime_context as runtime_context
+
+        get_schedule = getattr(runtime_context, "get_schedule", None)
+        try:
+            schedule = get_schedule() if callable(get_schedule) else None
+        except (LookupError, RuntimeError, ValueError):
+            # Unit/startup callers can load budgeting before the scheduler
+            # namespace is published.  Production runtime uses the getter.
+            schedule = None
+        page_size = getattr(schedule, "page_size", getattr(model, "page_size", 128))
+
+        resident_capacity = expanded_resident_capacity(
+            configured_capacity,
+            rows_per_request,
+            expanded_topk,
+            page_size,
+        )
     layers += draft_layers
     groups += draft_layers
+    external_request_capacity = 0
+    external_request_extra_slots = 0
+    if backend == "external_plan":
+        pool = getattr(kvc, "req_to_token_pool", None)
+        generation = getattr(pool, "req_generation", None)
+        if generation is not None:
+            external_request_capacity = int(generation.numel())
+        disagg = get_disagg()
+        if disagg.disaggregation_mode == "decode" or getattr(
+            disagg, "enable_pd_role_switch", False
+        ):
+            external_request_extra_slots = (
+                getattr(disagg, "disaggregation_decode_extra_slots", 0) or 0
+            )
     graph_config = get_exec().graph.cuda_graph_config.decode
     graph_sizes = () if graph_config.backend == "disabled" else (graph_config.bs or ())
     graph_rows = max(graph_sizes, default=0)
     if graph_config.backend != "disabled":
         graph_rows = max(graph_rows, graph_config.max_bs or 0)
+    execution_abi = (
+        resolve_fsa_execution_abi() if backend == "external_plan" else None
+    )
+    native_workspace = 0
+    if execution_abi == "shared_v3":
+        from sglang.srt.hardware_backend.npu.hisparse.config import (
+            resolve_shared_load_mode,
+            resolve_shared_warmup_threshold,
+            register_shared_execution,
+        )
+
+        load_mode = resolve_shared_load_mode()
+        warmup_threshold = resolve_shared_warmup_threshold()
+        from sglang.srt.hardware_backend.npu.fsa_native import shared_v3_workspace_bytes
+        native_workspace = shared_v3_workspace_bytes()
+        if pool is not None:
+            register_shared_execution(pool, load_mode, warmup_threshold)
     return DecodeKvMemoryBudget(
         layers,
         groups,
@@ -600,10 +873,8 @@ def budget_from_config(kvc, layers):
         model.qk_rope_head_dim,
         model.index_head_dim,
         2,
-        int(model.hf_text_config.index_topk)
-        + int(getattr(model.hf_text_config, "index_kpool", 1))
-        - 1,
-        envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get(),
+        expanded_topk,
+        resident_capacity,
         envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get(),
         graph_rows,
         max(1, len(graph_sizes) if graph_sizes else graph_rows)
@@ -623,7 +894,18 @@ def budget_from_config(kvc, layers):
         rows_per_request=rows_per_request,
         prefill_layer_slots=prefill_slots,
         host_token_capacity=(envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()),
-        backend=envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get(),
+        backend=backend,
+        execution_abi=execution_abi,
+        native_workspace_bytes=native_workspace,
+        shared_graph_executions=tuple(
+            (b, b * rows_per_request)
+            for b in graph_sizes
+            for _ in range(
+                1
+                if kvc.spec_algorithm.is_none()
+                else int(get_spec().speculative_num_steps) + 2
+            )
+        ),
         lim_source_tokens=(
             model.context_len + 128
             if envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get() == "lim_copy_sfa"
@@ -635,4 +917,7 @@ def budget_from_config(kvc, layers):
         host_index_kpool=index_kpool,
         host_index_sidecar=index_kpool > 1
         and get_dsa_index_kpool_compress(model.hf_config),
+        external_request_capacity=external_request_capacity,
+        external_request_extra_slots=external_request_extra_slots,
+        external_resident_instances=1 + int(draft_layers > 0),
     )

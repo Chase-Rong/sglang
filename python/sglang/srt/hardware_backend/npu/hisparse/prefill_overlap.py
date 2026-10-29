@@ -136,6 +136,20 @@ class PipelinedIntegratedOffloadRuntime:
                 backing.publish_prefill_writes()
             self.host_visible = self._record(self.compute_stream)
             backing.page_binding.ready_event = self.host_visible
+            # Exact successful all-layer publication snapshot. This is Host
+            # coverage only; coordinator separately reads Req committed truth.
+            if batch.seq_lens_cpu is not None:
+                self.warmup_publication = (
+                    tuple(batch.req_pool_indices.detach().cpu().tolist()),
+                    tuple(
+                        self.request_pool.req_generation[
+                            batch.req_pool_indices.detach().cpu().long()
+                        ].tolist()
+                    ),
+                    tuple(int(x) for x in batch.seq_lens_cpu),
+                    backing.page_binding.mapping_epoch,
+                    self.host_visible,
+                )
             self.retired.append(
                 (
                     self.host_visible,

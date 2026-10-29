@@ -117,7 +117,10 @@ def test_pd_publication_runs_once_for_packed_target_and_draft(bound):
 
 
 @pytest.mark.parametrize("waiting", ["transfer", "restore"])
-def test_pd_publication_waits_for_tp_receive_and_restore_readiness(bound, waiting):
+@pytest.mark.parametrize("warmup", ["no-coordinator", "disabled", "enabled", "unknown"])
+def test_pd_publication_waits_for_tp_receive_and_restore_readiness(
+    bound, waiting, warmup
+):
     from test_hisparse_pd_dispatch import production_definitions
 
     polls = production_definitions(
@@ -205,12 +208,37 @@ def test_pd_publication_waits_for_tp_receive_and_restore_readiness(bound, waitin
     )
     queue.queue = [entry]
     queue.scheduler = SimpleNamespace(enable_decode_hicache=waiting == "restore")
+    if warmup != "no-coordinator":
+        from sglang.srt.hardware_backend.npu.hisparse.runtime import (
+            NpuHiSparseCoordinator,
+        )
+
+        coordinator = NpuHiSparseCoordinator.__new__(NpuHiSparseCoordinator)
+        coordinator.mem_pool_device = SimpleNamespace(
+            fsa_runtime_state=SimpleNamespace(
+                execution_abi="shared_v3",
+                warmup_threshold=0 if warmup == "disabled" else 128,
+            )
+        )
+        coordinator.record_warmup_publication = lambda req, committed: calls.append(
+            ("warmup", committed)
+        )
+        queue.scheduler.hisparse_coordinator = coordinator
+        if warmup == "enabled":
+            request.kv = SimpleNamespace(kv_committed_len=6)
+            request.finished = lambda: False
     queue._process_hicache_local_restores = lambda entries: None
     queue.enable_staging = False
     queue.enable_host_receive = False
     queue.enable_deferred_kv_release = False
     queue.gloo_group = object()
-    queue._commit_transfer_to_req = lambda entry: calls.append("commit")
+
+    def commit(entry):
+        calls.append("commit")
+        if warmup == "enabled":
+            entry.req.kv.kv_committed_len = 7
+
+    queue._commit_transfer_to_req = commit
     queue.metadata_buffers = SimpleNamespace(bootstrap_room=torch.tensor([[5]]))
     queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
         free=lambda index: calls.append("free metadata")
@@ -225,7 +253,11 @@ def test_pd_publication_waits_for_tp_receive_and_restore_readiness(bound, waitin
     peer.poll = polls.Success
     entry.hicache_restore_status = restore.HiCacheRestoreResult.READY
     assert queue.pop_transferred() == [request]
-    assert calls == ["commit", "free metadata"]
+    assert calls == (
+        ["commit", ("warmup", 6), "free metadata"]
+        if warmup == "enabled"
+        else ["commit", "free metadata"]
+    )
     assert reductions[-1] == [polls.Success]
     assert queue.queue == []
     assert queue.metadata_buffers.bootstrap_room[0, 0].item() == 0

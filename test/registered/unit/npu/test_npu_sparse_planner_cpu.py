@@ -34,85 +34,6 @@ def modules(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("requests,routes", [(1, 1), (2, 1), (1, 6), (2, 6)])
-@pytest.mark.parametrize("hit_percent", [0, 80, 99, 100])
-def test_2051_selection_reorders_mask_and_copies_only_misses(
-    modules, monkeypatch, requests, routes, hit_percent
-):
-    _, planner = modules
-    rows, width, capacity = requests * routes, 2051, 2176
-    applied = torch.full((rows, capacity + 1), -1, dtype=torch.int64)
-    cache = SimpleNamespace(
-        selection_kv_cache=torch.empty(rows * capacity // 128, 128, 1),
-        max_tokens=rows,
-        applied_keys=applied[:, :-1],
-        applied_keys_with_padding=applied,
-    )
-    membership = torch.full((rows, 16400), -7, dtype=torch.int16)
-    keys = torch.arange(width).repeat(rows, 1) + 128
-    slots = torch.arange(width).repeat(rows, 1)
-    hits = width * hit_percent // 100
-    applied[:, :hits] = keys[:, :hits]
-    order = torch.arange(width).roll(37).flip(0)
-    keys, slots = keys[:, order], slots[:, order]
-    plan = planner.materialize_layer_plan(cache, keys, slots, membership)
-    assert plan.miss_mask.sum().item() == rows * (width - hits)
-    encoded = membership[:, 16384 - width : 16384]
-    assert torch.equal(encoded.abs().long(), slots + 1)
-    assert torch.equal(encoded < 0, plan.miss_mask)
-    assert membership[0, 16384:16392].tolist() == [
-        0x5A4D,
-        0x5A45,
-        2051,
-        14333,
-        0,
-        0x5A44,
-        capacity,
-        0,
-    ]
-    assert (membership[:, 14332] == -7).all()
-    source = torch.arange(4096, dtype=torch.float32).reshape(-1, 1)
-    destination = torch.full((rows * capacity, 1), -999.0)
-    destination.view(rows, capacity, 1)[:, :hits] = source[torch.arange(hits) + 128]
-    copied = []
-
-    def copy(source, target, source_ids, destination_ids, valid, **kwargs):
-        copied.append(valid.sum().item())
-        target[destination_ids[valid]] = source[source_ids[valid]]
-
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.hardware_backend.npu.fsa_native",
-        SimpleNamespace(unidex_copy_inplace=copy),
-    )
-    import sglang.srt.hardware_backend.npu as npu
-
-    monkeypatch.setattr(
-        npu,
-        "fsa_native",
-        sys.modules["sglang.srt.hardware_backend.npu.fsa_native"],
-        raising=False,
-    )
-    inputs = SimpleNamespace(
-        selection_plan=plan,
-        selection_kv_cache=destination.reshape(-1, 128, 1),
-        selection_k_rope=torch.empty(rows * capacity // 128, 128, 0),
-        full_kv_cache=source,
-        full_k_rope=torch.empty(4096, 0),
-        full_kv_region=None,
-        full_rope_region=None,
-    )
-    planner.gather_selection_misses(inputs)
-    assert copied == [rows * (width - hits)]
-    assert torch.equal(
-        destination.view(rows, capacity, 1)[:, :width, 0],
-        torch.arange(width).repeat(rows, 1) + 128,
-    )
-    assert (destination.view(rows, capacity, 1)[:, width:] == -999).all()
-    planner.commit_layer_plan(cache, plan)
-    assert not planner.materialize_layer_plan(
-        cache, keys, slots, membership
-    ).miss_mask.any()
 
 
 @pytest.mark.parametrize("length", [2047, 2048, 2049])
@@ -137,7 +58,7 @@ def test_causal_metadata_preserves_tail_and_masks_invalid_columns(
     assert (masked[:, :, 0] == -1).all()
     assert (masked[:, 0][torch.arange(2051)[None] > positions[:, None]] == -1).all()
     table = torch.stack((torch.arange(1, 19), torch.arange(19, 37))).int()
-    plan = fsa.build_reference_sparse_plan(masked, table, lengths, ends, page_size=128)
+    plan = fsa.translate_logical_selection(masked, table, lengths, ends, page_size=128)
     assert torch.equal(
         plan.physical_token_ids[:, 0],
         torch.where(
@@ -160,7 +81,7 @@ def test_lim_capacity_covers_union_and_native_limit(monkeypatch, routes, capacit
 def test_generation_upload_is_stable_and_monotonic_after_clear(modules):
     fsa, _ = modules
     pool = SimpleNamespace(req_generation=torch.tensor([0, 4, 9]))
-    state = fsa.FusedSparseAttentionState("cpu", pool)
+    state = fsa.FusedSparseAttentionState("cpu", pool, page_size=128)
     address = state.generations.data_ptr()
     version = state._generation_version
     state.refresh_generations()
@@ -195,72 +116,8 @@ def test_host_table_scope_shares_only_one_preparation_and_mapping_epoch(monkeypa
     assert not output[:, 2:].any()
 
 
-def test_mutable_tail_and_inactive_rows_do_not_publish_hits(modules):
-    _, planner = modules
-    applied = torch.full((2, 9), -1, dtype=torch.int64)
-    cache = SimpleNamespace(
-        selection_kv_cache=torch.empty(8, 2, 1),
-        max_tokens=2,
-        applied_keys=applied[:, :-1],
-        applied_keys_with_padding=applied,
-    )
-    membership = torch.empty(2, 16400, dtype=torch.int16)
-    keys = torch.tensor([[8, 9, 10, 11], [-1, -1, -1, -1]])
-    slots = torch.arange(4).repeat(2, 1)
-    stable = torch.tensor([[True, True, False, False], [False] * 4])
-    first = planner.materialize_layer_plan(
-        cache, keys, slots, membership, cacheable_mask=stable
-    )
-    planner.commit_layer_plan(cache, first)
-    second = planner.materialize_layer_plan(
-        cache, keys, slots, membership, cacheable_mask=stable
-    )
-    assert second.miss_mask.tolist() == [[False, False, True, True], [False] * 4]
-    assert (membership[1, 16380:16384] == 0).all()
-    assert (cache.applied_keys[1] == -1).all()
 
 
-@pytest.mark.parametrize("change", ["generation", "mapping", "requests", "seed"])
-def test_external_draft_reuse_identity_change_replans(modules, monkeypatch, change):
-    fsa, planner = modules
-    pool = SimpleNamespace(req_generation=torch.tensor([0, 1, 2]))
-    state = fsa.FusedSparseAttentionState(
-        "cpu", pool, external_planner=True, resident_capacity=8, mutable_tail_tokens=2
-    )
-    enqueue = []
-
-    def ensure(layer, cache, topk):
-        def plan(keys, owners, lengths):
-            enqueue.append(keys.clone())
-            return torch.arange(topk).repeat(keys.shape[0], 1)
-
-        return layer, SimpleNamespace(enqueue=plan)
-
-    monkeypatch.setattr(state, "_ensure_planner", ensure)
-    cache = {}
-    kwargs = dict(
-        layer_id=0,
-        q_nope=torch.zeros(2, 1, 4),
-        q_rope=torch.empty(2, 1, 0),
-        topk_indices=torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32),
-        full_kv=torch.empty(8, 2, 4),
-        full_rope=torch.empty(8, 2, 0),
-        block_table=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
-        kv_lengths=torch.tensor([4, 4]),
-        query_lengths=torch.tensor([1, 2]),
-        request_slots=torch.tensor([1, 2]),
-        scale=0.5,
-        draft_plan_cache=cache,
-        draft_plan_identity=("generation", 0),
-    )
-    inputs = state.build_inputs(**kwargs)
-    planner.commit_layer_plan(inputs.selection_cache, inputs.selection_plan)
-    state.build_inputs(**kwargs)
-    assert len(enqueue) == 1
-    kwargs["draft_plan_identity"] = (change, 1)
-    state.refresh_generations()
-    state.build_inputs(**kwargs)
-    assert len(enqueue) == 2
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ class OffloadPageBinding:
         self.retired = deque()
         self.ready_event = None
         self.reader_events = deque()
+        self.reader_failure = None
         self.evict_host = None
         shared = getattr(host_pool.backing.pool, "shared_group", None)
         self.shared_group = (
@@ -104,8 +105,19 @@ class OffloadPageBinding:
         )
         self.mapping_epoch += 1
 
+    def check_reader_health(self):
+        if self.reader_failure is not None:
+            raise RuntimeError(
+                "FSA Host reader drain failed; binding is quarantined"
+            ) from self.reader_failure
+
+    def mark_reader_failure(self, error):
+        with self.lock:
+            self.reader_failure = error
+
     def reap(self):
         with self.lock:
+            self.check_reader_health()
             while self.reader_events and self.reader_events[0].query():
                 self.reader_events.popleft()
             while (
@@ -118,6 +130,7 @@ class OffloadPageBinding:
 
     def record_reader(self, event):
         with self.lock:
+            self.check_reader_health()
             self.reader_events.append(event)
 
     def reclaim_for_capacity(self, count):
@@ -259,6 +272,7 @@ class OffloadPageBinding:
             self._release(host_pages)
 
     def _release(self, pages):
+        self.check_reader_health()
         if not pages.numel():
             return
         unique_pages, counts = torch.unique(pages, return_counts=True)
@@ -291,6 +305,7 @@ class OffloadPageBinding:
 
     def release_device_pages(self, pages):
         with self.lock:
+            self.check_reader_health()
             pages = torch.unique(pages.detach().to(device="cpu", dtype=torch.int64))
             self._validate_device_pages(pages)
             for reader in self.reader_events:
@@ -304,6 +319,7 @@ class OffloadPageBinding:
 
     def restore_mapping(self, host_rows, device_rows):
         with self.lock:
+            self.check_reader_health()
             host_pages = self._complete_pages(host_rows)
             device_pages = self._complete_pages(device_rows)
             host = host_rows.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
@@ -329,7 +345,8 @@ class OffloadPageBinding:
 
     def clear(self):
         with self.lock:
-            if self.references.any() or self.retired:
+            self.check_reader_health()
+            if self.references.any() or self.retired or self.reader_events:
                 torch.npu.synchronize()
                 if self.shared_group is not None:
                     self.shared_group.group.barrier()

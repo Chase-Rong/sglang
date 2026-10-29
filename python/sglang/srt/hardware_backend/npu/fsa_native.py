@@ -367,3 +367,45 @@ def native_ops():
             "the installed sgl-kernel-npu wheel is left unchanged"
         )
     return torch.ops.sgl_fsa
+
+
+def require_shared_v3_capability():
+    """Reject an old planner, extension, or OPP before FUSED allocations."""
+    from .hisparse.external_plan_fused import PLANNER_CAPABILITIES
+
+    ops = native_ops()
+    try:
+        capabilities = list(ops.shared_v3_capabilities())
+        planner = list(ops.external_plan_prepare_capabilities())
+        ops.external_plan_prepare
+        ops.npu_fused_sparse_attention_overlap
+        workspace = int(ops.shared_v3_workspace_bytes())
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError(
+            "FUSED requires ABI3 planner, extension and unique-copy OPP"
+        ) from error
+    expected = [3, 1, 32, 512, 0, 128, 2051, 32767, 32767, 9, 1024, 1, 8, 16, 1]
+    if capabilities != expected or planner != PLANNER_CAPABILITIES or workspace <= 0:
+        raise RuntimeError(
+            f"unsupported FUSED capabilities {capabilities}/{planner}/{workspace}"
+        )
+    return capabilities
+
+
+def shared_v3_workspace_bytes():
+    require_shared_v3_capability()
+    return int(native_ops().shared_v3_workspace_bytes())
+
+
+def require_external_plan_warmup_capability():
+    """FILL_ONLY has its own direct-kernel contract and needs no Attention OPP."""
+    ops = native_ops()
+    try:
+        capabilities = list(ops.external_plan_warmup_capabilities())
+        ops.external_plan_fill_only
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError("external_plan fill-only helper ABI1 is required") from error
+    expected = [1, 1, 512, 0, 128, 16384, 32767, 1024, 9, 1]
+    if capabilities != expected:
+        raise RuntimeError(f"unsupported external_plan warmup capabilities {capabilities}")
+    return capabilities

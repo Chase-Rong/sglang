@@ -6,11 +6,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-set(SOC_VERSION "Ascend950PR_9599" CACHE STRING "Exact SoC reported by the target CANN runtime")
-set(FSA_SOURCE_ROOT "" CACHE PATH "Exported sgl-kernel-npu sources containing the FSA wrapper")
+set(SOC_VERSION "Ascend950DT_9582" CACHE STRING "Exact SoC reported by the target CANN runtime")
+set(FSA_SOURCE_ROOT "" CACHE PATH "Exported sgl-kernel-npu sources containing shared Host utilities")
 set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}" CACHE PATH "CANN root")
 set(ASCEND_DRIVER_PATH "/usr/local/Ascend/driver" CACHE PATH "Ascend driver headers and libraries")
-if(NOT EXISTS "${FSA_SOURCE_ROOT}/csrc/fused_sparse_attention_overlap/fsa_lru_planner.cpp")
+if(NOT EXISTS "${FSA_SOURCE_ROOT}/csrc/sparsity_driven_kv_offload/shm_allocator/shm_allocator.cpp")
     message(FATAL_ERROR "FSA_SOURCE_ROOT must point to the exported FSA source bundle")
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
@@ -38,27 +38,35 @@ set(FSA_CSRC "${FSA_SOURCE_ROOT}/csrc")
 ascendc_library(fsa_unidex_kernel STATIC
     "${FSA_CSRC}/sparsity_driven_kv_offload/unidex_copy/op_kernel/unidex_copy_kernel.cpp")
 ascendc_include_directories(fsa_unidex_kernel PRIVATE "${FSA_CSRC}/utils/kernel")
+ascendc_library(fsa_shared_kernel STATIC fused_sparse_attention_overlap_finish_kernel.cpp external_plan_warmup_kernel.cpp)
+ascendc_library(fsa_planner_kernel STATIC planner_prepare_kernel.cpp)
+ascendc_compile_options(fsa_planner_kernel PRIVATE --cce-auto-sync=off
+    "SHELL:-mllvm -cce-vf-remove-membar=false" "SHELL:-mllvm -cce-aicore-hoist-movemask=false")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/version.h" "#pragma once\n")
 add_library(sgl_fsa_extension SHARED registration.cpp
     external_host_mapping.cpp
     prefill_dma.cpp
-    clock_plan.cpp
-    host_plan.cpp
     fused_sparse_attention_overlap.cpp
-    "${FSA_CSRC}/fused_sparse_attention_overlap/fsa_lru_planner.cpp"
     "${FSA_CSRC}/sparsity_driven_kv_offload/shm_allocator/shm_allocator.cpp"
     "${FSA_CSRC}/sparsity_driven_kv_offload/shm_allocator/shm_allocator_op.cpp"
     "${FSA_CSRC}/sparsity_driven_kv_offload/unidex_copy/op_host/unidex_copy.cpp")
+set(FSA_CONFIGURED_DIR "${CMAKE_CURRENT_BINARY_DIR}/configured")
+add_custom_command(
+    OUTPUT "${FSA_CONFIGURED_DIR}/configured_planner.cpp" "${FSA_CONFIGURED_DIR}/configured_planner.h"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/prepare_planner_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}" "${FSA_CONFIGURED_DIR}"
+    DEPENDS fsa_planner_kernel "${CMAKE_CURRENT_SOURCE_DIR}/prepare_planner_launch.py"
+    VERBATIM)
+target_sources(sgl_fsa_extension PRIVATE planner_prepare.cpp "${FSA_CONFIGURED_DIR}/configured_planner.cpp")
 target_compile_definitions(sgl_fsa_extension PRIVATE _GLIBCXX_USE_CXX11_ABI=${FSA_CXX11_ABI})
 target_include_directories(sgl_fsa_extension PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}" "${FSA_CONFIGURED_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}" "${FSA_CSRC}" "${FSA_CSRC}/utils"
-    "${FSA_CSRC}/fused_sparse_attention_overlap"
     "${FSA_TORCH_NPU_ROOT}/include" "${FSA_TORCH_NPU_ROOT}/include/third_party/acl/inc"
-    "${ASCEND_CANN_PACKAGE_PATH}/include" "${ASCEND_DRIVER_PATH}/include"
+    "${ASCEND_CANN_PACKAGE_PATH}/include" "${ASCEND_CANN_PACKAGE_PATH}/include/op_common" "${ASCEND_DRIVER_PATH}/include"
     ${Python3_INCLUDE_DIRS})
 target_link_directories(sgl_fsa_extension PRIVATE
     "${FSA_TORCH_NPU_ROOT}/lib" "${ASCEND_CANN_PACKAGE_PATH}/lib64"
     "${ASCEND_DRIVER_PATH}/lib64/driver")
-target_link_libraries(sgl_fsa_extension PRIVATE fsa_unidex_kernel OpenMP::OpenMP_CXX ${TORCH_LIBRARIES}
-    torch_npu ascendcl ascend_hal Python3::Python dl)
+target_link_libraries(sgl_fsa_extension PRIVATE fsa_unidex_kernel fsa_shared_kernel fsa_planner_kernel OpenMP::OpenMP_CXX ${TORCH_LIBRARIES}
+    torch_npu ascendcl ascend_hal tiling_api platform Python3::Python dl)

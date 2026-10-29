@@ -4175,8 +4175,9 @@ class Scheduler(
                 running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -4620,6 +4621,15 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if (
+                        batch.forward_mode.is_decode()
+                        and self.hisparse_coordinator is not None
+                    ):
+                        warmup = getattr(
+                            self.hisparse_coordinator, "warmup_committed_requests", None
+                        )
+                        if warmup is not None:
+                            warmup(batch.reqs)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -4808,6 +4818,15 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                if (
+                    batch.forward_mode.is_decode()
+                    and self.hisparse_coordinator is not None
+                ):
+                    warmup = getattr(
+                        self.hisparse_coordinator, "warmup_committed_requests", None
+                    )
+                    if warmup is not None:
+                        warmup(batch.reqs)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -4871,6 +4890,12 @@ class Scheduler(
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req
 
+        if batch.forward_mode.is_extend() and self.hisparse_coordinator is not None:
+            record = getattr(
+                self.hisparse_coordinator, "record_local_warmup_publication", None
+            )
+            if record is not None:
+                record(batch.reqs)
         self._maybe_report_active_ranks()
 
         return ret
@@ -5306,7 +5331,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                idle &= (
+                    not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
