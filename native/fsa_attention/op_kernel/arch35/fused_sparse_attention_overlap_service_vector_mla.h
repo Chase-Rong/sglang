@@ -285,6 +285,8 @@ private:
     int64_t selectionDirectRowStride = 0;
     int64_t selectionPlanOffset = 0;
     bool externalSelectionPlanActive = false;
+    int64_t selectionPreparedRow = -1;
+    int64_t selectionPreparedCount = 0;
 
     static constexpr int16_t SELECTION_EXTERNAL_PLAN_READY_MARKER = 0x5A45;
     static constexpr int16_t SELECTION_DIRECT_LAYOUT_MARKER = 0x5A44;
@@ -425,53 +427,61 @@ FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::PrepareExternalSelectio
     const RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<int16_t> selectionPlanLocal,
     int64_t &logicalSelectionRow)
 {
-    externalSelectionPlanActive = false;
-    selectionDataRow = -1;
-    selectionDirectRowStride = 0;
-    selectionPlanOffset = 0;
     logicalSelectionRow = GetSelectionRow(runInfo, constInfo);
-    if (selectionMembershipStride < SELECTION_MEMBERSHIP_STORAGE_COUNT ||
-        logicalSelectionRow < 0) {
-        return false;
-    }
-
-    LocalTensor<int16_t> controlLocal = selectionPlanTBuf.template Get<int16_t>();
-    DataCopyExtParams controlParams;
-    controlParams.blockCount = 1;
-    controlParams.blockLen = 8 * sizeof(int16_t);
-    controlParams.srcStride = 0;
-    controlParams.dstStride = 0;
-    DataCopyPadExtParams<int16_t> controlPadParams{false, 0, 0, 0};
-    int64_t membershipBase = logicalSelectionRow * selectionMembershipStride;
-    DataCopyPad(controlLocal,
-        selectionMembershipMapGm[membershipBase + SELECTION_MEMBERSHIP_CONTROL_OFFSET],
-        controlParams, controlPadParams);
-    SetFlag<HardEvent::MTE2_S>(mte2ToSPlan);
-    WaitFlag<HardEvent::MTE2_S>(mte2ToSPlan);
-
-    int64_t planCount = static_cast<int64_t>(controlLocal.GetValue(2));
     int64_t chunkPlanStart = runInfo.s2LoopCount * constInfo.s2BaseSize;
-    int64_t planOffset = static_cast<int64_t>(controlLocal.GetValue(3));
-    if (controlLocal.GetValue(1) != SELECTION_EXTERNAL_PLAN_READY_MARKER ||
-        planCount < chunkPlanStart + runInfo.s2RealSize || planOffset < 0 ||
-        planOffset + planCount > SELECTION_MEMBERSHIP_CONTROL_OFFSET) {
+    bool reuseHeader = externalSelectionPlanActive && selectionPreparedRow == logicalSelectionRow;
+    externalSelectionPlanActive = false;
+    if (!reuseHeader) {
+        selectionDataRow = -1;
+        selectionDirectRowStride = 0;
+        selectionPlanOffset = 0;
+        selectionPreparedRow = -1;
+        selectionPreparedCount = 0;
+        if (selectionMembershipStride < SELECTION_MEMBERSHIP_STORAGE_COUNT ||
+            logicalSelectionRow < 0) {
+            return false;
+        }
+
+        LocalTensor<int16_t> controlLocal = selectionPlanTBuf.template Get<int16_t>();
+        DataCopyExtParams controlParams;
+        controlParams.blockCount = 1;
+        controlParams.blockLen = 8 * sizeof(int16_t);
+        controlParams.srcStride = 0;
+        controlParams.dstStride = 0;
+        DataCopyPadExtParams<int16_t> controlPadParams{false, 0, 0, 0};
+        int64_t membershipBase = logicalSelectionRow * selectionMembershipStride;
+        DataCopyPad(controlLocal,
+            selectionMembershipMapGm[membershipBase + SELECTION_MEMBERSHIP_CONTROL_OFFSET],
+            controlParams, controlPadParams);
+        SetFlag<HardEvent::MTE2_S>(mte2ToSPlan);
+        WaitFlag<HardEvent::MTE2_S>(mte2ToSPlan);
+
+        int64_t planCount = static_cast<int64_t>(controlLocal.GetValue(2));
+        int64_t planOffset = static_cast<int64_t>(controlLocal.GetValue(3));
+        if (controlLocal.GetValue(1) != SELECTION_EXTERNAL_PLAN_READY_MARKER ||
+            planCount < chunkPlanStart + runInfo.s2RealSize || planOffset < 0 ||
+            planOffset + planCount > SELECTION_MEMBERSHIP_CONTROL_OFFSET) {
+            return false;
+        }
+        if (controlLocal.GetValue(0) != 0x5A4D || controlLocal.GetValue(1) != 0x5A45 ||
+            controlLocal.GetValue(5) != 0x5A53 || controlLocal.GetValue(7) != 3 ||
+            controlLocal.GetValue(4) < 0 || controlLocal.GetValue(6) <= 0 ||
+            planOffset != SELECTION_MEMBERSHIP_CONTROL_OFFSET - planCount) {
+            return false;
+        }
+        selectionDataRow = static_cast<int64_t>(controlLocal.GetValue(4));
+        selectionDirectRowStride = static_cast<int64_t>(controlLocal.GetValue(6));
+        selectionPlanOffset = planOffset;
+        selectionPreparedCount = planCount;
+        selectionPreparedRow = logicalSelectionRow;
+    }
+    if (selectionPreparedCount < chunkPlanStart + runInfo.s2RealSize) {
+        selectionDataRow = -1;
+        selectionDirectRowStride = 0;
+        selectionPlanOffset = 0;
         return false;
     }
-
-    if (controlLocal.GetValue(0) != 0x5A4D || controlLocal.GetValue(1) != 0x5A45 ||
-        controlLocal.GetValue(5) != 0x5A53 || controlLocal.GetValue(7) != 3 ||
-        controlLocal.GetValue(4) < 0 || controlLocal.GetValue(6) <= 0 ||
-        planOffset != 16384-planCount) return false;
-    selectionDataRow = static_cast<int64_t>(controlLocal.GetValue(4));
-    if (selectionDataRow < 0) {
-        selectionDataRow = logicalSelectionRow;
-    }
-    if (controlLocal.GetValue(5) ==
-        0x5A53 &&
-        controlLocal.GetValue(6) > 0) {
-        selectionDirectRowStride = static_cast<int64_t>(controlLocal.GetValue(6));
-    }
-    selectionPlanOffset = planOffset;
+    int64_t membershipBase = logicalSelectionRow * selectionMembershipStride;
     int64_t chunkPlanCount = static_cast<int64_t>(runInfo.s2RealSize);
     DataCopyExtParams planParams;
     planParams.blockCount = 1;
@@ -485,7 +495,7 @@ FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::PrepareExternalSelectio
     SetFlag<HardEvent::MTE2_S>(mte2ToSPlan);
     WaitFlag<HardEvent::MTE2_S>(mte2ToSPlan);
     if (GetSubBlockIdx() == 0 && runInfo.s2LoopCount == 0) {
-        selectionKvActualSeqGm.SetValue(logicalSelectionRow, static_cast<int32_t>(planCount));
+        selectionKvActualSeqGm.SetValue(logicalSelectionRow, static_cast<int32_t>(selectionPreparedCount));
     }
     externalSelectionPlanActive = true;
     return true;
@@ -907,6 +917,12 @@ void FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::InitGlobalBuffer(_
     selectionKvBlockSize = tilingData->baseParams.blockSize;
     selectionMaxBlockNum = tilingData->baseParams.selectionBlockTableStride;
     selectionMembershipStride = tilingData->baseParams.selectionMembershipStride;
+    externalSelectionPlanActive = false;
+    selectionPreparedRow = -1;
+    selectionPreparedCount = 0;
+    selectionDataRow = -1;
+    selectionDirectRowStride = 0;
+    selectionPlanOffset = 0;
 }
 
 TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void FusedSparseAttentionOverlapVectorService<TEMPLATE_ARGS>::SoftmaxInitBuffer()
